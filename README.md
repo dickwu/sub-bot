@@ -9,6 +9,39 @@
 
 > 状态：v0.5.0。支持问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
+## Install
+
+### Homebrew
+
+支持 macOS / Linux，arm64 / x86_64：
+
+```bash
+brew install dickwu/tap/sub-bot
+```
+
+示例配置安装在 `$(brew --prefix)/share/sub-bot/sub-bot.example.json`。
+
+Formula 由 release workflow 自动更新；需要在本仓库配置 secret `HOMEBREW_TAP_TOKEN`，并授予它对 `dickwu/homebrew-tap` 的 push 权限。未配置时会跳过 tap 更新，不影响 Release 发布。也可以对本地 tap checkout 手动运行（版本号不带 `v`）：
+
+```bash
+scripts/update-tap.sh 0.4.0 /path/to/homebrew-tap
+```
+
+脚本下载 Release 的四个平台校验文件并生成 `Formula/sub-bot.rb`，不执行 commit 或 push。
+
+### 手动安装 / 源码构建
+
+从 [Releases](https://github.com/dickwu/sub-bot/releases) 下载对应平台的压缩包，并用 `.sha256` 校验：
+
+| 平台 | 文件 |
+|---|---|
+| Linux x86_64 / arm64 | `sub-bot-vX.Y.Z-x86_64-unknown-linux-musl.tar.gz` / `sub-bot-vX.Y.Z-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Intel / Apple Silicon | `sub-bot-vX.Y.Z-x86_64-apple-darwin.tar.gz` / `sub-bot-vX.Y.Z-aarch64-apple-darwin.tar.gz` |
+
+解压后进入顶层目录，把 `sub-bot` 放到 PATH 里，并保留 `sub-bot.example.json` 作为配置模板。macOS 首次运行如果被拦截，执行 `xattr -d com.apple.quarantine sub-bot`。
+
+从源码构建：`cargo build --release -p agentd`
+
 ## 问题上报 (issues)
 
 v0.5.0 将运行异常统一为 `IssueEvent`，写入日志目录下的 **`issues.log`（JSONL）**，并可投递到多个告警接收器。Webhook 沿用 v0.4 的 HMAC-SHA256 签名、独立 delivery ID、超时与重试；事件名为 **`issue`**，信封 `data` 是以下对象：
@@ -72,19 +105,6 @@ sub-bot --config sub-bot.json issues tail -n 20
 - 各目标独立签名、delivery ID 和重试，最多 32 个网络投递并发；慢目标不阻塞其它目标/问题队列。失败生成 `webhook_delivery_failed`，仅去 alerts 和 JSONL，不回到订阅者；失败问题自身的投递不会递归生成问题。外部失败回调只有 host，保守排除同 host 的 alert targets；issue 内部失败可精确排除原 URL。
 - 安全约定：来源不得传入 prompts/bodies/工具原文；details 递归剔除 prompt/content/body/text/messages/arguments/output 与密钥字段，掩盖 `sk-…`、Bearer、GitHub tokens、敏感 key=value 和已加载的 webhook secrets。message 最多 500 字符，details 超过 2 KiB 替换为 `{"truncated":true}`。不要将原始输入输出拼入自由文本 message；模式脱敏不能识别任意无标记的私密文本。
 - JSONL I/O 失败只计数，不使服务失败；启动失败的同步告警最多等 5 秒，正常退出 flush 最多等 5 秒。panic 仅 best-effort 入队并调用原 hook；进程被强杀、超时退出或磁盘故障时不保证投递。问题不是持久化消息队列，接收端仍需按 delivery ID 幂等处理。
-
-## 安装
-
-从 [Releases](https://github.com/dickwu/sub-bot/releases) 下载对应平台的压缩包，并用 `.sha256` 校验：
-
-| 平台 | 文件 |
-|---|---|
-| Linux x86_64 / arm64 | `sub-bot-<ver>-x86_64-unknown-linux-musl.tar.gz` / `aarch64-unknown-linux-musl` |
-| macOS Intel / Apple Silicon | `x86_64-apple-darwin` / `aarch64-apple-darwin` |
-
-解压后把 `sub-bot` 放到 PATH 里。macOS 首次运行如果被拦截，执行 `xattr -d com.apple.quarantine sub-bot`。
-
-从源码构建：`cargo build --release -p agentd`
 
 ## 快速开始
 

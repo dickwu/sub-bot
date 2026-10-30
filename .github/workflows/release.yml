@@ -95,3 +95,42 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/*.tar.gz.sha256
+  homebrew:
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: check tap token
+        id: tap-token
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$TAP_TOKEN" ]]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not configured; skipping Homebrew tap update"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.tap-token.outputs.skip != 'true'
+        with:
+          repository: dickwu/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: update formula
+        if: steps.tap-token.outputs.skip != 'true'
+        shell: bash
+        run: scripts/update-tap.sh "${GITHUB_REF_NAME#v}" tap
+      - name: publish formula
+        if: steps.tap-token.outputs.skip != 'true'
+        working-directory: tap
+        shell: bash
+        run: |
+          git add Formula/sub-bot.rb
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898699+github-actions[bot]@users.noreply.github.com'
+          git commit -m "sub-bot ${GITHUB_REF_NAME#v}"
+          git push origin HEAD:main

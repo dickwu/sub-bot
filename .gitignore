@@ -1,0 +1,24 @@
+# build
+/target/
+**/*.rs.bk
+
+# 本地运行产物：工作区、会话、日志
+/work/
+/sessions/
+*.jsonl
+*.log
+logs/
+
+# 机密与本地配置（只提交 agentd.example.json）
+.env
+.env.*
+agentd.json
+agentd.local.json
+*.pem
+*.key
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

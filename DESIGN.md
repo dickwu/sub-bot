@@ -1,0 +1,256 @@
+# pi-agentd 设计文档：用 Rust 仿 pi coding-agent 做一个可被其它 bot 调用的本地编码 agent
+
+> 目标：我要用 Rust 写一个**以编码为核心**的 agent，架构上尽量贴近 Mario Zechner 的 pi coding-agent（`badlogic/pi-mono`）。
+> 它的核心能力是编码：读、写、编辑文件，执行 shell 命令。
+> “通用”的意思是它**不绑定某个项目或任务**，不同的 bot 可以拿它在不同的目录里做不同的编码工作。
+> 它在 Windows、macOS 和 Linux 上本地运行，使用我的 OpenAI API Key，并通过 HTTP、SSE 或 stdio JSONL RPC 给其它 bot 调用。
+> API Key 只留在 agent 进程里，绝不外传。
+>
+> 参考源码：`/workspace/pi-mono`（浅克隆）。本文提到的 pi 路径都相对 `packages/`。
+> 脚手架代码：`/workspace/rust-agent`。
+
+---
+
+## (a) pi 的架构
+
+pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`。
+
+### 1. `ai/`（pi-ai）：统一的 LLM 接口
+- `ai/src/types.ts` 定义了以下类型：
+  - `Message`：只有 `user`、`assistant`、`toolResult` 三种角色；
+  - 内容块：`text`、`thinking`、`image`、`toolCall`；
+  - `AssistantMessageEvent` 流事件：`start`，`text_start/_delta/_end`，`thinking_*`，`toolcall_*`，`done`，`error`；
+  - `StopReason`：`stop`、`length`、`toolUse`、`error`、`aborted`。
+- `ai/src/models.ts` 的 `stream` 和 `streamSimple` 按模型的 `api` 字段分派到 `ai/src/api/*.ts`，例如：
+  - `openai-responses.ts`
+  - `openai-completions.ts`
+  - `anthropic-messages.ts`
+  - `google-generative-ai.ts`
+- `ai/src/providers/*.ts` 是各家厂商的入口和模型表；`providers/faux.ts` 是测试用的假 provider。
+- **关键约定**：流永远不抛异常，失败会被编码成 `stopReason: "error" | "aborted"` 的最终消息。上层因此只需要处理一种结局。
+
+### 2. `agent/`（pi-agent-core）：与具体任务无关的 agent 循环
+- `agent/src/agent-loop.ts` 中的 `runLoop`（约第 172 到 340 行）是一个**双层循环**：
+  - 外层循环处理 follow-up 消息；
+  - 内层循环执行以下步骤：调用 LLM，执行工具（`executeToolCalls`，按工具声明串行或并行），注入 steering 消息，再继续，直到没有工具调用为止。
+  - 如果 `stopReason=length`，就把被截断的工具调用全部标记为失败（`failToolCallsFromTruncatedMessage`）。
+- 钩子：`convertToLlm`、`transformContext`、`beforeToolCall`、`afterToolCall`、`prepareRequest`、`getSteeringMessages`、`getFollowUpMessages`。
+- `agent/src/agent.ts` 中的 `Agent` 类是有状态的外壳，提供 `prompt`、`continue`、`steer`、`followUp`、`abort`、`waitForIdle` 和 `subscribe`。
+- `AgentEvent` 包括：`agent_start/end`、`turn_start/end`、`message_start/update/end`、`tool_execution_start/update/end`。
+- `agent/src/proxy.ts` 是精简的代理事件，用于“服务端持有密钥”的场景。
+
+### 3. `coding-agent/`：编码 agent 本体
+- **会话**：
+  - `core/agent-session.ts`（`AgentSession`）把 Agent、工具、会话存储、压缩和扩展粘合在一起；
+  - `core/sdk.ts` 的 `createAgentSession` 是对外的 SDK 入口。
+- **核心工具**：`core/tools/` 目录下有
+  - `read.ts`、`write.ts`、`edit.ts`（精确替换 `edits[{oldText,newText}]`，`oldText` 必须唯一匹配）和 `edit-diff.ts`；
+  - `ls.ts`、`grep.ts`、`find.ts`；
+  - `bash.ts`、`powershell.ts`；
+  - `file-mutation-queue.ts`（同一文件的写操作串行化）、`truncate.ts`、`output-accumulator.ts`、`path-utils.ts`。
+  - `tools/index.ts` 用 `createToolDefinition(name, cwd, …)` 和 `createCodingTools(cwd)` **按 cwd 实例化**这些工具。
+  - 默认启用的工具是 `read/bash/edit/write`（见 `core/agent-session.ts` 中的 `defaultTools`）。
+- **系统提示**：`core/system-prompt.ts` 的 `buildSystemPromptSections` 按顺序拼接以下几段：
+  1. preamble（“expert coding assistant …”，可以用 `customPrompt` 替换）；
+  2. 工具列表；
+  3. 规则；
+  4. `appendSystemPrompt`；
+  5. 项目上下文文件；
+  6. skills；
+  7. cwd。
+- **项目上下文**：`core/resource-loader.ts` 从 cwd 向上查找 `AGENTS.override.md`、`AGENTS.md` 和 `CLAUDE.md`。`core/project-trust.ts` 和 `trust-manager.ts` 负责项目信任。
+- **会话存储**：`core/session-manager.ts` 把会话存为 JSONL 树。
+  - 每个条目都有 `id` 和 `parentId`，叶子指针表示当前分支。条目类型有 `session`、`message`、`model_change`、`thinking_level_change`、`compaction`、`branch_summary`、`label` 等。
+  - 文件路径是 `~/.pi/agent/sessions/--<cwd>--/<ts>_<uuid>.jsonl`（格式见 `docs/session-format.md`）。
+- **压缩**：`core/compaction/compaction.ts` 和 `branch-summarization.ts` 负责压缩。
+- **扩展**：`core/extensions/`、`core/skills.ts`、`core/prompt-templates.ts` 和 `core/mcp-servers.ts`。MCP 客户端在独立包 `mcp/src`（client.ts 和 transports）。
+- **运行模式**：`modes/interactive`（TUI）、`modes/print-mode.ts`、`modes/json-event.ts`、`modes/rpc/`。
+  - `modes/rpc/` 包含 `rpc-mode.ts`、`rpc-types.ts`、`rpc-client.ts` 和 `jsonl.ts`。
+  - RPC 是严格以 LF 分帧的 JSONL：命令格式为 `{id?, type:"prompt"|"steer"|"follow_up"|"abort"|"get_state"|"get_messages"|"set_model"|"compact"|"bash"|"fork"…}`，响应格式为 `{id, type:"response", command, success, data|error}`，事件与 `AgentEvent` 相同，空闲时额外发送 `agent_settled`。
+  - 参考文档：`docs/rpc.md`、`docs/rpc-commands.md`、`docs/json.md`。
+
+---
+
+## (b) pi 组件到 Rust crate 的映射
+
+| pi | Rust（`/workspace/rust-agent/crates/`） | 状态 |
+|---|---|---|
+| `ai/src/types.ts` | `agent-ai/src/types.rs`：`Message`、`Content`、`AssistantMessage`、`StopReason`、`AssistantEvent`，serde 字段名与 pi 的 JSON 一致 | ✅ |
+| `ai/src/models.ts` + `api/*` | `agent-ai/src/provider.rs`：`Provider` trait（`stream(req, cancel) -> EventStream`，**不返回错误**）和 `ProviderRegistry` | ✅ |
+| `api/openai-completions.ts` | `agent-ai/src/openai.rs`：Chat Completions 流式调用（按字节缓冲 SSE，累积 tool call 增量，读取 usage 和 cached_tokens，处理流中途的 error，流没有 finish_reason 就提前结束时判为错误，错误信息里的 key 会被打码，支持取消） | ✅ 已用 gpt-4.1-mini 实测 |
+| `api/openai-responses.ts` | `agent-ai/src/openai_responses.rs` | M1 |
+| `api/anthropic-messages.ts` | `agent-ai/src/anthropic.rs`：Claude（Anthropic Messages API 流式：`message_start`、`content_block_start/delta/stop`、`message_delta`、`message_stop`，其中 `input_json_delta` 用来累积工具参数，`thinking` 块对应 Thinking），实现同一个 `Provider` trait。每个 profile 用 `"provider": "openai" \| "anthropic"` 加 `model` 选择；key 只从 `ANTHROPIC_API_KEY` 环境变量读取。目前没有 Anthropic key，只做 faux 和单测（离线校验请求体构建与 SSE 解析） | 计划（M1.5） |
+| `providers/faux.ts` | `agent-ai/src/faux.rs`：离线回显；输入 `/tool <name> <json>` 会触发一次工具调用 | ✅ |
+| `agent/src/agent-loop.ts` | `agent-core/src/agent_loop.rs`：`run_loop` 双层循环、steering 和 follow-up 队列、串行或并行执行工具、`length` 截断处理 | ✅（已有单测） |
+| `agent/src/agent.ts` | `agent-core/src/agent.rs`：`Agent`（broadcast 订阅，`prompt`、`steer`、`follow_up`、`abort`） | ✅ |
+| `AgentTool` / `AgentEvent` | `agent-core/src/{tool,event}.rs`，事件名与 `docs/json.md` 一致 | ✅ |
+| 钩子 `beforeToolCall`/`afterToolCall`/`transformContext` | 在 `LoopConfig` 上加 `Arc<dyn Hooks>` | M3 |
+| `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：**核心工具** `read`、`write`、`edit`、`ls`、`bash`（Windows 上走 PowerShell），全部限定在会话 cwd 内 | ✅（edit 已有单测） |
+| `tools/grep.ts`、`find.ts`、`file-mutation-queue.ts`、`truncate.ts` | `agent-tools/src/builtin/{grep,find}.rs`（用 `ignore` 和 `grep-searcher` crate），`mutation_queue.rs` | M1 |
+| `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, edit, write, bash`；预设有 `default`、`readonly`、`no-shell` | ✅ |
+| `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 cwd 向上查找到 workspaceRoot 为止）、cwd | ✅ |
+| `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_messages`） | ✅ 读写；恢复会话在 M2 |
+| `core/compaction/*` | `agent-compaction` crate | M2 |
+| `core/skills.ts`、`extensions/`、`prompt-templates.ts` | `agent-resources` crate（只做 skills 和 prompt templates；扩展改成 MCP 或回调） | M4 |
+| `mcp/`（pi-mcp）、`core/mcp-servers.ts` | `agent-mcp` crate（可以基于 `rmcp`），MCP 工具注册进 `ToolRegistry` | M4 |
+| `modes/rpc/*` | `agentd/src/rpc.rs`：stdio JSONL，命令和响应格式与 `rpc-types.ts` 一致 | ✅ 部分命令 |
+| `core/sdk.ts` / `AgentSession` | `agentd/src/hub.rs`：`Hub::create_session` 校验 profile、工具白名单和 cwd，并组装 Agent、工具、系统提示和存储 | ✅ |
+| （pi 没有）多 bot 的 HTTP 服务 | `agentd/src/http.rs`（axum + SSE）和 `config.rs`（profiles、clients、token 哈希） | ✅ |
+| interactive TUI | 不做（这个项目面向 bot） | — |
+
+设计上的取舍：
+- 核心编码工具总是注册的，profile 只用白名单选择启用哪些。
+- `clock`、`http_fetch`、调用方回调工具（`callback.rs`）和以后的 MCP 工具都是**附加**的，不是核心。
+
+---
+
+## (c) 给其它 bot 的接口
+
+### 鉴权与隔离
+- 每个 bot 一个 token。配置里**只存 SHA-256**（用 `pi-agentd hash-token <token>` 生成），比较时用常量时间比较。
+- 请求头为 `Authorization: Bearer <token>`。
+- 每个 client 有一个 profile 白名单（`clients[].profiles`）。
+- 会话按 owner 隔离：别的 bot 访问时一律返回 404。会话文件存放在 `<sessionDir>/<client>/` 下。
+- 每个 profile 有 `workspaceRoots`。会话可以指定 `cwd`（相对路径相对第一个 root，也可以写绝对路径），服务端 canonicalize 之后必须落在某个 root 之内，否则返回 400（已测试 `/tmp` 和 `..` 都会被拒）。
+- 工具内部还会做一次 `resolve_in_root` 校验（拒绝绝对路径和 `..`）。
+- 请求里的 `tools` 只能在 profile 白名单范围内**收窄**，不能扩大。
+- `systemPrompt`/`appendSystemPrompt` 覆盖需要 profile 设置 `allowSystemPromptOverride`；调用方回调工具需要 `allowCallerTools`。
+- **OpenAI Key** 只从 `OPENAI_API_KEY` 环境变量读入内存，任何响应、事件和日志中都不会出现；bot 拿不到它。
+- 默认只监听 `127.0.0.1:7878`。如果要跨机器访问，建议经过反向代理加 TLS（M3 会内建 rustls 支持）。
+
+### HTTP API（`/v1`）
+| 方法和路径 | 说明 |
+|---|---|
+| `GET /health` | 无需鉴权 |
+| `GET /profiles` | 当前 bot 可用的 profile，包括 model、tools 和 workspaceRoots |
+| `POST /sessions` | 请求体为 `{profile, cwd?, model?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, tools}` |
+| `POST /sessions/{id}/prompt` | 请求体为 `{message, mode?: "steer"|"follow_up"}`，返回 202 和 `started`/`queuedSteer`/`queuedFollowUp`（语义同 pi：运行中只能 steer 或 follow_up） |
+| `GET /sessions/{id}/events` | SSE，`event:` 名称与 pi 的 `AgentEvent.type` 一致，额外有 `agent_settled{aborted}` |
+| `POST /sessions/{id}/abort` | 中止当前运行 |
+| `GET /sessions/{id}/messages` | 返回当前分支的消息 |
+| `POST /chat` | 一次性调用：`{message, sessionId?, session?: {...}, stream?}`。不流式时返回 `{sessionId, text, stopReason, error, aborted, messages}`；`stream:true` 时返回 SSE，直到 `agent_settled` |
+
+示例：
+```bash
+curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>' -H 'content-type: application/json' \
+  -d '{"message":"修复 src/lib.rs 里的编译错误并运行 cargo test","session":{"profile":"coder","cwd":"projA"}}'
+```
+
+### stdio JSONL RPC（`pi-agentd rpc --profile coder`）
+- 父进程直接拉起 agent，命令和响应格式与 pi 的 `modes/rpc/rpc-types.ts` 一致：
+  ```
+  → {"id":"1","type":"prompt","message":"..."}
+  ← {"id":"1","type":"response","command":"prompt","success":true}
+  ← {"type":"message_update","assistantMessageEvent":{...}} ... {"type":"agent_settled","aborted":false}
+  ```
+- 目前支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`。
+- M2 加入 `set_model`、`compact`、`fork`、`new_session`、`switch_session`。
+- 关闭 stdin 等于关机（与 pi 相同）。
+- 本地 stdio 被视为可信，可以使用全部 profile。
+
+### 调用方工具（附加能力）
+- `callerTools: [{name, description, parameters, callbackUrl, callbackToken}]`。
+- 工具被调用时，服务端 POST `{sessionId, toolCallId, toolName, arguments}` 到 `callbackUrl`，期待返回 `{content, isError}`。
+- M4 计划改为：除了 HTTP 回调，也可以让 bot 在 SSE/RPC 上通过 `tool_result` 命令回填结果，或者挂载 MCP server。
+
+---
+
+## (d) 跨平台构建与分发
+
+- **纯 Rust TLS**：`reqwest` 使用 `rustls-tls`，不依赖 OpenSSL，所以各平台都能静态或近静态链接。
+- **Shell**：
+  - `bash` 工具在 Windows 上运行 `powershell -NoProfile -NonInteractive -Command`，其它平台运行 `sh -c`；
+  - 以后对应 pi 的 `powershell.ts`，单独提供 `powershell` 工具，并检测 Git Bash；
+  - 进程设置 `kill_on_drop`，有超时，并支持取消。
+- **路径**：统一用 `PathBuf` 加 `canonicalize`（Windows 上会产生 `\\?\` 前缀，比较 root 时要两边都 canonicalize，代码里已经这样做了）。系统提示里的路径统一使用 `/`。
+- **目标平台**：
+  - `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`
+  - `x86_64-apple-darwin`、`aarch64-apple-darwin`（可以合成 universal 二进制）
+  - `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`
+- **发布（已确定）**：
+  - 源码放在这台机器的 `/workspace/rust-agent`；
+  - 由 GitHub Actions CI 构建三平台预编译二进制，每台 PC 直接下载安装。
+  - 草稿工作流在 `.github/workflows/release.yml`：
+    - 推送 `v*` tag 时，先在三个操作系统上跑 `cargo test --locked`；
+    - 然后矩阵构建 6 个目标（Linux musl 用 `cross`）；
+    - 打包成 `tar.gz`（Windows 为 `zip`），附带 `.sha256`，上传到 GitHub Release。
+  - 还没有创建远程仓库，也没有推送。
+  - 以后可以换成 `cargo-dist`，额外生成安装脚本（sh/ps1）和 Homebrew formula。
+  - release profile 已经开启 `lto="thin"` 和 `strip=true`。
+- **作为服务运行**：
+  - Linux 用 systemd user unit；
+  - macOS 用 launchd plist（`~/Library/LaunchAgents`）；
+  - Windows 用 `windows-service` crate 或 NSSM。
+  - M5 提供 `pi-agentd service install` 命令。
+- **配置和数据目录**：用 `directories` crate 按操作系统决定：
+  - Linux：`~/.config/pi-agentd`，数据放在 `~/.local/share`；
+  - macOS：`~/Library/Application Support/pi-agentd`；
+  - Windows：`%APPDATA%\pi-agentd`。
+- **API Key 来源**：环境变量，或者系统钥匙串（`keyring` crate，M3）。Key 不写进配置文件。
+
+---
+
+## (d2) 日志（tracing）
+
+- **框架**：`tracing`，加上 `tracing-subscriber`（`EnvFilter`）和 `tracing-appender`。实现见 `agentd/src/logging.rs`。
+- **级别**：用 `--log-level`（环境变量 `PI_AGENTD_LOG`，默认 `info`）设置；`RUST_LOG` 优先，可以按模块细调，例如 `agentd=debug,agent_ai=trace`。
+  - 依赖库 `hyper`、`reqwest`、`h2`、`rustls` 默认压到 `warn`，防止请求头在 trace 级被打印出来。
+- **输出**：
+  - stderr 输出人类可读格式。stdout 只留给 RPC 协议，永远不写日志。
+  - 文件日志按天滚动，保留 14 天，文件名为 `pi-agentd.YYYY-MM-DD.log`，默认是 JSON 格式（`--log-format json|text`）。
+  - 默认目录：
+    - Linux：`~/.local/share/pi-agentd/logs`
+    - macOS：`~/Library/Application Support/pi-agentd/logs`
+    - Windows：`%LOCALAPPDATA%\pi-agentd\data\logs`
+  - 用 `--log-dir <dir>` 改目录，传 `-` 关闭文件日志。
+- **Span 层级**（JSON 日志的每一行都带完整的 span 列表）：
+  - `http{request_id, method, path, bot}`：request_id 沿用调用方的 `X-Request-Id`，否则自动生成，并回写到响应头；
+  - 其下是 `session_run{session_id, bot, profile}`；
+  - 再往下是 `llm{provider, model}` 和 `tool{tool, tool_call_id}`。
+- **关键事件**：
+  - 请求结束（status、latency_ms，4xx 记为 warn，5xx 记为 error）；
+  - `session created`（cwd、model、tools）；
+  - `run started/finished`（耗时、消息数、工具调用数、输入和输出 token、stop_reason）；
+  - `llm call finished/failed`（耗时、token、cached_tokens）；
+  - `tool finished/failed`（耗时）；
+  - 鉴权失败；
+  - 会话持久化失败。
+- **绝不记录密钥**：
+  - API key、Bearer token、回调 token 都不进入任何字段，鉴权失败也只记录“token 缺失或未知”；
+  - 上游错误信息会先打码，形如 `sk-…` 的内容替换为 `[redacted]`；
+  - 提示词、模型输出、工具参数和文件内容只记录长度或计数。
+  - 例外：没有配置文件时，`serve` 会把随机生成的 token 用 eprintln 打到 stderr 一次，方便本机使用；这条不经过 tracing，也不进日志文件。
+- 已实测：日志文件和会话 JSONL 里都搜不到 key、`sk-` 或 bot token。
+
+---
+
+## (e) MVP 里程碑
+
+| 里程碑 | 内容 | 验收 |
+|---|---|---|
+| **M0（已完成，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；会话 cwd 与 workspaceRoots 校验；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件，越权 cwd 和工具被拒，401/404 隔离） |
+| **M1：编码能力补齐** | OpenAI Responses API（reasoning 和 cache）；`grep`、`find`（遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
+| **M1.5：Claude** | `agent-ai/src/anthropic.rs` 接入 Anthropic Messages API；profile 增加 `provider` 字段；Hub 持有多个 provider，按 profile 分派 | 先用离线单测覆盖 SSE 解析和请求体，有 key 后再做端到端测试 |
+| **M2：会话** | 恢复会话（`sessionId` 重开后加载 JSONL）；fork 和分支切换；`compaction`（自动压缩和 `compact` 命令）；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
+| **M3：安全与治理** | `beforeToolCall` 审批钩子（profile 可设 bash 需要调用方确认，确认通过 SSE/RPC 往返）；bash 命令允许和拒绝规则；每个 bot 的限流和并发上限；审计日志；内建 TLS；keyring | 只读 profile 无法写文件，也无法执行命令；审批流程可用 |
+| **M4：扩展** | MCP 客户端（stdio/HTTP）；skills 和 prompt templates；项目信任（对应 `project-trust.ts`）；调用方工具支持通过 RPC 回填 | 接入一个 MCP server 后能调用其工具 |
+| **M5：分发** | cargo-dist 三平台六个目标；`service install`；按操作系统决定配置目录；安装文档 | 在 Win、mac、Linux 上一键安装并作为服务运行 |
+
+---
+
+## 附：脚手架用法
+```bash
+cd /workspace/rust-agent
+cargo build --release
+export OPENAI_API_KEY=sk-...          # 只在本机环境中
+./target/release/pi-agentd hash-token my-bot-token   # 把结果填进配置的 tokenSha256
+./target/release/pi-agentd --config agentd.example.json serve           # HTTP 服务
+./target/release/pi-agentd --workspace ~/code rpc                       # stdio RPC
+./target/release/pi-agentd --provider faux --config agentd.example.json serve   # 离线测试，不调用 OpenAI
+```
+`agentd.example.json` 中有三个 profile：
+- `coder`：全部核心工具；
+- `reviewer`：只读，`preset:readonly`；
+- `docs-writer`：不能执行 shell，外加 `http_fetch`。
+
+另有两个 client：`ci-bot` 只能用 reviewer；`dev-bot` 三个都能用。示例里的 `tokenSha256` 是占位符，必须换成 `pi-agentd hash-token <随机 token>` 的输出。

@@ -1,0 +1,14 @@
+[package]
+name = "agent-session"
+description = "JSONL 会话树持久化（对应 coding-agent/src/core/session-manager.ts）"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+agent-ai.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true

@@ -1,0 +1,54 @@
+{
+  "defaultModel": "gpt-4.1",
+  "profiles": {
+    "coder": {
+      "workspaceRoots": [
+        "./work"
+      ],
+      "appendSystemPrompt": "Run the project's tests after making changes when possible.",
+      "allowSystemPromptOverride": true,
+      "allowCallerTools": true
+    },
+    "reviewer": {
+      "model": "gpt-4.1-mini",
+      "tools": [
+        "preset:readonly"
+      ],
+      "workspaceRoots": [
+        "./work"
+      ],
+      "appendSystemPrompt": "You only review code. Never modify files."
+    },
+    "docs-writer": {
+      "tools": [
+        "preset:no-shell",
+        "http_fetch"
+      ],
+      "httpAllowHosts": [
+        "docs.rs",
+        "doc.rust-lang.org"
+      ],
+      "workspaceRoots": [
+        "./work/docs"
+      ]
+    }
+  },
+  "clients": [
+    {
+      "name": "ci-bot",
+      "tokenSha256": "REPLACE_ME: output of `pi-agentd hash-token <a long random token for ci-bot>`",
+      "profiles": [
+        "reviewer"
+      ]
+    },
+    {
+      "name": "dev-bot",
+      "tokenSha256": "REPLACE_ME: output of `pi-agentd hash-token <a long random token for dev-bot>`",
+      "profiles": [
+        "coder",
+        "reviewer",
+        "docs-writer"
+      ]
+    }
+  ]
+}

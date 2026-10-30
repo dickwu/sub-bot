@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = ["crates/agent-ai", "crates/agent-core", "crates/agent-tools", "crates/agent-session", "crates/agentd"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+repository = "https://github.com/dickwu/sub-bot"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "process", "fs", "io-util", "io-std", "time", "signal"] }
+tokio-util = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+axum = "0.8"
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+directories = "5"
+rand = "0.8"
+sha2 = "0.10"
+agent-ai = { path = "crates/agent-ai" }
+agent-core = { path = "crates/agent-core" }
+agent-tools = { path = "crates/agent-tools" }
+agent-session = { path = "crates/agent-session" }
+
+[profile.release]
+lto = "thin"
+strip = true

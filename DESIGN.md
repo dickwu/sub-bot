@@ -129,6 +129,8 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `GET /profiles` | 当前 bot 可用的 profile，包括 model、allowedModels、reasoningEffort、tools 和 workspaceRoots |
 | `GET /models?profile=&all=` | 调用 provider 的 `/v1/models` 实时取模型列表（Hub 缓存 10 分钟），默认过滤掉非对话模型（embedding/tts/image/realtime/codex/-pro 等）和日期快照；每项带 `reasoning`、`reasoningEfforts` |
 | `POST /sessions` | 请求体为 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, model, reasoningEffort, tools}`；model 不在 profile 的 `allowedModels` 内返回 400 |
+| `GET /sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |
+| `DELETE /sessions/{id}` | owner 删除内存会话并 abort 当前运行，返回 `{"deleted":true}`；未知/非 owner 返回 404，持久化 JSONL 保留并记日志 |
 | `POST /sessions/{id}/prompt` | 请求体为 `{message, mode?: "steer"|"follow_up"}`，返回 202 和 `started`/`queuedSteer`/`queuedFollowUp`（语义同 pi：运行中只能 steer 或 follow_up） |
 | `GET /sessions/{id}/events` | SSE，`event:` 名称与 pi 的 `AgentEvent.type` 一致，额外有 `agent_settled{aborted}` |
 | `POST /sessions/{id}/abort` | 中止当前运行 |
@@ -140,6 +142,14 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>' -H 'content-type: application/json' \
   -d '{"message":"修复 src/lib.rs 里的编译错误并运行 cargo test","session":{"profile":"coder","cwd":"projA"}}'
 ```
+
+### 会话生命周期（v0.3.2）
+- 顶层配置 `sessionIdleTtlSecs` 默认 3600；无 `sessionId` 的 `/chat` 自动创建临时会话，使用独立的 `chatSessionTtlSecs`（默认 600）。两个字段各自的 0 表示禁用该类过期。
+- 创建、submit、运行完成后更新单调时钟时间；GET/SSE 不刷新。`serve` 启动 sweeper，周期为最短非零 TTL 与 60 秒的较小值，仅清理未运行且超过其 TTL 的会话。`Hub::evict_idle(now)` 可注入时间测试，每次清理记 info 日志。
+- `maxSessionsPerClient` 默认 64，0 不限制，包括普通和临时会话。创建时在同一 map 锁内检查/插入；满额先回收该 client 已过期的空闲会话，仍满返回专用错误（HTTP 429），其它参数错误返回 400。
+- HTTP 提交、删除、清理使用同一个 map 锁，避免删除后旧 handle 再启动运行。DELETE 会取消正在运行的 Agent；清理与删除都保留已有 JSONL，当前不自动恢复旧 ID。
+- 临时会话可通过返回的 ID 继续（流式响应使用 `X-Session-Id` 头），续聊刷新计时但不改变 TTL。
+- RPC 只有一个进程生命周期内的会话，无需 delete 命令或 sweeper；关闭 stdin 会 abort 并退出。
 
 ### stdio JSONL RPC（`sub-bot rpc --profile coder`）
 - 父进程直接拉起 agent，命令和响应格式与 pi 的 `modes/rpc/rpc-types.ts` 一致：

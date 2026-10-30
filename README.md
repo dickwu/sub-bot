@@ -42,6 +42,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 ```jsonc
 {
   "defaultModel": "gpt-4.1-mini",
+  "sessionIdleTtlSecs": 3600,                 // 普通会话空闲 TTL，0 禁用
+  "chatSessionTtlSecs": 600,                  // /v1/chat 自动创建会话的空闲 TTL，0 禁用（独立于普通 TTL）
+  "maxSessionsPerClient": 64,                // 每个 client 的内存会话上限，0 不限制
   "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
@@ -134,11 +137,19 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`） |
 | `GET /v1/models?profile=&all=` | 实时模型列表（缓存 10 分钟），每项带 `reasoning` / `reasoningEfforts`；`profile` 只返回该 profile 允许的 |
 | `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, cwd, model, api, reasoningEffort, requestedReasoningEffort, tools}` |
+| `GET /v1/sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |
+| `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
 | `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up"}`，返回 202 |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
 | `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?}` |
+
+会话在创建、提交消息、运行结束时刷新空闲计时；读取信息/历史或订阅 SSE 不刷新计时。`serve` 每隔最多 60 秒（更短的非零 TTL 优先）清理超过各自 TTL 且未运行的会话，并记录日志；运行中的会话不会被空闲清理。删除/过期仅释放内存中的会话，已有 JSONL 文件保留在磁盘，当前不支持按旧 ID 自动恢复。
+
+每个 client 最多保留 `maxSessionsPerClient` 个会话（包括 chat 自动创建的会话）。达到上限时先清理该 client 已过期的空闲会话；仍满则创建返回 HTTP **429** `{"error":"too many sessions..."}`，可主动 DELETE 腾出名额。其它创建参数错误仍返回 400。
+
+`/v1/chat` 不带 `sessionId` 时自动创建临时会话，使用独立的 `chatSessionTtlSecs`（默认 10 分钟），而非普通会话的 `sessionIdleTtlSecs`（默认 1 小时）。可用返回的 `sessionId` 继续对话；`stream:true` 时 ID 在响应头 `X-Session-Id` 中。继续对话会刷新计时，但不改变会话 TTL。三个配置字段都是顶层字段；两个 TTL 的 `0` 各自表示禁用过期，上限的 `0` 表示不限数量。
 
 ```bash
 # 一次性调用，等待结果

@@ -31,3 +31,6 @@ directories.workspace = true
 rand.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

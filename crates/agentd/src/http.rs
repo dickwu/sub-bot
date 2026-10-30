@@ -1,6 +1,6 @@
 use crate::{
     config::{Client, Config},
-    hub::{Hub, SessionRequest},
+    hub::{Hub, SessionRequest, TooManySessions},
 };
 use agent_ai::Message;
 use agent_core::AgentEvent;
@@ -74,10 +74,10 @@ async fn trace_request(req: Request, next: Next) -> Response {
     .await
 }
 
-pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
-    let st = AppState { hub };
+fn router(st: AppState) -> Router {
     let api = Router::new()
         .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
@@ -86,9 +86,25 @@ pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
         .route("/v1/profiles", get(profiles))
         .route("/v1/models", get(models))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
-    let app = Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st);
+    Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st)
+}
+
+pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app)
+    let mut tasks = tokio::task::JoinSet::new();
+    if let Some(period) = hub.sweep_interval() {
+        let hub = hub.clone();
+        tasks.spawn(async move {
+            let mut interval = tokio::time::interval(period);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                hub.evict_idle(std::time::Instant::now());
+            }
+        });
+    }
+    // JoinSet 在退出（包括错误/取消）时终止后台清理任务。
+    axum::serve(listener, router(AppState { hub }))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -103,6 +119,26 @@ fn not_found() -> (StatusCode, Json<serde_json::Value>) {
 
 fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
+}
+
+fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    if e.is::<TooManySessions>() {
+        (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))
+    } else {
+        bad_request(e)
+    }
+}
+
+async fn get_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
+    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    Ok(Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "model": h.agent.config.model, "isStreaming": h.agent.is_running()})).into_response())
+}
+
+async fn delete_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
+    if !st.hub.remove(&c, &id) {
+        return Err(not_found());
+    }
+    Ok(Json(json!({"deleted": true})).into_response())
 }
 
 /// 列出当前 bot 可用的 profile 及其工具（不含任何密钥）。
@@ -139,7 +175,7 @@ async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Quer
 
 async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: Option<Json<SessionRequest>>) -> ApiResult {
     let b = body.map(|b| b.0).unwrap_or_default();
-    let h = st.hub.create_session(&c, b).map_err(bad_request)?;
+    let h = st.hub.create_session(&c, b).map_err(create_error)?;
     Ok((StatusCode::CREATED, Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "model": h.agent.config.model, "reasoningEffort": h.agent.config.reasoning, "requestedReasoningEffort": h.requested_effort, "api": st.hub.effective_api(&h.agent.config), "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()}))).into_response())
 }
 
@@ -151,8 +187,7 @@ struct PromptBody {
 }
 
 async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, Json(b): Json<PromptBody>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
-    let d = h.submit(b.message, b.mode.as_deref());
+    let d = st.hub.submit(&c, &id, b.message, b.mode.as_deref()).ok_or_else(not_found)?;
     Ok((StatusCode::ACCEPTED, Json(json!({"disposition": d}))).into_response())
 }
 
@@ -214,12 +249,14 @@ struct ChatBody {
 async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<ChatBody>) -> ApiResult {
     let h = match b.session_id {
         Some(id) => st.hub.get(&c, &id).ok_or_else(not_found)?,
-        None => st.hub.create_session(&c, b.session).map_err(bad_request)?,
+        None => st.hub.create_chat_session(&c, b.session).map_err(create_error)?,
     };
     let rx = h.subscribe(); // 先订阅再提交，避免漏事件
-    h.submit(b.message, None);
+    st.hub.submit(&c, &h.id, b.message, None).ok_or_else(not_found)?;
     if b.stream {
-        return Ok(Sse::new(sse_stream(rx, true)).into_response());
+        let mut response = Sse::new(sse_stream(rx, true)).into_response();
+        response.headers_mut().insert("x-session-id", h.id.parse().expect("UUID header"));
+        return Ok(response);
     }
     let mut rx = rx;
     let mut new_messages: Vec<Message> = vec![];
@@ -246,4 +283,87 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
         "messages": new_messages,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use serde_json::Value;
+    use tower::ServiceExt;
+
+    fn app(cap: usize) -> (Router, Arc<Hub>) {
+        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.max_sessions_per_client = cap;
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()] });
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        (router(AppState { hub: hub.clone() }), hub)
+    }
+
+    async fn request(app: &Router, method: &str, path: &str, token: Option<&str>, body: Value) -> (StatusCode, Value) {
+        let mut req = Request::builder().method(method).uri(path).header("content-type", "application/json");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app.clone().oneshot(req.body(Body::from(body.to_string())).unwrap()).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn create_delete_get_and_owner_visibility() {
+        let (app, _) = app(64);
+        let (status, body) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let path = format!("/v1/sessions/{}", body["sessionId"].as_str().unwrap());
+        assert_eq!(request(&app, "GET", &path, Some("test-token"), json!({})).await.0, StatusCode::OK);
+        for method in ["GET", "DELETE"] {
+            assert_eq!(request(&app, method, &path, Some("other-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+        }
+        let (status, body) = request(&app, "DELETE", &path, Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, json!({"deleted": true}));
+        for method in ["GET", "DELETE"] {
+            assert_eq!(request(&app, method, &path, Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+        }
+        assert_eq!(request(&app, "GET", &format!("{path}/messages"), Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn cap_maps_to_429_for_create_and_chat_other_errors_stay_400() {
+        let (app, _) = app(1);
+        assert_eq!(request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"profile":"missing"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "POST", "/v1/sessions", Some("test-token"), json!({})).await.0, StatusCode::CREATED);
+        for (path, body) in [("/v1/sessions", json!({})), ("/v1/chat", json!({"message":"hello"}))] {
+            let (status, body) = request(&app, "POST", path, Some("test-token"), body).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert!(body["error"].as_str().unwrap().starts_with("too many sessions"));
+        }
+        assert_eq!(request(&app, "POST", "/v1/sessions", Some("other-token"), json!({})).await.0, StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn missing_auth_is_401() {
+        let (app, _) = app(64);
+        for (method, path) in [("POST", "/v1/sessions"), ("GET", "/v1/sessions/unknown"), ("DELETE", "/v1/sessions/unknown"), ("POST", "/v1/chat")] {
+            assert_eq!(request(&app, method, path, None, json!({})).await.0, StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(request(&app, "GET", "/v1/health", None, json!({})).await.0, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn chat_can_continue_until_its_short_ttl_expires() {
+        let (app, hub) = app(1);
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"hello"})).await;
+        assert_eq!(status, StatusCode::OK);
+        let id = body["sessionId"].as_str().unwrap();
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"again", "sessionId":id})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["sessionId"], id);
+        assert_eq!(hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(601)), 1);
+        assert_eq!(request(&app, "GET", &format!("/v1/sessions/{id}"), Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"new"})).await.0, StatusCode::OK);
+    }
 }

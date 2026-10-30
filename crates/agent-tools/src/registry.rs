@@ -49,7 +49,12 @@ impl ToolRegistry {
         r.register("bash", Risk::Exec, |c| Some(Arc::new(BashTool { root: c.cwd.clone(), env: c.shell_env.clone() })));
         // 可选辅助
         r.register("clock", Risk::Safe, |_| Some(Arc::new(ClockTool)));
-        r.register("http_fetch", Risk::Network, |c| Some(Arc::new(HttpFetchTool { allow_hosts: c.http_allow_hosts.clone(), http: reqwest::Client::new() })));
+        r.register("http_fetch", Risk::Network, |c| {
+            Some(Arc::new(HttpFetchTool {
+                allow_hosts: c.http_allow_hosts.clone(),
+                http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15)).timeout(std::time::Duration::from_secs(60)).build().expect("http client"),
+            }))
+        });
         r
     }
 

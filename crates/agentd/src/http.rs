@@ -208,6 +208,8 @@ struct ChatBody {
     session: SessionRequest,
     #[serde(default)]
     stream: bool,
+    /// 非流式等待上限；不填使用全局 chatTimeoutSecs。
+    timeout_secs: Option<u64>,
 }
 
 /// 一步到位接口：给只想“发一句话拿回答”的 bot 用。
@@ -223,10 +225,35 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
     }
     let mut rx = rx;
     let mut new_messages: Vec<Message> = vec![];
+    let mut segment_start = 0;
+    let mut partial_text = String::new();
     let mut aborted = false;
+    let mut timed_out = false;
+    let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs));
     loop {
-        match rx.recv().await {
-            Ok(AgentEvent::AgentEnd { messages }) => new_messages.extend(messages),
+        let event = tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(deadline) => {
+                if timed_out {
+                    break;
+                }
+                timed_out = true;
+                tracing::warn!(session_id = %h.id, "chat timed out");
+                h.agent.abort();
+                deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                continue;
+            }
+            event = rx.recv() => event,
+        };
+        match event {
+            Ok(AgentEvent::AgentStart) => segment_start = new_messages.len(),
+            Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
+            Ok(AgentEvent::MessageEnd { message }) => new_messages.push(message),
+            Ok(AgentEvent::AgentEnd { messages }) => {
+                // AgentEnd 是权威快照，也补齐广播丢失的消息；不重复 MessageEnd。
+                new_messages.truncate(segment_start);
+                new_messages.extend(messages);
+            }
             Ok(AgentEvent::AgentSettled { aborted: a }) => {
                 aborted = a;
                 break;
@@ -235,6 +262,12 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(_) => break,
         }
+    }
+    if timed_out {
+        if partial_text.is_empty() {
+            partial_text = new_messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a.text()) } else { None }).collect::<Vec<_>>().join("");
+        }
+        return Ok((StatusCode::GATEWAY_TIMEOUT, Json(json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "messages": new_messages}))).into_response());
     }
     let last = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a.clone()) } else { None });
     Ok(Json(json!({
@@ -246,4 +279,41 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
         "messages": new_messages,
     }))
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chat_timeout_aborts_faux_tool_run() {
+        // Faux 可以请求一个阻塞的 bash 工具，无需真实 provider 或外部网络。
+        for timeout_secs in [None, Some(1)] {
+            let mut config = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+            config.chat_timeout_secs = if timeout_secs.is_none() { 1 } else { 900 };
+            let client = Arc::new(config.clients[0].clone());
+            let hub = Hub::new(config, "faux", None, None).unwrap();
+            let started = std::time::Instant::now();
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                chat(
+                    State(AppState { hub: hub.clone() }),
+                    Extension(client.clone()),
+                    Json(ChatBody { message: r#"/tool bash {"command":"sleep 10"}"#.into(), session_id: None, session: SessionRequest::default(), stream: false, timeout_secs }),
+                ),
+            )
+            .await
+            .expect("chat hung")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+            assert!(started.elapsed() < std::time::Duration::from_secs(3));
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], "timeout");
+            assert!(body["text"].is_string());
+            assert!(body["messages"].as_array().unwrap().len() >= 3);
+            let h = hub.get(&client, body["sessionId"].as_str().unwrap()).unwrap();
+            assert!(!h.agent.is_running());
+        }
+    }
 }

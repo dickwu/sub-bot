@@ -221,13 +221,13 @@ fn parse_args(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
 }
 
-pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
+pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: std::time::Duration) -> Result<AssistantMessage, String> {
     let _ = tx.send(AssistantEvent::Start).await;
     let mut st = StreamState::new(model);
     let mut buf: Vec<u8> = Vec::new();
     let mut bytes = resp.bytes_stream();
     let mut out = vec![];
-    while let Some(chunk) = bytes.next().await {
+    while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| crate::openai::idle_timeout_error(idle_timeout))? {
         buf.extend_from_slice(&chunk.map_err(|e| crate::openai::redact(&e.to_string()))?);
         for data in crate::openai::drain_sse_lines(&mut buf) {
             if data == "[DONE]" {
@@ -239,6 +239,9 @@ pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc
             st.on_event(&v, &mut out).map_err(|e| crate::openai::redact(&e))?;
             for ev in out.drain(..) {
                 let _ = tx.send(ev).await;
+            }
+            if st.completed {
+                return st.finish();
             }
         }
     }

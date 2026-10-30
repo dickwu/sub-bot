@@ -44,6 +44,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "defaultModel": "gpt-4.1-mini",
   "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
+  "streamIdleTimeoutSecs": 300,               // LLM 流连续无字节的超时；推理模型可能长时间静默
+  "chatTimeoutSecs": 900,                     // /v1/chat 非流式默认等待上限
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
   "profiles": {
     "coder": {
@@ -55,6 +57,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "api": "auto",                           // 可选：auto|chat|responses，覆盖 defaultApi
       "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
       "tokenBudget": 300000,                   // 可选：整次运行的 token 预算，用完后禁止再调工具、要求直接给结论
+      "runTimeoutSecs": null,                 // 可选：整次运行的秒数上限，默认不限时；超时等同 abort
       "systemPrompt": null,                    // 替换默认编码前言
       "appendSystemPrompt": "...",             // 追加内容
       "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
@@ -138,7 +141,12 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
-| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?}` |
+| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?}` |
+
+超时行为：
+- `streamIdleTimeoutSecs`（全局，默认 300 秒）适用于 OpenAI Chat Completions 和 Responses；每次收到字节重置计时。超时产生 `stopReason: "error"`、`errorMessage: "stream idle timeout after Ns"`。连接超时为 30 秒，初始响应头等待上限为 120 秒。
+- `runTimeoutSecs`（profile，默认 `null`）限制整次运行（含工具和排队消息），对 HTTP、RPC、CLI 都生效。超时取消运行、记录 `run timed out` 警告，并发送 `agent_settled{aborted:true}`。
+- 非流式 `/v1/chat` 的 `timeoutSecs` 覆盖全局 `chatTimeoutSecs`（默认 900 秒）。超时 abort 后最多再等 5 秒收尾，返回 HTTP **504**：`{sessionId, error: "timeout", text, messages}`，保留已收到的部分文本和消息。`stream:true` 不使用此等待上限（仍受流空闲和运行超时限制）。
 
 ```bash
 # 一次性调用，等待结果

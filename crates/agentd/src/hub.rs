@@ -176,7 +176,7 @@ impl Hub {
                     .map_err(|e| anyhow::anyhow!("{e} (or use --provider faux)"))?;
                 // 只记录来源（变量名/路径），不记录 key
                 tracing::info!(provider = "openai", key_source = %source, "api key loaded");
-                Arc::new(OpenAiProvider::new(key, std::env::var("OPENAI_BASE_URL").ok()))
+                Arc::new(OpenAiProvider::with_stream_idle_timeout(key, std::env::var("OPENAI_BASE_URL").ok(), std::time::Duration::from_secs(config.stream_idle_timeout_secs)))
             }
             other => bail!("unknown provider {other}"),
         };
@@ -263,6 +263,7 @@ impl Hub {
             max_turns: p.max_turns,
             max_tokens: p.max_output_tokens,
             token_budget: p.token_budget,
+            run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
         };
         tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {

@@ -10,10 +10,23 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::Write,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[derive(Debug)]
+pub struct DataDirLocked {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for DataDirLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "dataDir {} is in use by another sub-bot server", self.path.display())
+    }
+}
+
+impl std::error::Error for DataDirLocked {}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -135,7 +148,7 @@ impl Store {
             if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.kind() == std::io::ErrorKind::WouldBlock {
-                    anyhow::bail!("dataDir {} is in use by another sub-bot server", dir.parent().unwrap_or(dir).display());
+                    return Err(DataDirLocked { path: dir.parent().unwrap_or(dir).to_path_buf() }.into());
                 }
                 return Err(anyhow::Error::new(error).context(format!("failed to lock {}", dir.join("lock").display())));
             }
@@ -317,6 +330,7 @@ mod tests {
         private_file(&dir.join("tasks.jsonl")).unwrap().write_all(b"{torn").unwrap();
         drop(store);
         let error = Store::open(&dir, ttl).err().expect("second store must fail");
+        assert_eq!(error.downcast_ref::<DataDirLocked>().expect("typed lock error").path, data_dir);
         assert_eq!(error.to_string(), format!("dataDir {} is in use by another sub-bot server", data_dir.display()));
         assert_eq!(std::fs::read(dir.join("tasks.jsonl")).unwrap(), b"{torn");
         let other = Store::open(&data_dir.join("other/state"), ttl).unwrap();

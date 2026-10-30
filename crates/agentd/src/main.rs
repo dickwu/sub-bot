@@ -150,7 +150,20 @@ fn install_reporter(cfg: &config::Config, cli: &Cli) {
     issues::install(issues::Reporter::new(&cfg.alerts, issue_log_dir(cli), secrets));
 }
 
-async fn startup_failed(cli: &Cli) {
+fn startup_failure(error: Option<&anyhow::Error>) -> (String, issues::IssueEvent) {
+    let mut event = issues::IssueEvent::new(issues::Severity::Fatal, "startup_failed", "config", "configuration or service initialization failed");
+    // Only this typed error is safe to expose; surrounding context may contain credentials.
+    if let Some(locked) = error.and_then(|e| e.downcast_ref::<store::DataDirLocked>()) {
+        let message = locked.to_string();
+        event.message = message.clone();
+        event = event.details(serde_json::json!({"reason": "data_dir_locked", "dataDir": locked.path.to_string_lossy()}));
+        (message, event)
+    } else {
+        ("service initialization failed (check provider and key configuration)".into(), event)
+    }
+}
+
+async fn startup_failed(cli: &Cli, event: issues::IssueEvent) {
     let reporter = match issues::global() {
         Some(r) => r,
         None => {
@@ -169,8 +182,6 @@ async fn startup_failed(cli: &Cli) {
             issues::Reporter::new(&alerts, issue_log_dir(cli), vec![])
         }
     };
-    // Generic message intentionally excludes parser/provider errors (may contain credentials).
-    let event = issues::IssueEvent::new(issues::Severity::Fatal, "startup_failed", "config", "configuration or service initialization failed");
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         reporter.test_alerts(event).await;
         reporter.flush(std::time::Duration::from_secs(1)).await;
@@ -234,7 +245,7 @@ async fn main() -> anyhow::Result<()> {
     let mut loaded = match load(&fallback_token) {
         Ok(cfg) => cfg,
         Err(_) => {
-            startup_failed(&cli).await;
+            startup_failed(&cli, startup_failure(None).1).await;
             anyhow::bail!("configuration load failed (check config and secret files)");
         }
     };
@@ -271,9 +282,10 @@ async fn main() -> anyhow::Result<()> {
         }
         match new_hub(cfg) {
             Ok(hub) => Some(hub),
-            Err(_) => {
-                startup_failed(&cli).await;
-                anyhow::bail!("service initialization failed (check provider and key configuration)");
+            Err(error) => {
+                let (message, event) = startup_failure(Some(&error));
+                startup_failed(&cli, event).await;
+                anyhow::bail!(message);
             }
         }
     };
@@ -384,4 +396,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_exposes_only_typed_lock_error_through_context() {
+        let path = PathBuf::from("/tmp/sub-bot-test-data");
+        let error = anyhow::Error::new(store::DataDirLocked { path: path.clone() }).context("sensitive provider context").context("sensitive initialization context");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, format!("dataDir {} is in use by another sub-bot server", path.display()));
+        assert_eq!(event.message, message);
+        assert_eq!(event.kind, "startup_failed");
+        assert_eq!(event.severity, issues::Severity::Fatal);
+        assert_eq!(event.details, serde_json::json!({"reason": "data_dir_locked", "dataDir": path}));
+    }
+
+    #[test]
+    fn startup_failure_keeps_untyped_errors_generic() {
+        // Even a lookalike message must not bypass the typed allowlist.
+        let error = anyhow::anyhow!("dataDir sensitive-value is in use by another sub-bot server").context("sensitive provider context");
+        for error in [None, Some(&error)] {
+            let (message, event) = startup_failure(error);
+            assert_eq!(message, "service initialization failed (check provider and key configuration)");
+            assert_eq!(event.message, "configuration or service initialization failed");
+            assert_eq!(event.kind, "startup_failed");
+            assert_eq!(event.details, serde_json::json!({}));
+        }
+    }
 }

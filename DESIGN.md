@@ -22,6 +22,7 @@
 - Unix 测试覆盖实际 UDS/TCP、uid/username/any 映射、无匹配 401、Bearer 优先级、IPv6/mapped loopback、伪造转发头、socket mode/残留清理/文件保护、faux provider 下同步和异步 ask。系统调用使用 Unix cfg，适用于 Linux/macOS CI。
 ## 持久化与恢复（agentd/store.rs）
 
+- 仅 `serve` 显式选择 `StoreMode::Persistent`。`Hub::new` 默认使用 `Store::memory()`（`StoreMode::Memory`），供 `run` / `rpc` / `models` 使用：不打开文件或锁、不加载 journal，因此没有重启恢复或历史 pending delivery 续投，可与同一 dataDir 的服务共存。内存 store 保留当前进程的任务/投递状态；日志与可选 session-dir 历史独立配置。
 - `Store` 管理 append-only `tasks.jsonl` 和 `deliveries.jsonl`，每次状态更新追加完整快照并 sync_data。启动按 ID 取最新记录，再通过临时文件 + rename + 目录 fsync 压缩；仅忽略崩溃留下的最后一个不完整行；完整行损坏时将原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），保留损坏行之前的记录，reporter 挂载后报告 error 级 `store_corrupt`。目录/文件权限分别为 0700/0600；`Store::open` 在读取/压缩前对 `<dataDir>/state/lock` 获取非阻塞排他 flock，文件句柄持有到 Store 释放，进程退出（含崩溃）自动解锁；同一 dataDir 的第二个服务启动失败，lock 文件不删除以避免 inode 竞争。
 - `dataDir` / CLI `--data-dir` 由 `Config::data_dir()` 统一解析，默认系统数据目录/sub-bot；journal 存放在 `<dataDir>/state`，不受 session-dir 影响。`shutdownGraceSecs` 默认 10，限制退出等待。task TTL 使用持久化的墙钟完成时间，重启不会延长 TTL。
 - task 入队和运行前记录 queued/running，完成记录结果/error 和各目标 delivery 状态。启动发现 queued/running 时转 failed（`interrupted by restart`），发出 error 级 `task_interrupted`，不重放工具副作用。结果只允许 owner 查询。
@@ -31,7 +32,7 @@
 
 ## Issue 的 owner 路由
 
-SessionHandle 在 submit 前订阅 `ScopeKey::Session`，覆盖同步 chat、SSE、普通 session 及 RPC 运行；async task 使用 `ScopeKey::Task`。settled 后 250ms 再取消 session 订阅，并用运行代数防止旧运行清理新订阅。Reporter 的路由始终校验 scope.client 与订阅 owner，按 events/minSeverity 过滤；取消订阅后保存至少 dedupWindowSecs 的缓存。入队 issue 捕获路由快照，窗口汇总不会因 task/session 已结束而丢失路由；dedup key 包含 task ID，避免同一 session 连续任务混并。管理员 alerts 是独立路由，不参与 client 间广播。issue webhook 同样进入持久化队列，失败通知禁止递归。
+SessionHandle 在 submit 前订阅 `ScopeKey::Session`，覆盖同步 chat、SSE、普通 session 及 RPC 运行；async task 使用 `ScopeKey::Task`。settled 后 250ms 再取消 session 订阅，并用运行代数防止旧运行清理新订阅。Reporter 的路由始终校验 scope.client 与订阅 owner，按 events/minSeverity 过滤；取消订阅后保存至少 dedupWindowSecs 的缓存。入队 issue 捕获路由快照，窗口汇总不会因 task/session 已结束而丢失路由；dedup key 包含 task ID，避免同一 session 连续任务混并。管理员 alerts 是独立路由，不参与 client 间广播。issue webhook 在 `serve` 中同样进入持久化队列，其它命令使用内存队列，失败通知禁止递归。
 ## LLM transient retry / webhook progress
 
 OpenAI provider 在每次尝试内新建流解析器，通过单独事件通道转发增量并跟踪工具调用边界。连接/请求超时、body read 错误、未完成 EOF、idle timeout、HTTP 408/429/5xx 可重试；其它 HTTP 4xx（包括认证、上下文溢出）不可重试。文本或思考增量允许回滚，工具事件一旦出现则禁止重试。

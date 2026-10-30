@@ -11,7 +11,7 @@
 
 ## 持久化、重启恢复与 issue 路由
 
-异步 task 状态和待投递 webhook 自动写入 `<dataDir>/state` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，不受 `--session-dir` 影响。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
+仅 `serve` 打开持久化 journal store：异步 task 状态和待投递 webhook 自动写入 `<dataDir>/state` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，不受 `--session-dir` 影响。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
 
 ```json
 {
@@ -19,6 +19,8 @@
   "shutdownGraceSecs": 10
 }
 ```
+
+`run`、`rpc`、`models` 使用内存 store，不获取 dataDir 锁、不读取或写入这些 journal、不恢复任务或续投服务端 webhook，因此可与同一 dataDir 的 `serve` 并行运行。独立的日志输出和 `--session-dir` 会话历史设置不受影响。
 
 启动时压缩日志、清理超过 `taskTtlSecs` 的结果。最后一个不完整行会被忽略；完整行损坏时，原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），恢复损坏行之前的记录，并上报 error issue `store_corrupt`。上次处于 queued/running 的任务不会重新执行工具，而是标记 failed，error 为 `interrupted by restart`，并上报 client/task 范围的 error issue `task_interrupted`。任务仍可由所属 client 通过 `GET /v1/tasks/{id}` 查询，直到 TTL 到期。
 

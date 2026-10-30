@@ -316,6 +316,12 @@ impl WebhookQueue {
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum StoreMode {
+    Memory,
+    Persistent,
+}
+
 pub struct Hub {
     pub config: Config,
     pub issues: Arc<Reporter>,
@@ -377,12 +383,20 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
 }
 
 impl Hub {
+    /// In-memory journals for standalone commands; session history remains independently configurable.
     /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
     pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>) -> Result<Arc<Self>> {
-        Self::with_reporter(config, provider_name, session_dir, openai_key_file, crate::issues::global().unwrap_or_else(Reporter::noop))
+        Self::with_reporter(config, provider_name, session_dir, openai_key_file, crate::issues::global().unwrap_or_else(Reporter::noop), StoreMode::Memory)
     }
 
-    pub fn with_reporter(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>, issues: Arc<Reporter>) -> Result<Arc<Self>> {
+    pub fn with_reporter(
+        config: Config,
+        provider_name: &str,
+        session_dir: Option<PathBuf>,
+        openai_key_file: Option<&std::path::Path>,
+        issues: Arc<Reporter>,
+        store_mode: StoreMode,
+    ) -> Result<Arc<Self>> {
         config.validate()?;
         let provider: Arc<dyn Provider> = match provider_name {
             "faux" => Arc::new(FauxProvider),
@@ -397,8 +411,10 @@ impl Hub {
             other => bail!("unknown provider {other}"),
         };
         let registry = ToolRegistry::with_builtins();
-        let dir = config.data_dir().join("state");
-        let store = crate::store::Store::open(&dir, Duration::from_secs(config.task_ttl_secs))?;
+        let store = match store_mode {
+            StoreMode::Memory => crate::store::Store::memory(),
+            StoreMode::Persistent => crate::store::Store::open(&config.data_dir().join("state"), Duration::from_secs(config.task_ttl_secs))?,
+        };
         let pending = store.pending();
         issues.attach_store(&store);
         for task in store.tasks.lock().unwrap().values_mut() {
@@ -797,6 +813,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_hub_leaves_server_journals_untouched_with_or_without_server() {
+        let cfg = config();
+        let dir = cfg.data_dir();
+        let server = Hub::with_reporter(cfg.clone(), "faux", None, None, Reporter::noop(), StoreMode::Persistent).unwrap();
+        let task: Task = serde_json::from_value(serde_json::json!({
+            "taskId": "server-task", "owner": "default", "sessionId": "server-session", "status": "running", "createdAt": unix_ms(),
+            "finishedAt": null, "result": null, "error": null, "delivery": null, "deliveries": []
+        }))
+        .unwrap();
+        server.store.save_task(&task).unwrap();
+        server.store.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
+        let delivery = crate::store::Delivery {
+            url: "http://127.0.0.1:1/hook".into(),
+            payload: serde_json::json!({"ok": true}),
+            client: Some("default".into()),
+            session_id: None,
+            task_id: None,
+            index: None,
+            status: DeliveryStatus { delivery_id: "server-delivery".into(), event: "task.completed".into(), state: DeliveryState::Pending, attempts: 1, last_status: Some(500), last_error: None },
+        };
+        server.store.save_delivery(&delivery).unwrap();
+        let snapshot = || {
+            let mut files: Vec<_> = std::fs::read_dir(dir.join("state")).unwrap().map(|entry| entry.unwrap().path()).collect();
+            files.sort();
+            files.into_iter().map(|path| (path.file_name().unwrap().to_owned(), std::fs::read(path).unwrap())).collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        let mut server = Some(server);
+        for running in [true, false] {
+            if !running {
+                drop(server.take());
+            }
+            let memory = Hub::new(cfg.clone(), "faux", None, None).unwrap();
+            assert!(memory.store.tasks.lock().unwrap().is_empty());
+            assert!(memory.store.pending().is_empty());
+            let h = memory.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
+            let local = memory.submit_task(&cfg.clients[0], &h.id, "hello".into(), &[]).unwrap();
+            memory.finish_task(&local.task_id, TaskStatus::Succeeded, serde_json::json!({"text": "done"})).unwrap();
+            memory.store.save_delivery(&delivery).unwrap();
+            assert_eq!(memory.store.pending().len(), 1);
+            let mut completed = delivery.clone();
+            completed.status.state = DeliveryState::Delivered;
+            memory.store.save_delivery(&completed).unwrap();
+            assert!(memory.store.pending().is_empty());
+            memory.abort_all().await;
+            drop(memory);
+            assert_eq!(snapshot(), before);
+        }
+        // With no existing state, standalone commands must not even create the data directory.
+        let mut fresh = cfg;
+        fresh.data_dir = Some(dir.join("unused"));
+        let memory = Hub::new(fresh.clone(), "faux", None, None).unwrap();
+        assert!(!fresh.data_dir().exists());
+        drop(memory);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn restart_resumes_same_delivery_and_interrupts_running_task() {
         use axum::{http::StatusCode, routing::post, Json, Router};
         let healthy = Arc::new(AtomicBool::new(false));
@@ -828,7 +902,7 @@ mod tests {
         cfg.data_dir = Some(dir.clone());
         cfg.clients[0].resolved_webhooks = vec![ResolvedTarget { target: target.clone(), events: None, min_severity: None }];
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent).unwrap();
         let h = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
         let task = hub.submit_task(&cfg.clients[0], &h.id, "hello".into(), &cfg.clients[0].resolved_webhooks).unwrap();
         let queue = hub.webhook_queue(task.task_id.clone(), target);
@@ -846,7 +920,7 @@ mod tests {
         drop(hub);
         assert!(weak.upgrade().is_none());
         healthy.store(true, Ordering::Relaxed);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent).unwrap();
         let restored = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
         assert_eq!(restored.status, TaskStatus::Failed);
         assert_eq!(restored.error.as_deref(), Some("interrupted by restart"));
@@ -886,7 +960,7 @@ mod tests {
         cfg.data_dir = Some(dir.clone());
         cfg.shutdown_grace_secs = 0;
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent).unwrap();
         let h = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
         let task = hub.submit_task(&cfg.clients[0], &h.id, "hello".into(), &[]).unwrap();
         let queue = hub.webhook_queue(task.task_id.clone(), WebhookTarget { url: "http://127.0.0.1:1/removed".into(), secret: None });
@@ -896,7 +970,7 @@ mod tests {
         assert!(!hub.store.pending().is_empty());
         drop(queue);
         drop(hub);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent).unwrap();
         tokio::time::timeout(Duration::from_secs(3), hub.store.flush()).await.unwrap();
         reporter.flush(Duration::from_secs(3)).await;
         let task = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
@@ -936,7 +1010,7 @@ mod tests {
         cfg.clients[0].resolved_webhooks = vec![target("own", Severity::Warn), target("filtered", Severity::Fatal)];
         cfg.clients.push(Client { name: "other".into(), resolved_webhooks: vec![target("other", Severity::Warn)], ..cfg.clients[0].clone() });
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Memory).unwrap();
         let session = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
         let app = crate::http::test_router(hub.clone());
         let request = axum::http::Request::builder()

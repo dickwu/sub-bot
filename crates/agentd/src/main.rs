@@ -246,7 +246,13 @@ async fn main() -> anyhow::Result<()> {
         loaded.unix_socket = Some(path.clone().unwrap_or_else(|| loaded.data_dir().join("sub-bot.sock")));
     }
     install_reporter(&loaded, &cli);
-    let new_hub = |cfg: config::Config| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
+    let new_hub = |cfg: config::Config| {
+        if matches!(cli.cmd, Cmd::Serve { .. }) {
+            hub::Hub::with_reporter(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref(), issues::global().expect("installed reporter"), hub::StoreMode::Persistent)
+        } else {
+            hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())
+        }
+    };
     // Construct before dispatch so initialization failures get the short synchronous alert path.
     let prepared_hub = if matches!(cli.cmd, Cmd::Issues { .. }) {
         None

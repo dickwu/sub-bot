@@ -29,14 +29,19 @@ pub struct Delivery {
 
 type DeliveryLane = (Option<String>, String);
 
+#[derive(Default)]
 pub struct Store {
     pub tasks: Mutex<HashMap<String, Task>>,
     deliveries: Mutex<HashMap<String, Delivery>>,
-    task_file: Mutex<File>,
-    delivery_file: Mutex<File>,
+    journals: Option<Journals>,
     lanes: Mutex<HashMap<DeliveryLane, Arc<tokio::sync::Mutex<()>>>>,
     workers: Mutex<Vec<tokio::task::AbortHandle>>,
     corrupt_journals: Mutex<Vec<&'static str>>,
+}
+
+struct Journals {
+    task_file: Mutex<File>,
+    delivery_file: Mutex<File>,
     // Keep the same inode locked until all journal handles have been closed. Never unlink it.
     #[cfg(unix)]
     _lock: File,
@@ -108,6 +113,11 @@ fn compact<T: Serialize>(dir: &Path, name: &str, records: impl Iterator<Item = T
 }
 
 impl Store {
+    /// Ephemeral task/delivery state: no filesystem access, recovery, or lock.
+    pub fn memory() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
     pub fn open(dir: &Path, ttl: Duration) -> Result<Arc<Self>> {
         #[cfg(unix)]
         {
@@ -168,13 +178,15 @@ impl Store {
         Ok(Arc::new(Self {
             tasks: Mutex::new(tasks),
             deliveries: Mutex::new(deliveries),
-            task_file: Mutex::new(task_file),
-            delivery_file: Mutex::new(delivery_file),
+            journals: Some(Journals {
+                task_file: Mutex::new(task_file),
+                delivery_file: Mutex::new(delivery_file),
+                #[cfg(unix)]
+                _lock: lock,
+            }),
             lanes: Mutex::new(HashMap::new()),
             workers: Mutex::new(vec![]),
             corrupt_journals: Mutex::new(corrupt_journals),
-            #[cfg(unix)]
-            _lock: lock,
         }))
     }
 
@@ -188,7 +200,10 @@ impl Store {
     }
 
     pub fn save_task(&self, task: &Task) -> Result<()> {
-        append(&self.task_file, task)
+        if let Some(journals) = &self.journals {
+            append(&journals.task_file, task)?;
+        }
+        Ok(())
     }
 
     pub fn pending(&self) -> Vec<Delivery> {
@@ -197,7 +212,9 @@ impl Store {
 
     pub fn save_delivery(&self, delivery: &Delivery) -> Result<()> {
         let mut deliveries = self.deliveries.lock().unwrap();
-        append(&self.delivery_file, delivery)?;
+        if let Some(journals) = &self.journals {
+            append(&journals.delivery_file, delivery)?;
+        }
         if delivery.status.state == DeliveryState::Pending {
             deliveries.insert(delivery.status.delivery_id.clone(), delivery.clone());
         } else {

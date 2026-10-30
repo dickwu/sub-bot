@@ -141,6 +141,8 @@ pub struct Hub {
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     shutting_down: AtomicBool,
     http: reqwest::Client,
+    #[cfg(test)]
+    pub(crate) callback_timeout: Option<Duration>,
     models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
 }
 
@@ -214,6 +216,8 @@ impl Hub {
             sessions: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
             http: reqwest::Client::new(),
+            #[cfg(test)]
+            callback_timeout: None,
             models_cache: Default::default(),
         }))
     }
@@ -273,7 +277,10 @@ impl Hub {
             if tools.iter().any(|t| t.name() == spec.name) {
                 bail!("caller tool '{}' collides with a built-in tool", spec.name);
             }
-            tools.push(Arc::new(CallbackTool { spec, session_id: id.clone(), http: self.http.clone() }));
+            let tool = CallbackTool::new(spec, id.clone(), self.http.clone());
+            #[cfg(test)]
+            let tool = CallbackTool { timeout: self.callback_timeout.unwrap_or(tool.timeout), ..tool };
+            tools.push(Arc::new(tool));
         }
 
         let model = match req.model {

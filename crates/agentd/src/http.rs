@@ -351,6 +351,151 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
+    /// Real loopback HTTP receiver; no tracing middleware or request/header logging.
+    async fn callback_chat(status: StatusCode, reply: String, slow: bool, token: Option<&str>) -> Value {
+        use axum::http::{header, HeaderMap, Method};
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/callback", listener.local_addr().unwrap());
+        let (tx, mut requests) = tokio::sync::mpsc::channel(8);
+        let receiver = Router::new().route(
+            "/callback",
+            post(move |method: Method, headers: HeaderMap, Json(body): Json<Value>| {
+                let tx = tx.clone();
+                let reply = reply.clone();
+                async move {
+                    tx.send((method, headers, body)).await.unwrap();
+                    if slow {
+                        std::future::pending::<()>().await;
+                    }
+                    (status, [(header::CONTENT_TYPE, "application/json")], reply)
+                }
+            }),
+        );
+        // Drop aborts the listener even if an assertion fails.
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
+
+        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        if slow {
+            Arc::get_mut(&mut hub).unwrap().callback_timeout = Some(Duration::from_secs(1));
+        }
+        let app = router(AppState { hub });
+        let args = json!({"query": "hello 回调", "limit": 3, "options": {"enabled": true}, "ids": [1, 2]});
+        let mut spec = json!({
+            "name": "caller_lookup", "description": "Look up caller data",
+            "parameters": {"type": "object", "properties": {
+                "query": {"type": "string"}, "limit": {"type": "integer"},
+                "options": {"type": "object"}, "ids": {"type": "array", "items": {"type": "integer"}}
+            }, "required": ["query"]},
+            "callbackUrl": url,
+        });
+        if let Some(token) = token {
+            spec["callbackToken"] = json!(token);
+        }
+        let (chat_status, chat) = tokio::time::timeout(
+            Duration::from_secs(5),
+            request(
+                &app,
+                "POST",
+                "/v1/chat",
+                Some("test-token"),
+                json!({
+                    "message": format!("/tool caller_lookup {args}"),
+                    "session": {"tools": [], "callerTools": [spec]},
+                }),
+            ),
+        )
+        .await
+        .expect("callback chat hung");
+        assert_eq!(chat_status, StatusCode::OK);
+        assert_eq!(chat["aborted"], false);
+        let (method, headers, body) = requests.try_recv().expect("callback request missing");
+        assert_eq!(method, Method::POST);
+        assert_eq!(headers[header::CONTENT_TYPE], "application/json");
+        // Boolean assertions avoid printing credentials on failure.
+        match token {
+            Some(token) => assert!(headers.get(header::AUTHORIZATION).is_some_and(|v| v == format!("Bearer {token}").as_str())),
+            None => assert!(!headers.contains_key(header::AUTHORIZATION)),
+        }
+        let session_id = chat["sessionId"].as_str().unwrap();
+        assert!(!session_id.is_empty());
+        let call_id = body["toolCallId"].as_str().unwrap();
+        assert!(!call_id.is_empty());
+        assert_eq!(body, json!({"sessionId": session_id, "toolCallId": call_id, "toolName": "caller_lookup", "arguments": args}));
+        assert!(requests.try_recv().is_err(), "unexpected duplicate callback");
+
+        let messages = chat["messages"].as_array().unwrap();
+        let results: Vec<_> = messages.iter().filter(|m| m["role"] == "toolResult").collect();
+        assert_eq!(results.len(), 1);
+        let result = results[0];
+        assert_eq!(result["toolName"], "caller_lookup");
+        assert_eq!(result["toolCallId"], call_id);
+        let call = &messages.iter().find(|m| m["role"] == "assistant").unwrap()["content"][0];
+        assert_eq!(call["id"], call_id);
+        assert_eq!(call["name"], "caller_lookup");
+        assert_eq!(call["arguments"], args);
+        result.clone()
+    }
+
+    #[tokio::test]
+    async fn caller_callback_round_trip() {
+        let content = "caller reply 回调成功";
+        let result = callback_chat(StatusCode::OK, json!({"content": content, "isError": false}).to_string(), false, Some("callback-test-token")).await;
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"], json!([{"type": "text", "text": content}]));
+    }
+
+    #[tokio::test]
+    async fn caller_callback_without_token() {
+        let result = callback_chat(StatusCode::OK, json!({"content": "anonymous reply", "isError": false}).to_string(), false, None).await;
+        assert_eq!(result["isError"], false);
+        assert_eq!(result["content"], json!([{"type": "text", "text": "anonymous reply"}]));
+    }
+
+    #[tokio::test]
+    async fn caller_callback_error_reply() {
+        let result = callback_chat(StatusCode::OK, json!({"content": "lookup denied", "isError": true}).to_string(), false, Some("callback-test-token")).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"], json!([{"type": "text", "text": "lookup denied"}]));
+    }
+
+    #[tokio::test]
+    async fn caller_callback_http_error_includes_bounded_body() {
+        for body in ["receiver failed".to_string(), format!("receiver failed: {}DO_NOT_INCLUDE_TAIL", "x".repeat(2048))] {
+            let result = callback_chat(StatusCode::INTERNAL_SERVER_ERROR, body.clone(), false, Some("callback-test-token")).await;
+            assert_eq!(result["isError"], true);
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("500"));
+            assert!(text.contains(&body[..body.len().min(1024)]));
+            if body.len() > 1024 {
+                assert!(text.ends_with(" [truncated]"));
+                assert!(!text.contains("DO_NOT_INCLUDE_TAIL"));
+                assert_eq!(text.split_once(": ").unwrap().1.len(), 1024 + " [truncated]".len());
+            } else {
+                assert!(text.ends_with(&body));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_callback_oversized_response() {
+        let reply = json!({"content": "x".repeat(1024 * 1024), "isError": false}).to_string();
+        let result = callback_chat(StatusCode::OK, reply, false, Some("callback-test-token")).await;
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn caller_callback_timeout() {
+        let result = callback_chat(StatusCode::OK, String::new(), true, Some("callback-test-token")).await;
+        assert_eq!(result["isError"], true);
+        assert!(result["content"][0]["text"].as_str().unwrap().contains("callback timed out"));
+    }
+
     #[tokio::test]
     async fn create_delete_get_and_owner_visibility() {
         let (app, _) = app(64);

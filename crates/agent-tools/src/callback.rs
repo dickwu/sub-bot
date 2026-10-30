@@ -21,10 +21,18 @@ pub struct CallbackTool {
     pub spec: CallerToolSpec,
     pub session_id: String,
     pub http: reqwest::Client,
+    pub timeout: std::time::Duration,
 }
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 1024;
 const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl CallbackTool {
+    pub fn new(spec: CallerToolSpec, session_id: String, http: reqwest::Client) -> Self {
+        Self { spec, session_id, http, timeout: CALLBACK_TIMEOUT }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,13 +61,19 @@ impl AgentTool for CallbackTool {
             req = req.bearer_auth(t);
         }
         let request = async {
-            let resp = req.send().await?.error_for_status()?;
+            let resp = req.send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let (body, truncated) = crate::response::read_body(resp, MAX_ERROR_BYTES).await?;
+                let snippet = String::from_utf8_lossy(&body);
+                anyhow::bail!("callback HTTP {status}: {snippet}{}", if truncated { " [truncated]" } else { "" });
+            }
             let (body, truncated) = crate::response::read_body(resp, MAX_RESPONSE_BYTES).await?;
             anyhow::ensure!(!truncated, "callback response exceeds {MAX_RESPONSE_BYTES} bytes");
             Ok::<CallbackReply, anyhow::Error>(serde_json::from_slice(&body)?)
         };
         let reply = tokio::select! {
-            r = tokio::time::timeout(CALLBACK_TIMEOUT, request) => r.context("callback timed out")??,
+            r = tokio::time::timeout(self.timeout, request) => r.context("callback timed out")??,
             _ = cancel.cancelled() => anyhow::bail!("aborted"),
         };
         let mut r = ToolResult::text(reply.content);
@@ -75,11 +89,7 @@ mod tests {
     use std::sync::Arc;
 
     fn tool(url: String) -> CallbackTool {
-        CallbackTool {
-            spec: CallerToolSpec { name: "test".into(), description: String::new(), parameters: json!({}), callback_url: url, callback_token: None },
-            session_id: "test".into(),
-            http: reqwest::Client::new(),
-        }
+        CallbackTool::new(CallerToolSpec { name: "test".into(), description: String::new(), parameters: json!({}), callback_url: url, callback_token: None }, "test".into(), reqwest::Client::new())
     }
 
     #[tokio::test]

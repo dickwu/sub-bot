@@ -143,7 +143,7 @@ impl Config {
 
     /// profile 是否允许使用该模型。
     pub fn model_allowed(p: &Profile, model: &str) -> bool {
-        p.allowed_models.as_ref().map_or(true, |list| list.iter().any(|pat| agent_ai::models::model_matches(pat, model)))
+        p.allowed_models.as_ref().is_none_or(|list| list.iter().any(|pat| agent_ai::models::model_matches(pat, model)))
     }
 
     /// 常量时间比较哈希，找出 token 对应的客户端。

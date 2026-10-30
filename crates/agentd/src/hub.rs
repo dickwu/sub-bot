@@ -24,76 +24,51 @@ pub struct SessionHandle {
     store: Mutex<Option<Session>>,
 }
 
-#[derive(serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Disposition {
-    Started,
-    QueuedSteer,
-    QueuedFollowUp,
-}
-
-trait PipeSpawn: std::future::Future<Output = ()> + Send + Sized + 'static {
-    fn pipe_spawn(self) {
-        tokio::spawn(self);
-    }
-}
-impl<F: std::future::Future<Output = ()> + Send + 'static> PipeSpawn for F {}
+pub use agent_core::Disposition;
 
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
         let msg_len = text.chars().count();
         let msg = Message::user_text(text);
-        if self.agent.is_running() {
-            tracing::info!(session_id = %self.id, mode = mode.unwrap_or("follow_up"), "message queued while running");
-            return if mode == Some("steer") {
-                self.agent.steer(msg);
-                Disposition::QueuedSteer
-            } else {
-                self.agent.follow_up(msg);
-                Disposition::QueuedFollowUp
-            };
-        }
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
         let effort = self.agent.config.reasoning.map(|l| l.as_str()).unwrap_or("-");
         let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, model = %self.agent.config.model, reasoning_effort = effort);
-        tracing::Instrument::instrument(async move {
-            let started = std::time::Instant::now();
-            tracing::info!(prompt_chars = msg_len, "run started");
-            if let Some(new) = this.agent.prompt(msg).await {
-                let (mut input, mut output, mut reasoning_tokens, mut tools) = (0u64, 0u64, 0u64, 0usize);
-                let mut stop = None;
-                for m in &new {
-                    match m {
-                        Message::Assistant(a) => {
-                            input += a.usage.input;
-                            output += a.usage.output;
-                            reasoning_tokens += a.usage.reasoning;
-                            if let Some(api) = a.api {
-                                *this.last_call.lock().unwrap() = Some((api, a.reasoning_effort));
-                            }
-                            stop = Some(a.stop_reason);
-                            if let Some(e) = &a.error_message {
-                                tracing::warn!(error = %e, "assistant message ended with error");
-                            }
+        let _entered = span.enter();
+        let started = std::time::Instant::now();
+        let disposition = self.agent.submit_with(msg, mode, move |new| {
+            let (mut input, mut output, mut reasoning_tokens, mut tools) = (0u64, 0u64, 0u64, 0usize);
+            let mut stop = None;
+            for m in &new {
+                match m {
+                    Message::Assistant(a) => {
+                        input += a.usage.input;
+                        output += a.usage.output;
+                        reasoning_tokens += a.usage.reasoning;
+                        if let Some(api) = a.api {
+                            *this.last_call.lock().unwrap() = Some((api, a.reasoning_effort));
                         }
-                        Message::ToolResult(_) => tools += 1,
-                        _ => {}
+                        stop = Some(a.stop_reason);
+                        if let Some(e) = &a.error_message {
+                            tracing::warn!(error = %e, "assistant message ended with error");
+                        }
                     }
+                    Message::ToolResult(_) => tools += 1,
+                    _ => {}
                 }
-                tracing::info!(latency_ms = started.elapsed().as_millis() as u64, messages = new.len(), tool_calls = tools, input_tokens = input, output_tokens = output, reasoning_tokens, stop_reason = ?stop, "run finished");
-                if let Some(store) = this.store.lock().unwrap().as_mut() {
-                    for m in new {
-                        if let Err(e) = store.append_message(m) {
-                            tracing::error!(error = %e, "persist failed");
-                        }
+            }
+            tracing::info!(latency_ms = started.elapsed().as_millis() as u64, messages = new.len(), tool_calls = tools, input_tokens = input, output_tokens = output, reasoning_tokens, stop_reason = ?stop, "run finished");
+            if let Some(store) = this.store.lock().unwrap().as_mut() {
+                for m in new {
+                    if let Err(e) = store.append_message(m) {
+                        tracing::error!(error = %e, "persist failed");
                     }
                 }
             }
-        }, span)
-        .pipe_spawn();
-        Disposition::Started
+        });
+        tracing::info!(prompt_chars = msg_len, ?disposition, "message submitted");
+        disposition
     }
 
     /// 实际生效的推理强度：有调用记录时取最近一次真正发送的值，否则取会话解析后的值。

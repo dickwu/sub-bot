@@ -4,6 +4,7 @@
 //! - `run`：一次性执行一个 prompt 并打印结果
 //! - `models`：实时列出 provider 支持的模型
 //! - `hash-token`：生成配置文件里用的 token 哈希
+//!
 //! OpenAI key 只从环境变量读入进程内存，任何接口都不会回传。
 
 #[cfg(not(unix))]

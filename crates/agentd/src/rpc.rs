@@ -22,6 +22,15 @@ enum Command {
     GetAvailableModels,
 }
 
+fn send_response(out: &mpsc::UnboundedSender<Value>, id: Option<Value>, command: String, resp: Value) {
+    let mut r = json!({"type": "response", "command": command});
+    if let Some(id) = id {
+        r["id"] = id;
+    }
+    r.as_object_mut().unwrap().extend(resp.as_object().unwrap().clone());
+    let _ = out.send(r);
+}
+
 /// stdio 的调用方就是父进程本身，视为可用全部 profile 的本地 client。
 pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect() };
@@ -52,8 +61,10 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
         }
     });
 
+    let mut requests = tokio::task::JoinSet::new();
     let mut lines = BufReader::new(tokio::io::stdin()).split(b'\n');
     while let Some(raw) = lines.next_segment().await? {
+        while requests.try_join_next().is_some() {}
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_end_matches('\r');
         if text.trim().is_empty() {
@@ -84,25 +95,35 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
                 json!({"success": true})
             }
             Ok(Command::GetMessages) => {
-                json!({"success": true, "data": {"messages": session.agent.messages().await}})
+                let session = session.clone();
+                let out = out_tx.clone();
+                requests.spawn(async move {
+                    let resp = json!({"success": true, "data": {"messages": session.agent.messages().await}});
+                    send_response(&out, id, cmd_name, resp);
+                });
+                continue;
             }
             Ok(Command::GetState) => {
                 json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.effective_effort(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile}})
             }
-            Ok(Command::GetAvailableModels) => match hub.list_models(false).await {
-                Ok(models) => json!({"success": true, "data": {"models": models}}),
-                Err(e) => json!({"success": false, "error": e.to_string()}),
-            },
+            Ok(Command::GetAvailableModels) => {
+                let hub = hub.clone();
+                let out = out_tx.clone();
+                requests.spawn(async move {
+                    let resp = match hub.list_models(false).await {
+                        Ok(models) => json!({"success": true, "data": {"models": models}}),
+                        Err(e) => json!({"success": false, "error": e.to_string()}),
+                    };
+                    send_response(&out, id, cmd_name, resp);
+                });
+                continue;
+            }
         };
-        let mut r = json!({"type": "response", "command": cmd_name});
-        if let Some(id) = id {
-            r["id"] = id;
-        }
-        r.as_object_mut().unwrap().extend(resp.as_object().unwrap().clone());
-        let _ = out_tx.send(r);
+        send_response(&out_tx, id, cmd_name, resp);
     }
     // stdin 关闭 = 有序退出
     session.agent.abort();
+    requests.shutdown().await;
     forwarder.abort();
     let _ = forwarder.await;
     drop(out_tx);

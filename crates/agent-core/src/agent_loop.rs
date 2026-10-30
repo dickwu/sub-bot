@@ -35,8 +35,8 @@ fn drain(q: &Queue) -> Vec<Message> {
 }
 
 /// 对应 `agent-loop.ts::runLoop`：外层循环处理 follow-up，内层循环处理工具调用与 steering。
-/// `context` 会被就地追加；返回本次运行新增的消息。
-pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &LoopConfig, cancel: CancellationToken, emit: Emit) -> Vec<Message> {
+/// `context` 是随消息追加更新的快照；只在 clone/push 时短暂持锁。
+pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg: &LoopConfig, cancel: CancellationToken, emit: Emit) -> Vec<Message> {
     let mut new_messages = vec![];
     emit(AgentEvent::AgentStart);
     emit(AgentEvent::TurnStart);
@@ -57,7 +57,7 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             for m in pending.drain(..) {
                 emit(AgentEvent::MessageStart { message: m.clone() });
                 emit(AgentEvent::MessageEnd { message: m.clone() });
-                context.push(m.clone());
+                context.lock().unwrap().push(m.clone());
                 new_messages.push(m);
             }
 
@@ -73,7 +73,7 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
                 let m = Message::user_text("[sub-bot] Token budget reached. Do not call any more tools; give your final answer now based on what you have.");
                 emit(AgentEvent::MessageStart { message: m.clone() });
                 emit(AgentEvent::MessageEnd { message: m.clone() });
-                context.push(m.clone());
+                context.lock().unwrap().push(m.clone());
                 new_messages.push(m);
                 stream_assistant(context, cfg, cancel.clone(), &emit, false).await
             } else {
@@ -81,10 +81,10 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             };
             used_tokens += assistant.usage.total_tokens;
             let am = Message::Assistant(assistant.clone());
-            context.push(am.clone());
+            context.lock().unwrap().push(am.clone());
             new_messages.push(am.clone());
 
-            if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
+            if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) && assistant.tool_calls().is_empty() {
                 emit(AgentEvent::TurnEnd { message: am, tool_results: vec![] });
                 break 'outer;
             }
@@ -93,7 +93,9 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             let mut results = vec![];
             more_tool_calls = false;
             if !calls.is_empty() {
-                let (msgs, terminate) = if assistant.stop_reason == StopReason::Length {
+                let (msgs, terminate) = if cancel.is_cancelled() || matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    (calls.iter().map(|c| tool_result_msg(c, &ToolResult::error("aborted before execution"))).collect(), true)
+                } else if assistant.stop_reason == StopReason::Length {
                     // 被截断的参数不可信，全部判失败（对应 failToolCallsFromTruncatedMessage）
                     (calls.iter().map(|c| tool_result_msg(c, &ToolResult::error("tool call truncated by length limit"))).collect(), false)
                 } else {
@@ -104,7 +106,7 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
                     let m = Message::ToolResult(r.clone());
                     emit(AgentEvent::MessageStart { message: m.clone() });
                     emit(AgentEvent::MessageEnd { message: m.clone() });
-                    context.push(m.clone());
+                    context.lock().unwrap().push(m.clone());
                     new_messages.push(m);
                 }
                 results = msgs;
@@ -113,7 +115,7 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             if budget_forced {
                 break 'outer;
             }
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) {
                 break 'outer;
             }
             pending = drain(&cfg.steering);
@@ -128,11 +130,11 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
     new_messages
 }
 
-async fn stream_assistant(context: &[Message], cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
+async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
     let req = Request {
         model: cfg.model.clone(),
         system_prompt: cfg.system_prompt.clone(),
-        messages: context.to_vec(),
+        messages: context.lock().unwrap().clone(),
         tools: if with_tools { cfg.tools.iter().map(|t| t.spec()).collect() } else { vec![] },
         reasoning: cfg.reasoning,
         api: cfg.api,
@@ -158,6 +160,10 @@ fn tool_result_msg(call: &ToolCall, r: &ToolResult) -> ToolResultMessage {
 }
 
 async fn run_one(call: ToolCall, cfg: &LoopConfig, cancel: CancellationToken, emit: Emit) -> ToolResult {
+    // 即使并行 future 已构造，轮到 poll 时也可能已取消。
+    if cancel.is_cancelled() {
+        return ToolResult::error("aborted before execution");
+    }
     use tracing::Instrument;
     let span = tracing::info_span!("tool", tool = %call.name, tool_call_id = %call.id);
     run_one_inner(call, cfg, cancel, emit).instrument(span).await
@@ -191,13 +197,23 @@ async fn run_one_inner(call: ToolCall, cfg: &LoopConfig, cancel: CancellationTok
 
 /// 对应 executeToolCalls：全部可并行则并发执行，否则顺序执行；结果按模型给出的顺序返回。
 async fn execute_tool_calls(calls: &[ToolCall], cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit) -> (Vec<ToolResultMessage>, bool) {
-    let all_parallel = calls.iter().all(|c| cfg.tools.iter().find(|t| t.name() == c.name).map_or(true, |t| t.execution_mode() == ExecutionMode::Parallel));
+    if cancel.is_cancelled() {
+        return (calls.iter().map(|c| tool_result_msg(c, &ToolResult::error("aborted before execution"))).collect(), false);
+    }
+    let all_parallel = calls.iter().all(|c| cfg.tools.iter().find(|t| t.name() == c.name).is_none_or(|t| t.execution_mode() == ExecutionMode::Parallel));
     let results: Vec<ToolResult> = if all_parallel {
-        join_all(calls.iter().map(|c| run_one(c.clone(), cfg, cancel.clone(), emit.clone()))).await
+        join_all(calls.iter().map(|c| async {
+            if cancel.is_cancelled() {
+                ToolResult::error("aborted before execution")
+            } else {
+                run_one(c.clone(), cfg, cancel.clone(), emit.clone()).await
+            }
+        }))
+        .await
     } else {
         let mut v = vec![];
         for c in calls {
-            v.push(run_one(c.clone(), cfg, cancel.clone(), emit.clone()).await);
+            v.push(if cancel.is_cancelled() { ToolResult::error("aborted before execution") } else { run_one(c.clone(), cfg, cancel.clone(), emit.clone()).await });
         }
         v
     };
@@ -263,8 +279,8 @@ mod tests {
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
         let emit: Emit = Arc::new(move |e| ev.lock().unwrap().push(serde_json::to_value(&e).unwrap()["type"].as_str().unwrap().to_string()));
-        let mut ctx = vec![];
-        let new = run_loop(&mut ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), emit).await;
+        let ctx = Mutex::new(vec![]);
+        let new = run_loop(&ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), emit).await;
         assert_eq!(new.len(), 4); // user, assistant(toolCall), toolResult, assistant(text)
         let ev = events.lock().unwrap();
         assert_eq!(ev.iter().filter(|t| *t == "turn_start").count(), 2);
@@ -307,8 +323,8 @@ mod tests {
             token_budget: Some(250),
         };
         let emit: Emit = Arc::new(|_| {});
-        let mut ctx = vec![];
-        let new = run_loop(&mut ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), emit).await;
+        let ctx = Mutex::new(vec![]);
+        let new = run_loop(&ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), emit).await;
         let assistants: Vec<&AssistantMessage> = new.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).collect();
         // 3 次带工具（100+100+100 >= 250），然后 1 次不带工具的最终答复
         assert_eq!(assistants.len(), 4);

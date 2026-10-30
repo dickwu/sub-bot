@@ -1,60 +1,131 @@
 use crate::{agent_loop::*, event::AgentEvent};
 use agent_ai::Message;
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, Mutex as AsyncMutex};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
-/// 有状态 Agent（对应 `packages/agent/src/agent.ts` 的 `Agent` 类）。
-/// 同一时刻只跑一个 run；运行中再来的输入走 steer / follow_up 队列。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Disposition {
+    Started,
+    QueuedSteer,
+    QueuedFollowUp,
+}
+
+#[derive(Default)]
+struct State {
+    cancel: Option<CancellationToken>,
+}
+
+/// 有状态 Agent。同一时刻只跑一个 run；提交与结束交接共用 state 锁。
 pub struct Agent {
     pub config: LoopConfig,
-    messages: AsyncMutex<Vec<Message>>,
+    messages: Mutex<Vec<Message>>,
     events: broadcast::Sender<AgentEvent>,
-    cancel: Mutex<Option<CancellationToken>>,
+    state: Mutex<State>,
 }
 
 impl Agent {
     pub fn new(config: LoopConfig, history: Vec<Message>) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
-        Arc::new(Self { config, messages: AsyncMutex::new(history), events, cancel: Mutex::new(None) })
+        Arc::new(Self { config, messages: Mutex::new(history), events, state: Mutex::new(State::default()) })
     }
 
-    /// 订阅事件（对应 `subscribe`）。请在 prompt 之前订阅，避免漏掉快速完成的事件。
+    /// 请在提交之前订阅，避免漏掉快速完成的事件。
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.events.subscribe()
     }
 
     pub fn is_running(&self) -> bool {
-        self.cancel.lock().unwrap().is_some()
+        self.state.lock().unwrap().cancel.is_some()
     }
 
-    /// 运行一次完整 run，返回新增消息。若已有 run 在跑，返回 None（调用方应改用 steer/follow_up）。
-    pub async fn prompt(self: &Arc<Self>, message: Message) -> Option<Vec<Message>> {
-        let Ok(mut ctx) = self.messages.try_lock() else { return None };
+    pub fn submit(self: &Arc<Self>, message: Message, mode: Option<&str>) -> Disposition {
+        self.submit_with(message, mode, |_| {})
+    }
+
+    /// 原子地启动或排队。on_messages 在每段循环结束后调用，可用于持久化；排队时使用当前 run 的回调。
+    pub fn submit_with(self: &Arc<Self>, message: Message, mode: Option<&str>, on_messages: impl Fn(Vec<Message>) + Send + 'static) -> Disposition {
+        let mut state = self.state.lock().unwrap();
+        if state.cancel.is_some() {
+            return if mode == Some("steer") {
+                self.config.steering.lock().unwrap().push_back(message);
+                Disposition::QueuedSteer
+            } else {
+                self.config.follow_up.lock().unwrap().push_back(message);
+                Disposition::QueuedFollowUp
+            };
+        }
         let token = CancellationToken::new();
-        *self.cancel.lock().unwrap() = Some(token.clone());
-        let tx = self.events.clone();
-        let emit: Emit = Arc::new(move |e| {
-            let _ = tx.send(e);
-        });
-        let out = run_loop(&mut ctx, vec![message], &self.config, token.clone(), emit).await;
-        *self.cancel.lock().unwrap() = None;
-        let _ = self.events.send(AgentEvent::AgentSettled { aborted: token.is_cancelled() });
+        state.cancel = Some(token.clone());
+        let this = self.clone();
+        tokio::spawn(
+            async move {
+                let tx = this.events.clone();
+                let emit: Emit = Arc::new(move |e| {
+                    let _ = tx.send(e);
+                });
+                let mut pending = vec![message];
+                loop {
+                    let out = run_loop(&this.messages, pending, &this.config, token.clone(), emit.clone()).await;
+                    on_messages(out);
+                    // run_loop 最后一次 drain 与清除 running 之间的提交也必须被接走。
+                    // 锁顺序固定为 state -> queues；没有 std 锁跨越 await。
+                    let mut state = this.state.lock().unwrap();
+                    if token.is_cancelled() {
+                        let mut steering = this.config.steering.lock().unwrap();
+                        let mut follow_up = this.config.follow_up.lock().unwrap();
+                        let discarded = steering.len() + follow_up.len();
+                        steering.clear();
+                        follow_up.clear();
+                        tracing::warn!(discarded, "discarded queued messages after abort");
+                        state.cancel = None;
+                        let _ = this.events.send(AgentEvent::AgentSettled { aborted: true });
+                        break;
+                    }
+                    pending = this.config.steering.lock().unwrap().drain(..).collect();
+                    pending.extend(this.config.follow_up.lock().unwrap().drain(..));
+                    if pending.is_empty() {
+                        state.cancel = None;
+                        let _ = this.events.send(AgentEvent::AgentSettled { aborted: token.is_cancelled() });
+                        break;
+                    }
+                }
+            }
+            .in_current_span(),
+        );
+        Disposition::Started
+    }
+
+    /// 兼容等待式调用：Started 时等待整个 run 并返回新增消息；None 表示已排队，而非启动失败。
+    pub async fn prompt(self: &Arc<Self>, message: Message) -> Option<Vec<Message>> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        if self.submit_with(message, None, move |messages| {
+            let _ = tx.send(messages);
+        }) != Disposition::Started
+        {
+            return None;
+        }
+        let mut out = vec![];
+        while let Some(messages) = rx.recv().await {
+            out.extend(messages);
+        }
         Some(out)
     }
 
-    pub fn steer(&self, m: Message) {
-        self.config.steering.lock().unwrap().push_back(m);
+    pub fn steer(self: &Arc<Self>, m: Message) {
+        self.submit(m, Some("steer"));
     }
-    pub fn follow_up(&self, m: Message) {
-        self.config.follow_up.lock().unwrap().push_back(m);
+    pub fn follow_up(self: &Arc<Self>, m: Message) {
+        self.submit(m, Some("follow_up"));
     }
     pub fn abort(&self) {
-        if let Some(t) = self.cancel.lock().unwrap().as_ref() {
+        if let Some(t) = self.state.lock().unwrap().cancel.as_ref() {
             t.cancel();
         }
     }
     pub async fn messages(&self) -> Vec<Message> {
-        self.messages.lock().await.clone()
+        self.messages.lock().unwrap().clone()
     }
 }

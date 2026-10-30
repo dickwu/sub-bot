@@ -63,18 +63,34 @@ fn default_max_turns() -> usize {
     50
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
     pub name: String,
     /// token 的 SHA-256（hex）。用 `sub-bot hash-token <token>` 生成，配置文件里不存明文。
     pub token_sha256: String,
     pub profiles: Vec<String>,
+    pub webhook_url: Option<String>,
+    pub webhook_secret_file: Option<PathBuf>,
+    #[serde(default)]
+    pub webhook_allowed_hosts: Vec<String>,
+    #[serde(skip)]
+    pub webhook_secret: Option<String>,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client").field("name", &self.name).field("profiles", &self.profiles).field("webhook_secret", &"<redacted>").finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default = "default_session_idle_ttl")]
+    pub task_ttl_secs: u64,
+    #[serde(default = "default_webhook_attempts")]
+    pub webhook_max_attempts: u32,
     /// LLM 流连续无字节的超时（秒）。
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
@@ -106,6 +122,10 @@ pub struct Config {
     pub clients: Vec<Client>,
 }
 
+fn default_webhook_attempts() -> u32 {
+    6
+}
+
 fn default_session_idle_ttl() -> u64 {
     3600
 }
@@ -126,6 +146,11 @@ fn default_model() -> String {
     "gpt-4.1-mini".into()
 }
 
+/// URL errors deliberately omit the input (it may contain credentials).
+pub fn webhook_url(value: &str) -> Option<reqwest::Url> {
+    reqwest::Url::parse(value).ok().filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some() && url.username().is_empty() && url.password().is_none())
+}
+
 pub fn sha256_hex(s: &str) -> String {
     Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -136,6 +161,16 @@ impl Config {
         if let (Some(f), Some(dir)) = (&cfg.api_key_file, path.parent()) {
             if f.is_relative() {
                 cfg.api_key_file = Some(dir.join(f));
+            }
+        }
+        for client in &mut cfg.clients {
+            if let Some(file) = &mut client.webhook_secret_file {
+                if file.is_relative() {
+                    *file = path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(&*file);
+                }
+                let secret = std::fs::read_to_string(file).map_err(|_| anyhow::anyhow!("cannot read webhookSecretFile"))?;
+                anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
+                client.webhook_secret = Some(secret.trim().to_string());
             }
         }
         cfg.validate()?;
@@ -158,6 +193,9 @@ impl Config {
             }
         }
         for client in &self.clients {
+            if let Some(url) = &client.webhook_url {
+                anyhow::ensure!(webhook_url(url).is_some(), "webhookUrl must be an http/https URL");
+            }
             anyhow::ensure!(client.token_sha256.len() == 64 && client.token_sha256.bytes().all(|b| b.is_ascii_hexdigit()), "client '{}': tokenSha256 must be exactly 64 hex characters", client.name);
             for profile in &client.profiles {
                 anyhow::ensure!(self.profiles.contains_key(profile), "client '{}': unknown profile '{profile}'", client.name);
@@ -192,6 +230,8 @@ impl Config {
             },
         );
         Config {
+            task_ttl_secs: default_session_idle_ttl(),
+            webhook_max_attempts: default_webhook_attempts(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             chat_timeout_secs: default_chat_timeout_secs(),
             default_model: model,
@@ -202,7 +242,7 @@ impl Config {
             chat_session_ttl_secs: default_chat_session_ttl(),
             max_sessions_per_client: default_max_sessions(),
             profiles,
-            clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }],
+            clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],
         }
     }
 
@@ -221,6 +261,37 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_config_secret_loading_validation_and_redaction() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-webhook-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let secret = "test-webhook-key-do-not-log";
+        std::fs::write(dir.join("secret"), format!("  {secret}\n")).unwrap();
+        let mut value = serde_json::json!({"profiles": {}, "clients": [{"name": "bot", "tokenSha256": sha256_hex("token"), "profiles": [],
+            "webhookUrl": "https://example.com/hook", "webhookSecretFile": "secret", "webhookAllowedHosts": ["localhost:1234"]}]});
+        std::fs::write(&path, value.to_string()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!((cfg.task_ttl_secs, cfg.webhook_max_attempts), (3600, 6));
+        assert!(cfg.clients[0].webhook_secret.as_deref() == Some(secret));
+        assert_eq!(cfg.clients[0].webhook_secret_file.as_deref(), Some(dir.join("secret").as_path()));
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("<redacted>"));
+        for url in ["not a url", "ftp://example.com", "file:///tmp/hook", "https://user:password@example.com"] {
+            value["clients"][0]["webhookUrl"] = serde_json::json!(url);
+            std::fs::write(&path, value.to_string()).unwrap();
+            assert!(Config::load(&path).unwrap_err().to_string().contains("webhookUrl"));
+        }
+        value["clients"][0]["webhookUrl"] = serde_json::json!("http://localhost");
+        std::fs::write(&path, value.to_string()).unwrap();
+        std::fs::write(dir.join("secret"), " \n").unwrap();
+        assert_eq!(Config::load(&path).unwrap_err().to_string(), "webhookSecretFile is empty");
+        std::fs::remove_file(dir.join("secret")).unwrap();
+        assert_eq!(Config::load(&path).unwrap_err().to_string(), "cannot read webhookSecretFile");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn session_limits_defaults_and_overrides() {

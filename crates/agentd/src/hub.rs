@@ -1,4 +1,7 @@
-use crate::config::{Client, Config, Profile};
+use crate::{
+    config::{Client, Config, Profile},
+    webhook::{Deliverer, DeliveryStatus, RetryPolicy, WebhookTarget},
+};
 use agent_ai::{faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
 use agent_session::Session;
@@ -133,12 +136,46 @@ impl std::fmt::Display for TooManySessions {
 
 impl std::error::Error for TooManySessions {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Timeout,
+    Aborted,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Task {
+    pub task_id: String,
+    pub owner: String,
+    pub session_id: String,
+    pub status: TaskStatus,
+    pub created_at: u64,
+    pub finished_at: Option<u64>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<String>,
+    pub delivery: Option<DeliveryStatus>,
+    #[serde(skip)]
+    finished: Option<Instant>,
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+pub type WebhookQueue = tokio::sync::mpsc::UnboundedSender<(&'static str, serde_json::Value)>;
+
 pub struct Hub {
     pub config: Config,
     provider: Arc<dyn Provider>,
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    tasks: Mutex<HashMap<String, Task>>,
+    deliverer: Deliverer,
     shutting_down: AtomicBool,
     http: reqwest::Client,
     #[cfg(test)]
@@ -208,7 +245,11 @@ impl Hub {
             other => bail!("unknown provider {other}"),
         };
         let registry = ToolRegistry::with_builtins();
+        let webhook_http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
+        let deliverer = Deliverer::new(webhook_http, RetryPolicy { max_attempts: config.webhook_max_attempts, ..Default::default() });
         Ok(Arc::new(Self {
+            tasks: Mutex::new(HashMap::new()),
+            deliverer,
             config,
             provider,
             registry,
@@ -220,6 +261,68 @@ impl Hub {
             callback_timeout: None,
             models_cache: Default::default(),
         }))
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Admission and task registration share the session lock with shutdown/removal.
+    pub fn submit_task(&self, client: &Client, session_id: &str, text: String) -> Option<Task> {
+        let sessions = self.sessions.lock().unwrap();
+        if self.is_shutting_down() {
+            return None;
+        }
+        let h = sessions.get(session_id).filter(|h| h.owner == client.name)?;
+        let task = Task {
+            task_id: uuid::Uuid::new_v4().to_string(),
+            owner: client.name.clone(),
+            session_id: session_id.into(),
+            status: TaskStatus::Running,
+            created_at: unix_ms(),
+            finished_at: None,
+            result: None,
+            error: None,
+            delivery: None,
+            finished: None,
+        };
+        self.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
+        h.submit(text, None);
+        Some(task)
+    }
+
+    pub fn get_task(&self, client: &Client, id: &str) -> Option<Task> {
+        self.tasks.lock().unwrap().get(id).filter(|t| t.owner == client.name).cloned()
+    }
+
+    pub fn finish_task(&self, id: &str, status: TaskStatus, result: serde_json::Value) -> Option<Task> {
+        let mut tasks = self.tasks.lock().unwrap();
+        let task = tasks.get_mut(id)?;
+        task.status = status;
+        task.error = result["error"].as_str().map(str::to_owned);
+        task.result = Some(result);
+        task.finished_at = Some(unix_ms());
+        task.finished = Some(Instant::now());
+        Some(task.clone())
+    }
+
+    /// One sequential worker per task: progress attempts finish before the final event starts.
+    /// Unbounded enqueue keeps slow receivers from delaying chat timeout/abort processing.
+    pub fn webhook_queue(self: &Arc<Self>, id: String, target: WebhookTarget) -> WebhookQueue {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, serde_json::Value)>();
+        let hub = self.clone();
+        tokio::spawn(async move {
+            while let Some((event, payload)) = rx.recv().await {
+                let update = |status: &DeliveryStatus| {
+                    if let Some(task) = hub.tasks.lock().unwrap().get_mut(&id) {
+                        task.delivery = Some(status.clone());
+                    }
+                };
+                let final_status = hub.deliverer.deliver(&target, event, &payload, &update).await;
+                update(&final_status);
+            }
+        });
+        tx
     }
 
     pub fn create_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
@@ -342,6 +445,9 @@ impl Hub {
     /// HTTP 提交与删除/清理共用 map 锁：已取出的旧 handle 不能在删除后重新启动。
     pub fn submit(&self, client: &Client, id: &str, text: String, mode: Option<&str>) -> Option<Disposition> {
         let sessions = self.sessions.lock().unwrap();
+        if self.is_shutting_down() {
+            return None;
+        }
         let h = sessions.get(id).filter(|h| h.owner == client.name)?;
         Some(h.submit(text, mode))
     }
@@ -368,12 +474,13 @@ impl Hub {
             h.agent.abort();
         }
         // Agent 在持久化回调之后才清除 running；不持有 map 锁跨 await。
-        while sessions.iter().any(|h| h.agent.is_running()) {
+        while sessions.iter().any(|h| h.agent.is_running()) || self.tasks.lock().unwrap().values().any(|t| t.status == TaskStatus::Running) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
     pub fn evict_idle(&self, now: Instant) -> usize {
+        self.tasks.lock().unwrap().retain(|_, t| t.finished.is_none_or(|finished| now.saturating_duration_since(finished) <= Duration::from_secs(self.config.task_ttl_secs)));
         Self::evict_idle_from(&mut self.sessions.lock().unwrap(), now, None)
     }
 
@@ -395,7 +502,7 @@ impl Hub {
 
     /// 两类 TTL 独立；普通会话关闭过期时仍然清理 chat 会话。
     pub fn sweep_interval(&self) -> Option<Duration> {
-        [self.config.session_idle_ttl_secs, self.config.chat_session_ttl_secs].into_iter().filter(|ttl| *ttl != 0).min().map(|ttl| Duration::from_secs(ttl.min(60)))
+        [self.config.session_idle_ttl_secs, self.config.chat_session_ttl_secs, self.config.task_ttl_secs.max(1)].into_iter().filter(|ttl| *ttl != 0).min().map(|ttl| Duration::from_secs(ttl.min(60)))
     }
 
     /// 实时模型列表（缓存 10 分钟）。`all=false` 时只保留可用于对话的模型并去掉日期快照。
@@ -514,7 +621,7 @@ mod tests {
         assert!(hub.get(client, &regular.id).is_some());
         cfg.chat_session_ttl_secs = 0;
         let hub = Hub::new(cfg, "faux", None, None).unwrap();
-        assert_eq!(hub.sweep_interval(), None);
+        assert_eq!(hub.sweep_interval(), Some(Duration::from_secs(60)));
         hub.create_chat_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
         assert_eq!(hub.evict_idle(Instant::now() + Duration::from_secs(7200)), 0);
     }

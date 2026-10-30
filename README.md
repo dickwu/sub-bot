@@ -7,7 +7,7 @@
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.3。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.4.0。支持异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## 安装
 
@@ -47,6 +47,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "sessionIdleTtlSecs": 3600,                 // 普通会话空闲 TTL，0 禁用
   "chatSessionTtlSecs": 600,                  // /v1/chat 自动创建会话的空闲 TTL，0 禁用（独立于普通 TTL）
   "maxSessionsPerClient": 64,                // 每个 client 的内存会话上限，0 不限制
+  "taskTtlSecs": 3600,                       // 已完成任务保留秒数（从完成时计时）；0 在下次清理时过期
+  "webhookMaxAttempts": 6,                   // webhook 最大投递次数（含首次）
   "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
   "streamIdleTimeoutSecs": 300,               // LLM 流连续无字节的超时；推理模型可能长时间静默
@@ -77,7 +79,12 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
     }
   },
   "clients": [
-    { "name": "dev-bot", "tokenSha256": "<sub-bot hash-token 的输出>", "profiles": ["coder"] }
+    {
+      "name": "dev-bot", "tokenSha256": "<sub-bot hash-token 的输出>", "profiles": ["coder"],
+      "webhookUrl": "https://bot.example/hooks/sub-bot", // 可选：默认结果投递地址，只允许 http/https
+      "webhookSecretFile": "keys/webhook.key",          // 可选：HMAC key；相对配置文件目录，加载时读取并 trim
+      "webhookAllowedHosts": ["other.example", "localhost:8080"] // 可选：允许请求覆盖的目标 host 或 host:port
+    }
   ]
 }
 ```
@@ -148,7 +155,8 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
-| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?}` |
+| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?}` |
+| `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
 
 超时行为：
 - `streamIdleTimeoutSecs`（全局，默认 300 秒）适用于 OpenAI Chat Completions 和 Responses；每次收到字节重置计时。超时产生 `stopReason: "error"`、`errorMessage: "stream idle timeout after Ns"`。连接超时为 30 秒，初始响应头等待上限为 120 秒。
@@ -182,6 +190,51 @@ SSE 的 `event:` 名称与 pi 一致，依次有：
 - `turn_end`
 - `agent_end`
 - `agent_settled{aborted}`：本次运行结束的标志
+
+### 异步任务与 webhook（v0.4.0）
+
+```bash
+curl -i localhost:7878/v1/chat -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"message":"运行测试并总结","async":true,"callbackUrl":"https://bot.example/hooks/sub-bot","webhookEvents":"all"}'
+# HTTP 202; Location: /v1/tasks/<id>
+# {"taskId":"...","sessionId":"...","status":"running","statusUrl":"/v1/tasks/..."}
+curl -s localhost:7878/v1/tasks/<id> -H "Authorization: Bearer $BOT_TOKEN"
+```
+
+- `async:true` 立即返回，客户端断开不取消任务；不能同时设置 `stream:true`。继续已有会话可传 `sessionId`；否则与同步 chat 一样创建临时会话。已有会话的排队/settled 语义与同步 chat 相同：结果覆盖本次订阅直到会话 settled 的消息。
+- `callbackUrl` 覆盖 client 的 `webhookUrl`。仅接受 http/https（不允许 URL 用户名/密码）。覆盖地址的 host 必须匹配 `webhookAllowedHosts` 或默认 `webhookUrl` 的 host，否则 HTTP 400 `callback host not allowed`。`host` 允许任意端口，`host:port` 限定端口（省略端口时使用协议默认值）；不跟随 HTTP 重定向。默认 URL 的 host 隐式允许任意端口。请只允许可信目标，生产环境使用 HTTPS。
+- 两个 URL 都未设置时仍能异步执行，只轮询、不投递。密钥文件不可读或 trim 后为空会阻止配置加载；密钥不进入 Debug、任务 JSON 或日志。webhook 日志不得含完整 URL、签名或正文。
+- 任务 JSON 包括 `taskId`, `owner`, `sessionId`, `status`, `createdAt`/`finishedAt`（Unix 毫秒）, `result`, `error`, `delivery`。状态为 `running | succeeded | failed | timeout | aborted`；运行中结果/完成时间为 null。`result` 与同步 chat 响应一致，含 `text`, `messages`，正常结束还含 `usage`, `stopReason`, `error`, `aborted`。超时按 `timeoutSecs` / `chatTimeoutSecs` 取消运行，保留部分文本，任务状态为 `timeout`（轮询本身仍返回 200）。
+- 任务与会话独立保留，完成后 `taskTtlSecs`（默认 3600 秒）由 sweeper 清理，运行中的任务不清理。任务和待投递队列仅在内存中，重启不恢复；关机中不接受新 chat，已有任务取消并收尾。投递不阻塞任务完成，进程退出不保证排空所有 webhook。
+- `webhookEvents` 为 `final`（默认）或 `all`。完成（包括失败/超时/取消）发送 `task.completed`，`data` 为含结果的任务快照。`all` 另发送 `task.progress`：工具结束时 `{taskId,toolName,toolCallId,isError}`，assistant 消息结束时 `{taskId,text}`。每个任务使用一个队列按序投递，最终事件最后发送。`delivery` 是最近一次投递状态：`deliveryId,event,state`（pending/delivered/failed）, `attempts,lastStatus,lastError`；最终事件正文是投递前快照，最新投递状态请轮询。
+
+Webhook 使用 `POST`、`Content-Type: application/json`，正文：
+
+```json
+{"deliveryId":"uuid","event":"task.completed","timestamp":1700000000,"data":{"taskId":"...","result":{"text":"...","messages":[]}}}
+```
+
+请求头：`X-SubBot-Event`、`X-SubBot-Delivery`（UUID）、`X-SubBot-Timestamp`（Unix 秒）、`User-Agent: sub-bot/0.4.0`。配置 secret 时另带 `X-SubBot-Signature: t=<秒>,v1=<小写十六进制 HMAC-SHA256>`；签名输入是 `"<t>."` 的 UTF-8 字节加**原始 HTTP 正文字节**（不要解析再序列化）。`t` 取自签名头，与 `X-SubBot-Timestamp` 相同；每次尝试重新取当前时间并签名，而 envelope 的 `timestamp`、delivery id 和原始正文在重试间保持不变，不能用正文里的时间戳代替 `t`。接收端可这样验证：
+
+```python
+import hashlib, hmac, time
+
+def verify(secret: bytes, header: str, raw_body: bytes, tolerance=300):
+    try:
+        t, signature = header.split(",v1=", 1)
+        if not t.startswith("t="):
+            return False
+        timestamp = t[2:]
+        if abs(int(time.time()) - int(timestamp)) > tolerance:
+            return False
+        expected = hmac.new(secret, timestamp.encode() + b"." + raw_body,
+                            hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)
+    except (ValueError, TypeError):
+        return False
+```
+
+接收端尽快返回 2xx，并按 `X-SubBot-Delivery` 去重（重试使用相同 delivery id；每条 progress/final 事件各有自己的 id）。默认最多 6 次尝试（含首次），`webhookMaxAttempts` 可覆盖次数；每次尝试超时 10 秒（含错误响应体读取）。网络错误、超时、HTTP 408/429/5xx 会重试，其它 4xx 不重试；2xx 成功，3xx 不跟随重定向且不重试。指数退避从 1 秒开始逐次翻倍，加 0–10% 随机抖动，总等待上限 60 秒。429/503 响应的 `Retry-After` 若为非负整数秒，则优先使用（仍限制为最多 60 秒）；不支持 HTTP-date 格式，无效值回退到指数退避。
 
 ### stdio JSONL RPC（父进程直接拉起）
 

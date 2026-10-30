@@ -1,6 +1,7 @@
 use crate::{
     config::{Client, Config},
-    hub::{Hub, SessionRequest, TooManySessions},
+    hub::{Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
+    webhook::WebhookTarget,
 };
 use agent_ai::Message;
 use agent_core::AgentEvent;
@@ -82,6 +83,7 @@ fn router(st: AppState) -> Router {
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
         .route("/v1/sessions/{id}/messages", get(messages))
+        .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
         .route("/v1/profiles", get(profiles))
         .route("/v1/models", get(models))
@@ -239,6 +241,19 @@ async fn messages(State(st): State<AppState>, Extension(c): Caller, Path(id): Pa
     Ok(Json(json!({"messages": h.agent.messages().await})).into_response())
 }
 
+async fn get_task(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
+    let task = st.hub.get_task(&c, &id).ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "task not found"}))))?;
+    Ok(Json(task).into_response())
+}
+
+#[derive(Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WebhookEvents {
+    #[default]
+    Final,
+    All,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatBody {
@@ -249,30 +264,99 @@ struct ChatBody {
     session: SessionRequest,
     #[serde(default)]
     stream: bool,
+    #[serde(default, rename = "async")]
+    asynchronous: bool,
+    callback_url: Option<String>,
+    #[serde(default)]
+    webhook_events: WebhookEvents,
     /// 非流式等待上限；不填使用全局 chatTimeoutSecs。
     timeout_secs: Option<u64>,
 }
 
+/// A host entry allows any port; host:port restricts it. The configured URL implicitly
+/// allows its host. No URL input is included in errors or logs.
+fn webhook_target(c: &Client, callback: Option<&str>) -> Result<Option<WebhookTarget>, (StatusCode, Json<serde_json::Value>)> {
+    let Some(value) = callback.or(c.webhook_url.as_deref()) else { return Ok(None) };
+    let url = crate::config::webhook_url(value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
+    let host = url.host_str().unwrap_or_default();
+    let authority = format!("{host}:{}", url.port_or_known_default().unwrap_or_default());
+    let implicit = c.webhook_url.as_deref().and_then(crate::config::webhook_url).is_some_and(|default| default.host_str() == Some(host));
+    if callback.is_some() && !implicit && !c.webhook_allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)) {
+        return Err(bad_request("callback host not allowed"));
+    }
+    Ok(Some(WebhookTarget { url: url.into(), secret: c.webhook_secret.clone() }))
+}
+
 /// 一步到位接口：给只想“发一句话拿回答”的 bot 用。
 async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<ChatBody>) -> ApiResult {
+    if st.hub.is_shutting_down() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"}))));
+    }
+    if b.asynchronous && b.stream {
+        return Err(bad_request("async and stream cannot be combined"));
+    }
+    let target = webhook_target(&c, b.callback_url.as_deref())?;
+    let timeout_secs = b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs);
     let h = match b.session_id {
         Some(id) => st.hub.get(&c, &id).ok_or_else(not_found)?,
         None => st.hub.create_chat_session(&c, b.session).map_err(create_error)?,
     };
     let rx = h.subscribe(); // 先订阅再提交，避免漏事件
-    st.hub.submit(&c, &h.id, b.message, None).ok_or_else(not_found)?;
+    let submit_error = || {
+        if st.hub.is_shutting_down() {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"})))
+        } else {
+            not_found()
+        }
+    };
+    if b.asynchronous {
+        let task = st.hub.submit_task(&c, &h.id, b.message).ok_or_else(submit_error)?;
+        let status_url = format!("/v1/tasks/{}", task.task_id);
+        let queue = target.map(|target| st.hub.webhook_queue(task.task_id.clone(), target));
+        let response = (
+            StatusCode::ACCEPTED,
+            [("location", status_url.clone())],
+            Json(json!({
+                "taskId": task.task_id, "sessionId": h.id, "status": "running", "statusUrl": status_url,
+            })),
+        )
+            .into_response();
+        // Detached from the request future: disconnecting cannot cancel the run or its result.
+        tokio::spawn(async move {
+            let progress = if b.webhook_events == WebhookEvents::All { queue.as_ref().map(|q| (task.task_id.as_str(), q)) } else { None };
+            let outcome = collect_chat(&h, rx, timeout_secs, progress).await;
+            if let Some(task) = st.hub.finish_task(&task.task_id, outcome.status, outcome.body) {
+                if let Some(queue) = queue {
+                    let _ = queue.send(("task.completed", json!(task)));
+                }
+            }
+        });
+        return Ok(response);
+    }
+    st.hub.submit(&c, &h.id, b.message, None).ok_or_else(submit_error)?;
     if b.stream {
         let mut response = Sse::new(sse_stream(rx, true)).into_response();
         response.headers_mut().insert("x-session-id", h.id.parse().expect("UUID header"));
         return Ok(response);
     }
-    let mut rx = rx;
+    let outcome = collect_chat(&h, rx, timeout_secs, None).await;
+    let status = if outcome.status == TaskStatus::Timeout { StatusCode::GATEWAY_TIMEOUT } else { StatusCode::OK };
+    Ok((status, Json(outcome.body)).into_response())
+}
+
+struct ChatOutcome {
+    status: TaskStatus,
+    body: serde_json::Value,
+}
+
+/// Shared sync/async event collection, including partial text and the abort grace period.
+async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receiver<AgentEvent>, timeout_secs: u64, progress: Option<(&str, &WebhookQueue)>) -> ChatOutcome {
     let mut new_messages: Vec<Message> = vec![];
     let mut segment_start = 0;
     let mut partial_text = String::new();
     let mut aborted = false;
     let mut timed_out = false;
-    let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs));
+    let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let event = tokio::select! {
             biased;
@@ -291,7 +375,17 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
         match event {
             Ok(AgentEvent::AgentStart) => segment_start = new_messages.len(),
             Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
-            Ok(AgentEvent::MessageEnd { message }) => new_messages.push(message),
+            Ok(AgentEvent::MessageEnd { message }) => {
+                if let (Some((id, queue)), Message::Assistant(a)) = (progress, &message) {
+                    let _ = queue.send(("task.progress", json!({"taskId": id, "text": a.text()})));
+                }
+                new_messages.push(message);
+            }
+            Ok(AgentEvent::ToolExecutionEnd { tool_name, tool_call_id, is_error, .. }) => {
+                if let Some((id, queue)) = progress {
+                    let _ = queue.send(("task.progress", json!({"taskId": id, "toolName": tool_name, "toolCallId": tool_call_id, "isError": is_error})));
+                }
+            }
             Ok(AgentEvent::AgentEnd { messages }) => {
                 // AgentEnd 是权威快照，也补齐广播丢失的消息；不重复 MessageEnd。
                 new_messages.truncate(segment_start);
@@ -310,18 +404,28 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
         if partial_text.is_empty() {
             partial_text = new_messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a.text()) } else { None }).collect::<Vec<_>>().join("");
         }
-        return Ok((StatusCode::GATEWAY_TIMEOUT, Json(json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "messages": new_messages}))).into_response());
+        return ChatOutcome { status: TaskStatus::Timeout, body: json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "messages": new_messages}) };
     }
     let last = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a.clone()) } else { None });
-    Ok(Json(json!({
-        "sessionId": h.id,
-        "text": last.as_ref().map(|a| a.text()).unwrap_or_default(),
-        "stopReason": last.as_ref().map(|a| a.stop_reason),
-        "error": last.as_ref().and_then(|a| a.error_message.clone()),
-        "aborted": aborted,
-        "messages": new_messages,
-    }))
-    .into_response())
+    let status = if aborted || last.as_ref().is_some_and(|a| a.stop_reason == agent_ai::StopReason::Aborted) {
+        TaskStatus::Aborted
+    } else if last.as_ref().is_none_or(|a| a.stop_reason == agent_ai::StopReason::Error || a.error_message.is_some()) {
+        TaskStatus::Failed
+    } else {
+        TaskStatus::Succeeded
+    };
+    ChatOutcome {
+        status,
+        body: json!({
+            "sessionId": h.id,
+            "text": last.as_ref().map(|a| a.text()).unwrap_or_default(),
+            "stopReason": last.as_ref().map(|a| a.stop_reason),
+            "error": last.as_ref().and_then(|a| a.error_message.clone()),
+            "aborted": aborted,
+            "usage": last.as_ref().map(|a| &a.usage),
+            "messages": new_messages,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -335,7 +439,7 @@ mod tests {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
         cfg.max_sessions_per_client = cap;
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
-        cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()] });
+        cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()], ..Default::default() });
         let hub = Hub::new(cfg, "faux", None, None).unwrap();
         (router(AppState { hub: hub.clone() }), hub)
     }
@@ -349,6 +453,160 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    async fn start_async(app: &Router, body: Value) -> Value {
+        let req = Request::builder().method("POST").uri("/v1/chat").header("content-type", "application/json").header("authorization", "Bearer test-token").body(Body::from(body.to_string())).unwrap();
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let location = response.headers()["location"].to_str().unwrap().to_string();
+        let body: Value = serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["statusUrl"], location);
+        assert_eq!(location, format!("/v1/tasks/{}", body["taskId"].as_str().unwrap()));
+        body
+    }
+
+    async fn wait_task(app: &Router, started: &Value, delivered: bool) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let (status, task) = request(app, "GET", started["statusUrl"].as_str().unwrap(), Some("test-token"), json!({})).await;
+                assert_eq!(status, StatusCode::OK);
+                if task["status"] != "running" && (!delivered || task["delivery"]["event"] == "task.completed") {
+                    return task;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task did not finish")
+    }
+
+    #[tokio::test]
+    async fn async_poll_only_owner_ttl_and_shutdown() {
+        let (app, hub) = app(64);
+        let started = start_async(&app, json!({"message": "/tool bash {\"command\":\"sleep 0.2; printf done\"}", "async": true})).await;
+        let path = started["statusUrl"].as_str().unwrap();
+        let (status, task) = request(&app, "GET", path, Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(task["status"], "running");
+        assert!(task["finishedAt"].is_null());
+        assert_eq!(request(&app, "GET", path, Some("other-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+        hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(4000));
+        assert_eq!(request(&app, "GET", path, Some("test-token"), json!({})).await.0, StatusCode::OK);
+        let task = wait_task(&app, &started, false).await;
+        assert_eq!(task["status"], "succeeded");
+        assert_eq!(task["sessionId"], started["sessionId"]);
+        assert!(task["result"]["text"].as_str().unwrap().contains("done"));
+        assert!(task["result"]["messages"].is_array());
+        assert!(task["finishedAt"].as_u64().unwrap() >= task["createdAt"].as_u64().unwrap());
+        assert!(task["delivery"].is_null());
+        hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(3601));
+        assert_eq!(request(&app, "GET", path, Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+        let started = start_async(&app, json!({"message": "/tool bash {\"command\":\"sleep 10\"}", "async": true})).await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), hub.abort_all()).await.unwrap();
+        assert_eq!(wait_task(&app, &started, false).await["status"], "aborted");
+        assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "late", "async": true})).await.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn async_rejects_disallowed_callback_before_creating_session() {
+        let (app, hub) = app(1);
+        for url in ["http://evil.example/hook", "http://localhost:8080/hook"] {
+            let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"hello", "async":true, "callbackUrl":url})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(body["error"], "callback host not allowed");
+        }
+        for body in [json!({"message":"hello", "async":true, "callbackUrl":"file:///tmp/hook"}), json!({"message":"hello", "async":true, "stream":true})] {
+            assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), body).await.0, StatusCode::BAD_REQUEST);
+        }
+        assert!(hub.create_session(&hub.config.clients[0], SessionRequest::default()).is_ok());
+    }
+
+    #[test]
+    fn callback_host_matching() {
+        let mut c = Client { webhook_allowed_hosts: vec!["example.com:443".into(), "localhost".into()], ..Default::default() };
+        assert!(webhook_target(&c, Some("https://example.com/path")).is_ok());
+        assert!(webhook_target(&c, Some("http://example.com/path")).is_err());
+        assert!(webhook_target(&c, Some("http://example.com.evil:443/path")).is_err());
+        assert!(webhook_target(&c, Some("http://localhost:1234/path")).is_ok());
+        c.webhook_url = Some("https://default.example/hook".into());
+        assert!(webhook_target(&c, Some("https://default.example/override")).is_ok());
+        assert!(webhook_target(&c, None).unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn async_webhook_final_progress_and_timeout() {
+        use axum::http::HeaderMap;
+        for (all, timeout, default_target) in [(false, false, false), (true, false, false), (false, true, true)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let url = format!("http://{address}/hook");
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let receiver = Router::new().route(
+                "/hook",
+                post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                    let tx = tx.clone();
+                    async move {
+                        tx.send((headers, body)).unwrap();
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            );
+            let mut servers = tokio::task::JoinSet::new();
+            servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
+            let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+            cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+            cfg.clients[0].webhook_allowed_hosts = vec![address.to_string()];
+            cfg.clients[0].webhook_secret = Some("integration-test-key".into());
+            cfg.chat_timeout_secs = 1;
+            if default_target {
+                cfg.clients[0].webhook_url = Some(url.clone());
+            }
+            let hub = Hub::new(cfg, "faux", None, None).unwrap();
+            let app = router(AppState { hub });
+            let message = if timeout { "/tool bash {\"command\":\"sleep 10\"}" } else { "/tool bash {\"command\":\"printf webhook-result\"}" };
+            let mut body = json!({"message":message, "async":true, "webhookEvents": if all { "all" } else { "final" }});
+            if !default_target {
+                body["callbackUrl"] = json!(url);
+            }
+            let started = start_async(&app, body).await;
+            let task = wait_task(&app, &started, true).await;
+            assert_eq!(task["status"], if timeout { "timeout" } else { "succeeded" });
+            assert_eq!(task["delivery"]["state"], "delivered");
+            assert!(task["result"]["text"].is_string());
+            if timeout {
+                assert_eq!(task["result"]["error"], "timeout");
+            }
+            let mut received = vec![];
+            while let Ok((headers, bytes)) = rx.try_recv() {
+                let event: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(headers["x-subbot-event"], event["event"].as_str().unwrap());
+                assert_eq!(headers["x-subbot-delivery"], event["deliveryId"].as_str().unwrap());
+                assert_eq!(headers["content-type"], "application/json");
+                assert_eq!(headers["user-agent"], concat!("sub-bot/", env!("CARGO_PKG_VERSION")));
+                let timestamp = event["timestamp"].as_i64().unwrap();
+                assert_eq!(headers["x-subbot-timestamp"], timestamp.to_string());
+                assert!(crate::webhook::verify(b"integration-test-key", headers["x-subbot-signature"].to_str().unwrap(), &bytes, timestamp, 300));
+                assert_eq!(event["data"]["taskId"], started["taskId"]);
+                received.push(event);
+            }
+            let last = received.last().unwrap();
+            assert_eq!(last["event"], "task.completed");
+            assert_eq!(last["data"]["result"], task["result"]);
+            assert_eq!(last["data"]["status"], task["status"]);
+            if all {
+                assert_eq!(received.len(), 4); // assistant tool call, tool end, assistant answer, final
+                assert!(received[..3].iter().all(|e| e["event"] == "task.progress"));
+                assert!(received[0]["data"]["text"].is_string());
+                assert_eq!(received[1]["data"]["toolName"], "bash");
+                assert!(received[1]["data"]["toolCallId"].is_string());
+                assert_eq!(received[1]["data"]["isError"], false);
+                assert!(received[2]["data"]["text"].as_str().unwrap().contains("webhook-result"));
+            } else {
+                assert_eq!(received.len(), 1);
+            }
+        }
     }
 
     /// Real loopback HTTP receiver; no tracing middleware or request/header logging.
@@ -585,7 +843,16 @@ mod tests {
                 chat(
                     State(AppState { hub: hub.clone() }),
                     Extension(client.clone()),
-                    Json(ChatBody { message: r#"/tool bash {"command":"sleep 10"}"#.into(), session_id: None, session: SessionRequest::default(), stream: false, timeout_secs }),
+                    Json(ChatBody {
+                        message: r#"/tool bash {"command":"sleep 10"}"#.into(),
+                        session_id: None,
+                        session: SessionRequest::default(),
+                        stream: false,
+                        timeout_secs,
+                        asynchronous: false,
+                        callback_url: None,
+                        webhook_events: WebhookEvents::Final,
+                    }),
                 ),
             )
             .await

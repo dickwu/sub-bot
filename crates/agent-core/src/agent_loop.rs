@@ -73,7 +73,7 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             } else if over_budget {
                 budget_forced = true;
                 emit(AgentEvent::RunOutcome { kind: "token_budget_exceeded".into() });
-                tracing::warn!(used_tokens, budget = cfg.token_budget, "token budget reached; asking for a final answer without tools");
+                tracing::warn!(issue = "typed", used_tokens, budget = cfg.token_budget, "token budget reached; asking for a final answer without tools");
                 let m = Message::user_text("[sub-bot] Token budget reached. Do not call any more tools; give your final answer now based on what you have.");
                 emit(AgentEvent::MessageStart { message: m.clone() });
                 emit(AgentEvent::MessageEnd { message: m.clone() });
@@ -204,7 +204,7 @@ async fn run_one_inner(call: ToolCall, cfg: &LoopConfig, cancel: CancellationTok
     };
     let latency_ms = started.elapsed().as_millis() as u64;
     if result.is_error {
-        tracing::warn!(latency_ms, "tool failed");
+        tracing::warn!(issue = "typed", latency_ms, "tool failed");
     } else {
         tracing::info!(latency_ms, "tool finished");
     }

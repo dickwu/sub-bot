@@ -221,7 +221,7 @@ fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled:
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     h.report_lag(n);
-                    tracing::warn!(skipped = n, "SSE subscriber lagged; events dropped")
+                    tracing::warn!(issue = "typed", skipped = n, "SSE subscriber lagged; events dropped")
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
             }
@@ -473,7 +473,7 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
                 }
                 timed_out = true;
                 h.report_issue(Severity::Warn, "run_timeout", "http", "Chat timed out", json!({}));
-                tracing::warn!(session_id = %h.id, "chat timed out");
+                tracing::warn!(issue = "typed", session_id = %h.id, "chat timed out");
                 h.agent.abort();
                 deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
                 continue;
@@ -692,11 +692,15 @@ mod tests {
         assert!(first_good < last_bad, "healthy delivery must not wait for the failing receiver's retries");
         assert_eq!(received.iter().filter(|(name, _)| name == "bad").count(), 2);
         assert!(!received.iter().any(|(name, _)| name == "other"));
-        assert_eq!(received.iter().filter(|(name, e)| name == "good" && e["event"] == "issue").count(), 1, "task/session scopes must not duplicate issue delivery");
-        let issue = received.iter().find(|(name, e)| name == "good" && e["event"] == "issue").unwrap();
+        assert_eq!(received.iter().filter(|(name, e)| name == "good" && e["event"] == "issue").count(), 2, "one tool issue and one delivery failure, without duplicate scope delivery");
+        let issue = received.iter().find(|(name, e)| name == "good" && e["event"] == "issue" && e["data"]["kind"] == "tool_error").unwrap();
         assert_eq!(issue.1["data"]["kind"], "tool_error");
         assert_eq!(issue.1["data"]["taskId"], started["taskId"]);
         assert!(!issue.1.to_string().contains("PRIVATE_OUTPUT"));
+        let failures: Vec<_> = received.iter().filter(|(name, e)| name == "good" && e["event"] == "issue" && e["data"]["kind"] == "webhook_delivery_failed").collect();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].1["data"]["taskId"], started["taskId"]);
+        assert_eq!(failures[0].1["data"]["details"]["host"], "127.0.0.1");
         let (_, body) = request(&app, "GET", "/v1/issues?since=0&limit=500", Some("test-token"), json!({})).await;
         assert_eq!(body["issues"].as_array().unwrap().iter().filter(|e| e["kind"] == "webhook_delivery_failed").count(), 1, "report once after retries, not once per attempt or update");
         assert!(body["issues"].as_array().unwrap().iter().all(|e| e["client"] == "default"));

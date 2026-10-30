@@ -281,7 +281,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 
 `config::Targets` 支持单 URL 和最多 10 项的混合数组，加载时解析相对 secretFile，生成 `ResolvedTarget`；alerts 全局路由，client targets 通过 session/task 订阅隔离。`Reporter` 为一次安装的 Arc 全局服务（无运行时测试/RPC 可用 noop）：同步脱敏后写有界 drop-oldest 队列，Notify 唤醒 worker；按 `(kind, component, session_id, client)` 做 Tokio 时钟窗口聚合，摘要 count 包括首条。JSONL + 最近 1000 条 ring 是本地 sinks，网络复用 v0.4 Deliverer，每目标独立任务、签名与重试，Semaphore 限制 32 个并发请求。
 
-问题投递事件名为 `issue`。最终 webhook 失败转换为仅 alerts/JSONL 的 `webhook_delivery_failed`，携带内部失败路由标记，不再产生次级失败问题；外部任务失败入口 `on_delivery_failed(status, host, client)` 保守排除同 host 接收器。tracing Layer 只收本项目 WARN/ERROR，跳过 issues/webhook；panic hook 尽力入队，配置/Hub 初始化失败使用最多 5 秒同步投递；退出 flush 也有超时。I2 在 hub/http 接入运行事件、任务多目标 fan-out 与查询 API，本节不改变其生命周期。所有来源只传元数据，Reporter 集中掩码密钥、剔除敏感 details 键、限制消息/详情长度；落盘/网络失败不传播到业务运行。
+问题投递事件名为 `issue`。最终 webhook 失败转换为 `webhook_delivery_failed`，携带不序列化的失败 URL，按规范化后的完整 URL 排除失败接收器（不排除同 host 的其它端口/路径），details 仅保留 host。外部任务失败入口 `on_delivery_failed(status, url, scope, targets)` 同时投递 alerts 和所属 client 的 task/session issue targets，遵守 events/minSeverity；Hub 在创建投递 worker 时快照订阅，避免重试结束前订阅已清理。失败通知本身的投递失败不再产生次级失败问题，保留防递归 guard。tracing Layer 只收本项目 WARN/ERROR，跳过 issues/webhook 以及携带 `issue = "typed"` 的已分类诊断日志；panic hook 尽力入队，配置/Hub 初始化失败使用最多 5 秒同步投递；退出 flush 也有超时。I2 在 hub/http 接入运行事件、任务多目标 fan-out 与查询 API。所有来源只传元数据，Reporter 集中掩码密钥、剔除敏感 details 键、限制消息/详情长度；落盘/网络失败不传播到业务运行。
 
 ## 附：脚手架用法
 ```bash

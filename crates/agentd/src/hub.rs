@@ -83,7 +83,7 @@ impl SessionHandle {
                         }
                         stop = Some(a.stop_reason);
                         if let Some(e) = &a.error_message {
-                            tracing::warn!(error = %e, "assistant message ended with error");
+                            tracing::warn!(issue = "typed", error = %e, "assistant message ended with error");
                         }
                     }
                     Message::ToolResult(_) => tools += 1,
@@ -94,7 +94,7 @@ impl SessionHandle {
             if let Some(store) = this.store.lock().unwrap().as_mut() {
                 for m in new {
                     if let Err(e) = store.append_message(m) {
-                        tracing::error!(error = %e, "persist failed");
+                        tracing::error!(issue = "typed", error = %e, "persist failed");
                         this.report_issue(Severity::Error, "session_persist_failed", "session", "Session persistence failed", serde_json::json!({}));
                     }
                 }
@@ -423,7 +423,7 @@ impl Hub {
     /// One sequential worker per receiver, so retries never block other targets.
     pub fn webhook_queue(self: &Arc<Self>, id: String, target: WebhookTarget) -> WebhookQueue {
         let host = reqwest::Url::parse(&target.url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
-        let index = {
+        let (index, scope) = {
             let mut tasks = self.tasks.lock().unwrap();
             let task = tasks.get_mut(&id).expect("registered task");
             let index = task.deliveries.len();
@@ -431,8 +431,10 @@ impl Hub {
                 host: host.clone(),
                 status: DeliveryStatus { delivery_id: String::new(), event: String::new(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
             });
-            index
+            (index, IssueScope { client: Some(task.owner.clone()), session_id: Some(task.session_id.clone()), task_id: Some(id.clone()), ..Default::default() })
         };
+        // Retries may finish after HTTP removes the task subscription; retain its issue routes.
+        let issue_targets = self.issues.subscription_targets(&scope);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, serde_json::Value)>();
         let hub = self.clone();
         tokio::spawn(async move {
@@ -448,8 +450,7 @@ impl Hub {
                 let final_status = hub.deliverer.deliver(&target, event, &payload, &update).await;
                 update(&final_status);
                 if final_status.state == DeliveryState::Failed {
-                    let client = hub.tasks.lock().unwrap().get(&id).map(|t| t.owner.clone());
-                    hub.issues.on_delivery_failed(&final_status, &host, client.as_deref());
+                    hub.issues.on_delivery_failed(&final_status, &target.url, scope.clone(), &issue_targets);
                 }
             }
         });
@@ -727,6 +728,80 @@ mod tests {
         let events = hub.issues.recent(Some("default"), 0, 1);
         assert_eq!(events[0].kind, "events_lagged");
         assert_eq!(events[0].details["skipped"], 42);
+    }
+
+    #[tokio::test]
+    async fn task_webhook_failure_keeps_issue_routes_after_task_cleanup() {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = axum::Router::new()
+            .route(
+                "/failed",
+                axum::routing::post({
+                    let started = started.clone();
+                    let release = release.clone();
+                    move || {
+                        let started = started.clone();
+                        let release = release.clone();
+                        async move {
+                            started.notify_one();
+                            release.notified().await;
+                            axum::http::StatusCode::BAD_REQUEST
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/issues",
+                axum::routing::post({
+                    let seen = seen.clone();
+                    move |axum::Json(payload): axum::Json<serde_json::Value>| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push(payload);
+                            axum::http::StatusCode::NO_CONTENT
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut hub = Hub::new(config(), "faux", None, None).unwrap();
+        Arc::get_mut(&mut hub).unwrap().issues = Reporter::new(&crate::config::AlertsConfig::default(), None, vec![]);
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        let targets: Vec<_> = ["failed", "issues"]
+            .into_iter()
+            .map(|path| ResolvedTarget { target: WebhookTarget { url: format!("{base}/{path}"), secret: None }, events: Some(vec!["issues".into()]), min_severity: None })
+            .collect();
+        let task = hub.submit_task(&hub.config.clients[0], &h.id, "hello".into(), &targets).unwrap();
+        let queue = hub.webhook_queue(task.task_id.clone(), targets[0].target.clone());
+        queue.send(("task.completed", serde_json::json!({}))).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), started.notified()).await.unwrap();
+        hub.unsubscribe_task(&task.task_id, &h);
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !seen.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        hub.issues.flush(Duration::from_secs(3)).await;
+        let payloads = seen.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0]["data"]["kind"], "webhook_delivery_failed");
+        assert_eq!(payloads[0]["data"]["taskId"], task.task_id);
+        assert_eq!(payloads[0]["data"]["sessionId"], h.id);
+        assert_eq!(payloads[0]["data"]["client"], h.owner);
+        drop(queue);
+        hub.finish_task(&task.task_id, TaskStatus::Succeeded, serde_json::json!({}));
+        hub.abort_all().await;
+        server.abort();
     }
 
     #[tokio::test]

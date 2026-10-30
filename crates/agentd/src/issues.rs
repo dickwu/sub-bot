@@ -59,6 +59,9 @@ pub struct IssueEvent {
     /// Internal routing metadata, never serialized into the issue payload.
     #[serde(skip)]
     excluded_target: Option<String>,
+    /// Snapshot for task deliveries that can outlive their subscriptions.
+    #[serde(skip)]
+    subscription_targets: Option<Vec<ResolvedTarget>>,
 }
 impl IssueEvent {
     pub fn new(severity: Severity, kind: &str, component: &str, message: impl Into<String>) -> Self {
@@ -74,6 +77,7 @@ impl IssueEvent {
             details: json!({}),
             count: 1,
             excluded_target: None,
+            subscription_targets: None,
         }
     }
     pub fn scope(mut self, scope: IssueScope) -> Self {
@@ -341,26 +345,26 @@ impl Reporter {
         self.summaries.store(dedup.values().filter(|a| a.suppressed > 0).count(), Ordering::SeqCst);
         self.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
     }
-    fn emit(self: &Arc<Self>, event: IssueEvent) {
-        let failure = event.kind == "webhook_delivery_failed";
-        let excluded_host = if failure && event.excluded_target.is_none() { event.details.get("host").and_then(Value::as_str) } else { None };
-        let mut targets: Vec<_> = self
-            .alerts
-            .iter()
-            .filter(|t| event.severity >= t.min_severity.unwrap_or(Severity::Error) && event.excluded_target.as_ref() != Some(&t.target.url) && excluded_host.is_none_or(|h| host(&t.target.url) != h))
-            .cloned()
-            .collect();
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !failure {
-                for key in [event.scope.session_id.as_ref().map(|s| ScopeKey::Session(s.clone())), event.scope.task_id.as_ref().map(|s| ScopeKey::Task(s.clone()))].into_iter().flatten() {
-                    if let Some((client, ts)) = state.subscriptions.get(&key) {
-                        if event.scope.client.as_ref() == Some(client) {
-                            targets.extend(ts.iter().filter(|t| t.wants_issue(event.severity)).cloned());
-                        }
-                    }
+    pub fn subscription_targets(&self, scope: &IssueScope) -> Vec<ResolvedTarget> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut targets = Vec::new();
+        for key in [scope.session_id.as_ref().map(|s| ScopeKey::Session(s.clone())), scope.task_id.as_ref().map(|s| ScopeKey::Task(s.clone()))].into_iter().flatten() {
+            if let Some((client, ts)) = state.subscriptions.get(&key) {
+                if scope.client.as_ref() == Some(client) {
+                    targets.extend(ts.iter().cloned());
                 }
             }
+        }
+        targets
+    }
+    fn emit(self: &Arc<Self>, event: IssueEvent) {
+        let failure = event.kind == "webhook_delivery_failed";
+        let mut targets: Vec<_> = self.alerts.iter().filter(|t| event.severity >= t.min_severity.unwrap_or(Severity::Error)).cloned().collect();
+        let subscriptions = event.subscription_targets.clone().unwrap_or_else(|| self.subscription_targets(&event.scope));
+        targets.extend(subscriptions.into_iter().filter(|t| t.wants_issue(event.severity)));
+        targets.retain(|t| event.excluded_target.as_ref().is_none_or(|url| *url != normalize_url(&t.target.url)));
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.recent.len() == 1000 {
                 state.recent.pop_front();
             }
@@ -385,26 +389,28 @@ impl Reporter {
                 let _permit = r.semaphore.acquire().await;
                 let status = r.deliverer.deliver(&target.target, "issue", &json!(event), &|_| {}).await;
                 if !failure && status.state == DeliveryState::Failed {
-                    let mut failure = Self::delivery_failure(&status, &host(&target.target.url), event.scope.client.as_deref());
-                    failure.excluded_target = Some(target.target.url.clone());
-                    r.report(failure);
+                    r.report(Self::delivery_failure(&status, &target.target.url, event.scope.client.as_deref()));
                 }
                 r.inflight.fetch_sub(1, Ordering::SeqCst);
                 r.notify.notify_one();
             });
         }
     }
-    /// Failure issues route only to alerts, excluding the failed host, and never recurse.
-    pub fn on_delivery_failed(&self, status: &DeliveryStatus, host: &str, client: Option<&str>) {
-        if status.state != DeliveryState::Failed {
+    /// Task delivery failures reach alerts and the captured owning-client subscriptions, never the failed URL.
+    pub fn on_delivery_failed(&self, status: &DeliveryStatus, url: &str, scope: IssueScope, targets: &[ResolvedTarget]) {
+        if status.state != DeliveryState::Failed || status.event == "issue" {
             return;
         }
-        self.report(Self::delivery_failure(status, host, client));
+        let mut failure = Self::delivery_failure(status, url, scope.client.as_deref()).scope(scope);
+        failure.subscription_targets = Some(targets.to_vec());
+        self.report(failure);
     }
-    fn delivery_failure(status: &DeliveryStatus, host: &str, client: Option<&str>) -> IssueEvent {
-        IssueEvent::new(Severity::Error, "webhook_delivery_failed", "webhook", "webhook delivery exhausted retries")
+    fn delivery_failure(status: &DeliveryStatus, url: &str, client: Option<&str>) -> IssueEvent {
+        let mut failure = IssueEvent::new(Severity::Error, "webhook_delivery_failed", "webhook", "webhook delivery exhausted retries")
             .scope(IssueScope { client: client.map(str::to_owned), ..Default::default() })
-            .details(json!({"event": status.event, "host": host, "attempts": status.attempts, "lastStatus": status.last_status}))
+            .details(json!({"event": status.event, "host": host(url), "attempts": status.attempts, "lastStatus": status.last_status}));
+        failure.excluded_target = Some(normalize_url(url));
+        failure
     }
     pub async fn flush(&self, timeout: Duration) {
         if self.disabled {
@@ -451,15 +457,16 @@ impl Reporter {
             async move {
                 let status = self.deliverer.deliver(&target.target, "issue", &json!(event), &|_| {}).await;
                 if status.state == DeliveryState::Failed && event.kind != "webhook_delivery_failed" {
-                    let mut failure = Self::delivery_failure(&status, &host(&target.target.url), event.scope.client.as_deref());
-                    failure.excluded_target = Some(target.target.url.clone());
-                    self.report(failure);
+                    self.report(Self::delivery_failure(&status, &target.target.url, event.scope.client.as_deref()));
                 }
                 (host(&target.target.url), status)
             }
         }))
         .await
     }
+}
+fn normalize_url(url: &str) -> String {
+    reqwest::Url::parse(url).map_or_else(|_| url.to_owned(), |url| url.to_string())
 }
 pub fn host(url: &str) -> String {
     reqwest::Url::parse(url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default()
@@ -629,6 +636,74 @@ mod tests {
         assert_ne!(all[0]["deliveryId"], healthy.lock().unwrap()[0]["deliveryId"]);
         assert_eq!(std::fs::read_to_string(dir.join("issues.log")).unwrap().lines().count(), 2);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn task_delivery_failure_routes_to_alerts_and_own_subscriptions_after_unsubscribe() {
+        for key in [ScopeKey::Task("task".into()), ScopeKey::Session("session".into())] {
+            let (alert, alerts, _a) = receiver(StatusCode::NO_CONTENT, "alert-key").await;
+            let (mut failed, excluded, _b) = receiver(StatusCode::NO_CONTENT, "failed-key").await;
+            let (subscribed, own, _c) = receiver(StatusCode::NO_CONTENT, "own-key").await;
+            let (mut filtered, ignored, _d) = receiver(StatusCode::NO_CONTENT, "filtered-key").await;
+            failed.target.url.push_str("?token=private-route");
+            let mut fatal_only = filtered.clone();
+            fatal_only.min_severity = Some(Severity::Fatal);
+            filtered.events = Some(vec!["task.completed".into()]);
+            let scope = IssueScope { client: Some("bot".into()), task_id: Some("task".into()), session_id: Some("session".into()), ..Default::default() };
+            let r = Reporter::with_policy(&AlertsConfig { resolved: vec![alert, failed.clone()], dedup_window_secs: 0, ..Default::default() }, None, vec![], policy());
+            r.subscribe(key.clone(), "bot".into(), vec![failed.clone(), subscribed, filtered.clone(), fatal_only]);
+            // The other scope belongs to a different client and must not be included.
+            let other_key = match &key {
+                ScopeKey::Task(_) => ScopeKey::Session("session".into()),
+                ScopeKey::Session(_) => ScopeKey::Task("task".into()),
+            };
+            let mut other = filtered;
+            other.events = Some(vec!["issues".into()]);
+            r.subscribe(other_key, "other-client".into(), vec![other]);
+            let targets = r.subscription_targets(&scope);
+            r.unsubscribe(&key);
+            let mut status = DeliveryStatus { delivery_id: "delivery".into(), event: "task.completed".into(), state: DeliveryState::Failed, attempts: 2, last_status: Some(500), last_error: None };
+            r.on_delivery_failed(&status, &failed.target.url, scope.clone(), &targets);
+            // Issue deliveries and non-final failures cannot enter the task failure path.
+            status.event = "issue".into();
+            r.on_delivery_failed(&status, &failed.target.url, scope.clone(), &targets);
+            status.event = "task.progress".into();
+            status.state = DeliveryState::Pending;
+            r.on_delivery_failed(&status, &failed.target.url, scope, &targets);
+            r.flush(Duration::from_secs(3)).await;
+            assert_eq!(alerts.lock().unwrap().len(), 1);
+            assert_eq!(own.lock().unwrap().len(), 1);
+            assert!(excluded.lock().unwrap().is_empty());
+            assert!(ignored.lock().unwrap().is_empty());
+            let events = r.recent(None, 0, 10);
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "webhook_delivery_failed");
+            assert_eq!(events[0].scope.task_id.as_deref(), Some("task"));
+            assert_eq!(events[0].scope.session_id.as_deref(), Some("session"));
+            assert_eq!(events[0].details["host"], "127.0.0.1");
+            let payload = serde_json::to_string(&events).unwrap();
+            assert!(!payload.contains("private-route"));
+            assert!(!payload.contains("/hook"));
+            assert!(!payload.contains("excludedTarget"));
+            assert!(!payload.contains("subscriptionTargets"));
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_exclusion_compares_normalized_full_url_not_host_or_path() {
+        let (target, seen, _server) = receiver(StatusCode::NO_CONTENT, "same-endpoint-key").await;
+        let r = Reporter::with_policy(&AlertsConfig { resolved: vec![target.clone()], dedup_window_secs: 0, ..Default::default() }, None, vec![], policy());
+        let status = DeliveryStatus { delivery_id: "delivery".into(), event: "task.completed".into(), state: DeliveryState::Failed, attempts: 1, last_status: Some(500), last_error: None };
+        let normalized = target.target.url.replacen("http://", "HTTP://", 1);
+        r.on_delivery_failed(&status, &normalized, IssueScope::default(), &[]);
+        r.flush(Duration::from_secs(3)).await;
+        assert!(seen.lock().unwrap().is_empty());
+        for url in [format!("{}?private-query", target.target.url), target.target.url.replace("/hook", "/private-path")] {
+            r.on_delivery_failed(&status, &url, IssueScope::default(), &[]);
+        }
+        r.flush(Duration::from_secs(3)).await;
+        assert_eq!(seen.lock().unwrap().len(), 2);
+        assert!(!serde_json::to_string(&*seen.lock().unwrap()).unwrap().contains("private-"));
     }
 
     #[tokio::test]

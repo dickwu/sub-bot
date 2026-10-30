@@ -78,7 +78,7 @@ impl Agent {
                             let _state = this.state.lock().unwrap();
                             if !settled.is_cancelled() && !token.is_cancelled() {
                                 let _ = this.events.send(AgentEvent::RunOutcome { kind: "run_timeout".into() });
-                                tracing::warn!("run timed out");
+                                tracing::warn!(issue = "typed", "run timed out");
                                 token.cancel();
                             }
                         }
@@ -113,7 +113,7 @@ impl Agent {
                                 let discarded = steering.len() + follow_up.len();
                                 steering.clear();
                                 follow_up.clear();
-                                tracing::warn!(discarded, "discarded queued messages after abort");
+                                tracing::warn!(issue = "typed", discarded, "discarded queued messages after abort");
                                 state.cancel = None;
                                 settled.cancel();
                                 let _ = this.events.send(AgentEvent::AgentSettled { aborted: true });

@@ -155,7 +155,7 @@ impl Deliverer {
             if status.state == DeliveryState::Delivered {
                 tracing::info!(delivery_id = %status.delivery_id, event, host, attempt, status = ?status.last_status, "webhook delivered");
             } else {
-                tracing::warn!(delivery_id = %status.delivery_id, event, host, attempt, status = ?status.last_status, "webhook attempt failed");
+                tracing::warn!(issue = "typed", delivery_id = %status.delivery_id, event, host, attempt, status = ?status.last_status, "webhook attempt failed");
             }
             // A consumer callback must not unwind the delivery future.
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_update(&status)));

@@ -71,8 +71,16 @@ fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEv
     struct Fields {
         message: String,
         fields: Vec<String>,
+        typed: bool,
     }
     impl tracing::field::Visit for Fields {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "issue" && value == "typed" {
+                self.typed = true;
+            } else {
+                self.record_debug(field, &value);
+            }
+        }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
             if field.name() == "message" {
                 self.message = format!("{value:?}");
@@ -83,6 +91,10 @@ fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEv
     }
     let mut fields = Fields::default();
     event.record(&mut fields);
+    // Keep the diagnostic log, but let the structured source report the issue once.
+    if fields.typed {
+        return None;
+    }
     if !fields.fields.is_empty() {
         fields.message.push(' ');
         fields.message.push_str(&fields.fields.join(" "));
@@ -121,7 +133,10 @@ mod tests {
         let capture = Capture::default();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
             tracing::warn!(target: "agent_core::run", attempts = 3, api_key = "private-key", token = "private-token", body = "private-body", prompt = "private-prompt", "run warning");
-            tracing::error!(target: "sub_bot::http", "request error");
+            tracing::error!(target: "sub_bot::http", issue = "unclassified", "request error");
+            tracing::warn!(target: "agent_core::run", issue = "typed", "typed warning");
+            tracing::error!(target: "agent_ai::openai", issue = "typed", "typed error");
+            tracing::warn!(target: "agentd::hub", issue = "typed", "typed assistant failure");
             tracing::warn!(target: "agentd::issues", "ignored");
             tracing::error!(target: "agentd::webhook", "ignored");
             tracing::warn!(target: "sub_bot::webhook", "ignored");

@@ -203,7 +203,7 @@ impl Provider for OpenAiProvider {
                     AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => {
                         tracing::info!(latency_ms, "llm call aborted")
                     }
-                    AssistantEvent::Error { message: m } => tracing::error!(latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
+                    AssistantEvent::Error { message: m } => tracing::error!(issue = "typed", latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
                     _ => {}
                 }
                 let _ = tx.send(final_ev).await;

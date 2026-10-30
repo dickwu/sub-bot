@@ -1,4 +1,4 @@
-//! 核心编码工具（对应 pi `coding-agent/src/core/tools/{read,write,ls,bash,powershell}.ts`）。
+//! 核心编码工具（对应 pi `coding-agent/src/core/tools/{read,write,ls,bash}.ts`）。仅支持 macOS 和 Linux。
 //! 所有路径都限制在会话 cwd 之内。
 use agent_core::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 use anyhow::{bail, Context, Result};
@@ -88,23 +88,15 @@ impl AgentTool for LsTool {
 impl AgentTool for BashTool {
     fn name(&self) -> &str { "bash" }
     fn description(&self) -> &str {
-        if cfg!(windows) { "Run a PowerShell command in the workspace root." } else { "Run a shell command (sh -c) in the workspace root." }
+        "Run a shell command (sh -c) in the workspace root."
     }
     fn parameters(&self) -> Value { json!({"type":"object","properties":{"command":{"type":"string"},"timeoutSecs":{"type":"integer"}},"required":["command"]}) }
     fn execution_mode(&self) -> ExecutionMode { ExecutionMode::Sequential }
     async fn execute(&self, _id: &str, args: Value, cancel: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let cmd = arg_str(&args, "command")?;
         let secs = args.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(120);
-        // 跨平台：Windows 用 PowerShell（对应 pi 的 powershell.ts），其它用 sh
-        let mut c = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", cmd]);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", cmd]);
-            c
-        };
+        let mut c = tokio::process::Command::new("sh");
+        c.args(["-c", cmd]);
         c.current_dir(&self.root).kill_on_drop(true);
         let out = tokio::select! {
             r = tokio::time::timeout(std::time::Duration::from_secs(secs), c.output()) => r.context("command timed out")??,

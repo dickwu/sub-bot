@@ -1,4 +1,4 @@
-# 打 tag（v*）时为 6 个目标构建预编译二进制并上传到 GitHub Release。
+# 打 tag（v*）时为 4 个目标（Linux musl x86_64/aarch64、macOS x86_64/aarch64）构建预编译二进制并上传到 GitHub Release。
 name: release
 on:
   push:
@@ -11,7 +11,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,8 +27,6 @@ jobs:
           - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  cross: true }
           - { target: x86_64-apple-darwin,        os: macos-latest }
           - { target: aarch64-apple-darwin,       os: macos-latest }
-          - { target: x86_64-pc-windows-msvc,     os: windows-latest }
-          - { target: aarch64-pc-windows-msvc,    os: windows-latest }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -50,9 +48,8 @@ jobs:
         run: |
           name=pi-agentd-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p "$name"
-          ext=""; [[ "${{ matrix.target }}" == *windows* ]] && ext=".exe"
-          cp "target/${{ matrix.target }}/release/pi-agentd$ext" agentd.example.json README.md DESIGN.md "$name/"
-          if [[ "$ext" == ".exe" ]]; then 7z a "$name.zip" "$name" >/dev/null; f="$name.zip"; else tar czf "$name.tar.gz" "$name"; f="$name.tar.gz"; fi
+          cp "target/${{ matrix.target }}/release/pi-agentd" agentd.example.json README.md DESIGN.md "$name/"
+          tar czf "$name.tar.gz" "$name"; f="$name.tar.gz"
           (command -v sha256sum >/dev/null && sha256sum "$f" || shasum -a 256 "$f") > "$f.sha256"
           echo "ASSET=$f" >> "$GITHUB_ENV"
       - uses: softprops/action-gh-release@v2

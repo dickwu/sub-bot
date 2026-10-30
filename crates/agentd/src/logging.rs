@@ -7,7 +7,7 @@ use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub fn default_log_dir() -> Option<PathBuf> {
-    // Linux: ~/.local/share/pi-agentd/logs；macOS: ~/Library/Application Support/pi-agentd/logs；Windows: %LOCALAPPDATA%\pi-agentd\data\logs
+    // Linux: ~/.local/share/pi-agentd/logs；macOS: ~/Library/Application Support/pi-agentd/logs
     directories::ProjectDirs::from("", "", "pi-agentd").map(|d| d.data_local_dir().join("logs"))
 }
 

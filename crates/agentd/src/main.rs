@@ -3,6 +3,10 @@
 //! - `rpc`：stdio JSONL RPC（对应 pi `--mode rpc`，见 coding-agent/src/modes/rpc/rpc-mode.ts）
 //! - `hash-token`：生成配置文件里用的 token 哈希
 //! OpenAI key 只从环境变量读入进程内存，任何接口都不会回传。
+
+#[cfg(not(unix))]
+compile_error!("pi-agentd only supports macOS and Linux");
+
 mod config;
 mod http;
 mod hub;

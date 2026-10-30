@@ -3,7 +3,7 @@
 > 目标：我要用 Rust 写一个**以编码为核心**的 agent，架构上尽量贴近 Mario Zechner 的 pi coding-agent（`badlogic/pi-mono`）。
 > 它的核心能力是编码：读、写、编辑文件，执行 shell 命令。
 > “通用”的意思是它**不绑定某个项目或任务**，不同的 bot 可以拿它在不同的目录里做不同的编码工作。
-> 它在 Windows、macOS 和 Linux 上本地运行，使用我的 OpenAI API Key，并通过 HTTP、SSE 或 stdio JSONL RPC 给其它 bot 调用。
+> 它在 macOS 和 Linux（Ubuntu）上本地运行（不支持 Windows），使用我的 OpenAI API Key，并通过 HTTP、SSE 或 stdio JSONL RPC 给其它 bot 调用。
 > API Key 只留在 agent 进程里，绝不外传。
 >
 > 参考源码：`/workspace/pi-mono`（浅克隆）。本文提到的 pi 路径都相对 `packages/`。
@@ -46,7 +46,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 - **核心工具**：`core/tools/` 目录下有
   - `read.ts`、`write.ts`、`edit.ts`（精确替换 `edits[{oldText,newText}]`，`oldText` 必须唯一匹配）和 `edit-diff.ts`；
   - `ls.ts`、`grep.ts`、`find.ts`；
-  - `bash.ts`、`powershell.ts`；
+  - `bash.ts`（`powershell.ts` 不移植：不支持 Windows）；
   - `file-mutation-queue.ts`（同一文件的写操作串行化）、`truncate.ts`、`output-accumulator.ts`、`path-utils.ts`。
   - `tools/index.ts` 用 `createToolDefinition(name, cwd, …)` 和 `createCodingTools(cwd)` **按 cwd 实例化**这些工具。
   - 默认启用的工具是 `read/bash/edit/write`（见 `core/agent-session.ts` 中的 `defaultTools`）。
@@ -85,7 +85,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `agent/src/agent.ts` | `agent-core/src/agent.rs`：`Agent`（broadcast 订阅，`prompt`、`steer`、`follow_up`、`abort`） | ✅ |
 | `AgentTool` / `AgentEvent` | `agent-core/src/{tool,event}.rs`，事件名与 `docs/json.md` 一致 | ✅ |
 | 钩子 `beforeToolCall`/`afterToolCall`/`transformContext` | 在 `LoopConfig` 上加 `Arc<dyn Hooks>` | M3 |
-| `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：**核心工具** `read`、`write`、`edit`、`ls`、`bash`（Windows 上走 PowerShell），全部限定在会话 cwd 内 | ✅（edit 已有单测） |
+| `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：**核心工具** `read`、`write`、`edit`、`ls`、`bash`（PowerShell），全部限定在会话 cwd 内 | ✅（edit 已有单测） |
 | `tools/grep.ts`、`find.ts`、`file-mutation-queue.ts`、`truncate.ts` | `agent-tools/src/builtin/{grep,find}.rs`（用 `ignore` 和 `grep-searcher` crate），`mutation_queue.rs` | M1 |
 | `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, edit, write, bash`；预设有 `default`、`readonly`、`no-shell` | ✅ |
 | `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 cwd 向上查找到 workspaceRoot 为止）、cwd | ✅ |
@@ -159,33 +159,29 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 
 - **纯 Rust TLS**：`reqwest` 使用 `rustls-tls`，不依赖 OpenSSL，所以各平台都能静态或近静态链接。
 - **Shell**：
-  - `bash` 工具在 Windows 上运行 `powershell -NoProfile -NonInteractive -Command`，其它平台运行 `sh -c`；
-  - 以后对应 pi 的 `powershell.ts`，单独提供 `powershell` 工具，并检测 Git Bash；
+  - `bash` 工具运行 `sh -c`（只支持 macOS / Linux，`agentd` 在非 unix 平台上会直接编译失败）；
   - 进程设置 `kill_on_drop`，有超时，并支持取消。
-- **路径**：统一用 `PathBuf` 加 `canonicalize`（Windows 上会产生 `\\?\` 前缀，比较 root 时要两边都 canonicalize，代码里已经这样做了）。系统提示里的路径统一使用 `/`。
+- **路径**：统一用 `PathBuf` 加 `canonicalize`，比较 root 时两边都 canonicalize。系统提示里直接使用 unix 路径。
 - **目标平台**：
-  - `x86_64-pc-windows-msvc`、`aarch64-pc-windows-msvc`
   - `x86_64-apple-darwin`、`aarch64-apple-darwin`（可以合成 universal 二进制）
   - `x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`
 - **发布（已确定）**：
   - 源码放在这台机器的 `/workspace/rust-agent`；
-  - 由 GitHub Actions CI 构建三平台预编译二进制，每台 PC 直接下载安装。
+  - 由 GitHub Actions CI 构建 macOS 和 Linux 的预编译二进制（v0.1.1 起不再提供 Windows），每台 PC 直接下载安装。
   - 草稿工作流在 `.github/workflows/release.yml`：
-    - 推送 `v*` tag 时，先在三个操作系统上跑 `cargo test --locked`；
-    - 然后矩阵构建 6 个目标（Linux musl 用 `cross`）；
-    - 打包成 `tar.gz`（Windows 为 `zip`），附带 `.sha256`，上传到 GitHub Release。
-  - 还没有创建远程仓库，也没有推送。
-  - 以后可以换成 `cargo-dist`，额外生成安装脚本（sh/ps1）和 Homebrew formula。
+    - 推送 `v*` tag 时，先在 Ubuntu 和 macOS 上跑 `cargo test --locked`；
+    - 然后矩阵构建 4 个目标（Linux musl 用 `cross`）；
+    - 打包成 `tar.gz`，附带 `.sha256`，上传到 GitHub Release。
+  - 仓库：https://github.com/dickwu/sub-bot ；推送到 main 时另由 `ci.yml` 跑测试。
+  - 以后可以换成 `cargo-dist`，额外生成安装脚本（sh）和 Homebrew formula。
   - release profile 已经开启 `lto="thin"` 和 `strip=true`。
 - **作为服务运行**：
   - Linux 用 systemd user unit；
   - macOS 用 launchd plist（`~/Library/LaunchAgents`）；
-  - Windows 用 `windows-service` crate 或 NSSM。
   - M5 提供 `pi-agentd service install` 命令。
 - **配置和数据目录**：用 `directories` crate 按操作系统决定：
   - Linux：`~/.config/pi-agentd`，数据放在 `~/.local/share`；
   - macOS：`~/Library/Application Support/pi-agentd`；
-  - Windows：`%APPDATA%\pi-agentd`。
 - **API Key 来源**：环境变量，或者系统钥匙串（`keyring` crate，M3）。Key 不写进配置文件。
 
 ---
@@ -201,7 +197,6 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
   - 默认目录：
     - Linux：`~/.local/share/pi-agentd/logs`
     - macOS：`~/Library/Application Support/pi-agentd/logs`
-    - Windows：`%LOCALAPPDATA%\pi-agentd\data\logs`
   - 用 `--log-dir <dir>` 改目录，传 `-` 关闭文件日志。
 - **Span 层级**（JSON 日志的每一行都带完整的 span 列表）：
   - `http{request_id, method, path, bot}`：request_id 沿用调用方的 `X-Request-Id`，否则自动生成，并回写到响应头；

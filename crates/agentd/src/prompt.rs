@@ -14,7 +14,7 @@ fn context_files(cwd: &Path, root: &Path) -> Vec<(String, String)> {
     while let Some(d) = dir {
         if let Some(f) = CONTEXT_FILES.iter().map(|n| d.join(n)).find(|p| p.is_file()) {
             if let Ok(text) = std::fs::read_to_string(&f) {
-                found.push((f.to_string_lossy().replace('\\', "/"), text));
+                found.push((f.to_string_lossy().into_owned(), text));
             }
         }
         if d == root {
@@ -55,6 +55,6 @@ pub fn build(i: PromptInput) -> String {
             sections.push(format!("<project_context path=\"{path}\">\n{text}\n</project_context>"));
         }
     }
-    sections.push(format!("Current working directory: {}", i.cwd.to_string_lossy().replace('\\', "/")));
+    sections.push(format!("Current working directory: {}", i.cwd.display()));
     sections.join("\n\n")
 }

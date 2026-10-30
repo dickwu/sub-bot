@@ -2,7 +2,7 @@
 
 一个用 Rust 写的**本地编码 agent 服务**，架构仿照 [pi coding-agent](https://github.com/badlogic/pi-mono)。它内置 read / write / edit / ls / bash 等编码工具，不绑定具体项目，供其它 bot 通过 HTTP+SSE 或 stdio JSONL RPC 调用。
 
-- 支持 Windows / macOS / Linux 的单个二进制，TLS 用 rustls，不依赖 OpenSSL
+- 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
@@ -17,16 +17,15 @@
 |---|---|
 | Linux x86_64 / arm64 | `pi-agentd-<ver>-x86_64-unknown-linux-musl.tar.gz` / `aarch64-unknown-linux-musl` |
 | macOS Intel / Apple Silicon | `x86_64-apple-darwin` / `aarch64-apple-darwin` |
-| Windows x64 / ARM64 | `x86_64-pc-windows-msvc.zip` / `aarch64-pc-windows-msvc.zip` |
 
-解压后把 `pi-agentd`（Windows 上是 `pi-agentd.exe`）放到 PATH 里。macOS 首次运行如果被拦截，执行 `xattr -d com.apple.quarantine pi-agentd`。
+解压后把 `pi-agentd`放到 PATH 里。macOS 首次运行如果被拦截，执行 `xattr -d com.apple.quarantine pi-agentd`。
 
 从源码构建：`cargo build --release -p agentd`
 
 ## 快速开始
 
 ```bash
-export OPENAI_API_KEY=...            # Windows PowerShell: $env:OPENAI_API_KEY="..."
+export OPENAI_API_KEY=...
 pi-agentd hash-token "$(openssl rand -hex 24)"   # 记下 token 原文给 bot，把输出的哈希填进配置
 cp agentd.example.json agentd.json   # 编辑 profiles / clients
 pi-agentd --config agentd.json serve --bind 127.0.0.1:7878
@@ -75,7 +74,6 @@ pi-agentd --config agentd.json serve --bind 127.0.0.1:7878
 - 默认目录（`--log-dir <dir>` 可改，`--log-dir -` 关闭文件日志）：
   - Linux：`~/.local/share/pi-agentd/logs`
   - macOS：`~/Library/Application Support/pi-agentd/logs`
-  - Windows：`%LOCALAPPDATA%\pi-agentd\data\logs`
 - 每行日志都带 span：`request_id`（沿用请求的 `X-Request-Id`，也会回写到响应头）/ `bot` / `session_id` / `profile` / `model` / `tool`
 - 不会记录 API key、bot token 或回调 token；提示词、输出和文件内容只记录长度
 

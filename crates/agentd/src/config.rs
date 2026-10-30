@@ -83,9 +83,28 @@ pub struct Config {
     /// OpenAI API key 文件（相对路径相对于配置文件所在目录）。优先级低于 --openai-key-file 和 OPENAI_API_KEY_FILE，高于 OPENAI_API_KEY
     #[serde(default)]
     pub api_key_file: Option<PathBuf>,
+    /// 普通会话空闲过期秒数，0 禁用。
+    #[serde(default = "default_session_idle_ttl")]
+    pub session_idle_ttl_secs: u64,
+    /// 自动创建的 chat 会话空闲过期秒数，0 禁用。
+    #[serde(default = "default_chat_session_ttl")]
+    pub chat_session_ttl_secs: u64,
+    /// 每个 client 的内存会话上限，0 不限制。
+    #[serde(default = "default_max_sessions")]
+    pub max_sessions_per_client: usize,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
+}
+
+fn default_session_idle_ttl() -> u64 {
+    3600
+}
+fn default_chat_session_ttl() -> u64 {
+    600
+}
+fn default_max_sessions() -> usize {
+    64
 }
 
 fn default_model() -> String {
@@ -136,6 +155,9 @@ impl Config {
             default_reasoning_effort: None,
             default_api: Default::default(),
             api_key_file: None,
+            session_idle_ttl_secs: default_session_idle_ttl(),
+            chat_session_ttl_secs: default_chat_session_ttl(),
+            max_sessions_per_client: default_max_sessions(),
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }],
         }
@@ -156,6 +178,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_limits_defaults_and_overrides() {
+        let cfg: Config = serde_json::from_str(r#"{"profiles":{}}"#).unwrap();
+        assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
+        let cfg: Config = serde_json::from_str(r#"{"profiles":{},"sessionIdleTtlSecs":0,"chatSessionTtlSecs":5,"maxSessionsPerClient":0}"#).unwrap();
+        assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (0, 5, 0));
+    }
 
     #[test]
     fn api_key_file_is_relative_to_config_and_shell_env_parses() {

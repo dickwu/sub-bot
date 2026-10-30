@@ -8,6 +8,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 /// 一个会话 = 一个 Agent + 可选 JSONL 持久化，归属于创建它的 client（会话隔离）。
@@ -22,6 +23,9 @@ pub struct SessionHandle {
     /// 最近一次成功调用实际使用的 (API, 推理强度)
     last_call: Mutex<Option<(agent_ai::Api, Option<ThinkingLevel>)>>,
     store: Mutex<Option<Session>>,
+    last_activity: Mutex<Instant>,
+    idle_ttl: Duration,
+    ephemeral: bool,
 }
 
 pub use agent_core::Disposition;
@@ -29,6 +33,8 @@ pub use agent_core::Disposition;
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
+        let mut activity = self.last_activity.lock().unwrap();
+        *activity = Instant::now();
         let msg_len = text.chars().count();
         let msg = Message::user_text(text);
         let this = self.clone();
@@ -66,7 +72,10 @@ impl SessionHandle {
                     }
                 }
             }
+            // 持久化完成后更新：长时间运行不会消耗下一次空闲窗口。
+            *this.last_activity.lock().unwrap() = Instant::now();
         });
+        drop(activity);
         tracing::info!(prompt_chars = msg_len, ?disposition, "message submitted");
         disposition
     }
@@ -109,6 +118,17 @@ pub struct SessionRequest {
     #[serde(default)]
     pub caller_tools: Vec<CallerToolSpec>,
 }
+
+#[derive(Debug)]
+pub struct TooManySessions;
+
+impl std::fmt::Display for TooManySessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("too many sessions for this client; delete a session or wait for idle expiry")
+    }
+}
+
+impl std::error::Error for TooManySessions {}
 
 pub struct Hub {
     pub config: Config,
@@ -193,6 +213,23 @@ impl Hub {
     }
 
     pub fn create_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
+        self.create_session_with_ttl(client, req, false)
+    }
+
+    pub fn create_chat_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
+        self.create_session_with_ttl(client, req, true)
+    }
+
+    fn create_session_with_ttl(&self, client: &Client, req: SessionRequest, ephemeral: bool) -> Result<Arc<SessionHandle>> {
+        // 上限检查与插入共用 map 锁，避免并发创建突破上限。
+        let mut sessions = self.sessions.lock().unwrap();
+        let cap = self.config.max_sessions_per_client;
+        if cap != 0 && sessions.values().filter(|h| h.owner == client.name).count() >= cap {
+            Self::evict_idle_from(&mut sessions, Instant::now(), Some(&client.name));
+            if sessions.values().filter(|h| h.owner == client.name).count() >= cap {
+                return Err(TooManySessions.into());
+            }
+        }
         let profile_name = req.profile.clone().or_else(|| client.profiles.first().cloned()).ok_or_else(|| anyhow::anyhow!("client has no profiles"))?;
         if !client.profiles.contains(&profile_name) {
             bail!("profile '{profile_name}' is not allowed for client '{}'", client.name);
@@ -274,14 +311,60 @@ impl Hub {
             requested_effort,
             last_call: Mutex::new(None),
             store: Mutex::new(store),
+            last_activity: Mutex::new(Instant::now()),
+            idle_ttl: Duration::from_secs(if ephemeral { self.config.chat_session_ttl_secs } else { self.config.session_idle_ttl_secs }),
+            ephemeral,
         });
-        self.sessions.lock().unwrap().insert(id, h.clone());
+        sessions.insert(id, h.clone());
         Ok(h)
     }
 
     /// 只返回属于该 client 的会话；别的 bot 的会话一律当作不存在。
     pub fn get(&self, client: &Client, id: &str) -> Option<Arc<SessionHandle>> {
         self.sessions.lock().unwrap().get(id).filter(|h| h.owner == client.name).cloned()
+    }
+
+    /// HTTP 提交与删除/清理共用 map 锁：已取出的旧 handle 不能在删除后重新启动。
+    pub fn submit(&self, client: &Client, id: &str, text: String, mode: Option<&str>) -> Option<Disposition> {
+        let sessions = self.sessions.lock().unwrap();
+        let h = sessions.get(id).filter(|h| h.owner == client.name)?;
+        Some(h.submit(text, mode))
+    }
+
+    pub fn remove(&self, client: &Client, id: &str) -> bool {
+        let mut sessions = self.sessions.lock().unwrap();
+        if !sessions.get(id).is_some_and(|h| h.owner == client.name) {
+            return false;
+        }
+        let h = sessions.remove(id).unwrap();
+        h.agent.abort();
+        tracing::info!(session_id = %h.id, bot = %h.owner, "session deleted; persisted JSONL files retained");
+        true
+    }
+
+    pub fn evict_idle(&self, now: Instant) -> usize {
+        Self::evict_idle_from(&mut self.sessions.lock().unwrap(), now, None)
+    }
+
+    fn evict_idle_from(sessions: &mut HashMap<String, Arc<SessionHandle>>, now: Instant, owner: Option<&str>) -> usize {
+        let before = sessions.len();
+        sessions.retain(|_, h| {
+            if owner.is_some_and(|o| o != h.owner) || h.idle_ttl.is_zero() {
+                return true;
+            }
+            let activity = h.last_activity.lock().unwrap();
+            if h.agent.is_running() || now.saturating_duration_since(*activity) <= h.idle_ttl {
+                return true;
+            }
+            tracing::info!(session_id = %h.id, bot = %h.owner, ephemeral = h.ephemeral, "idle session evicted; persisted JSONL files retained");
+            false
+        });
+        before - sessions.len()
+    }
+
+    /// 两类 TTL 独立；普通会话关闭过期时仍然清理 chat 会话。
+    pub fn sweep_interval(&self) -> Option<Duration> {
+        [self.config.session_idle_ttl_secs, self.config.chat_session_ttl_secs].into_iter().filter(|ttl| *ttl != 0).min().map(|ttl| Duration::from_secs(ttl.min(60)))
     }
 
     /// 实时模型列表（缓存 10 分钟）。`all=false` 时只保留可用于对话的模型并去掉日期快照。
@@ -316,5 +399,145 @@ impl Hub {
 
     pub fn tool_names(&self) -> Vec<String> {
         self.registry.names()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        cfg
+    }
+
+    #[test]
+    fn cap_is_typed_per_client_and_zero_is_unlimited() {
+        let mut cfg = config();
+        cfg.max_sessions_per_client = 1;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        let err = hub.create_session(client, SessionRequest::default()).err().unwrap();
+        assert!(err.is::<TooManySessions>());
+        let other = Client { name: "other".into(), ..client.clone() };
+        hub.create_session(&other, SessionRequest::default()).unwrap();
+        assert!(hub.remove(client, &h.id));
+        hub.create_session(client, SessionRequest::default()).unwrap();
+
+        let mut cfg = config();
+        cfg.max_sessions_per_client = 0;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        for _ in 0..65 {
+            hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn cap_reclaims_only_owners_expired_sessions() {
+        let mut cfg = config();
+        cfg.max_sessions_per_client = 1;
+        cfg.session_idle_ttl_secs = 10;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let other = Client { name: "other".into(), ..client.clone() };
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        let unrelated = hub.create_session(&other, SessionRequest::default()).unwrap();
+        let past = Instant::now() - Duration::from_secs(11);
+        *h.last_activity.lock().unwrap() = past;
+        *unrelated.last_activity.lock().unwrap() = past;
+        hub.create_session(client, SessionRequest::default()).unwrap();
+        assert!(hub.get(client, &h.id).is_none());
+        assert!(hub.get(&other, &unrelated.id).is_some());
+    }
+
+    #[test]
+    fn idle_eviction_uses_fake_time_and_per_session_ttl() {
+        let hub = Hub::new(config(), "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let regular = hub.create_session(client, SessionRequest::default()).unwrap();
+        let chat = hub.create_chat_session(client, SessionRequest::default()).unwrap();
+        let now = Instant::now();
+        *regular.last_activity.lock().unwrap() = now;
+        *chat.last_activity.lock().unwrap() = now;
+        assert_eq!(hub.evict_idle(now + Duration::from_secs(600)), 0);
+        assert_eq!(hub.evict_idle(now + Duration::from_secs(601)), 1);
+        assert!(hub.get(client, &chat.id).is_none());
+        assert!(hub.get(client, &regular.id).is_some());
+        assert_eq!(hub.evict_idle(now + Duration::from_secs(3601)), 1);
+        assert_eq!(hub.evict_idle(now + Duration::from_secs(7200)), 0);
+    }
+
+    #[test]
+    fn disabled_ttl_is_independent_of_chat_ttl() {
+        let mut cfg = config();
+        cfg.session_idle_ttl_secs = 0;
+        cfg.chat_session_ttl_secs = 2;
+        let hub = Hub::new(cfg.clone(), "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let regular = hub.create_session(client, SessionRequest::default()).unwrap();
+        hub.create_chat_session(client, SessionRequest::default()).unwrap();
+        assert_eq!(hub.sweep_interval(), Some(Duration::from_secs(2)));
+        assert_eq!(hub.evict_idle(Instant::now() + Duration::from_secs(7200)), 1);
+        assert!(hub.get(client, &regular.id).is_some());
+        cfg.chat_session_ttl_secs = 0;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        assert_eq!(hub.sweep_interval(), None);
+        hub.create_chat_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        assert_eq!(hub.evict_idle(Instant::now() + Duration::from_secs(7200)), 0);
+    }
+
+    async fn settled(rx: &mut tokio::sync::broadcast::Receiver<AgentEvent>) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let AgentEvent::AgentSettled { aborted } = rx.recv().await.unwrap() {
+                    return aborted;
+                }
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn remove_checks_owner_and_aborts_running_session() {
+        let hub = Hub::new(config(), "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        let other = Client { name: "other".into(), ..client.clone() };
+        let mut rx = h.subscribe();
+        h.submit("hello".into(), None);
+        assert!(h.agent.is_running());
+        assert!(!hub.remove(&other, &h.id));
+        assert!(hub.get(&other, &h.id).is_none());
+        assert!(hub.remove(client, &h.id));
+        assert!(hub.get(client, &h.id).is_none());
+        assert!(!hub.remove(client, &h.id));
+        assert!(hub.submit(client, &h.id, "late".into(), None).is_none());
+        assert!(settled(&mut rx).await);
+        assert!(!h.agent.is_running());
+    }
+
+    #[tokio::test]
+    async fn running_sessions_survive_and_activity_refreshes_on_submit_and_settle() {
+        let mut cfg = config();
+        cfg.session_idle_ttl_secs = 10;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        let old = Instant::now() - Duration::from_secs(20);
+        *h.last_activity.lock().unwrap() = old;
+        let mut rx = h.subscribe();
+        h.submit("hello".into(), None);
+        assert!(*h.last_activity.lock().unwrap() > old);
+        assert_eq!(hub.evict_idle(Instant::now() + Duration::from_secs(100)), 0);
+        // 模拟长运行，settle 应重新开启完整的空闲窗口。
+        *h.last_activity.lock().unwrap() = old;
+        assert!(!settled(&mut rx).await);
+        let finished = *h.last_activity.lock().unwrap();
+        assert!(finished > old);
+        assert_eq!(hub.evict_idle(finished + Duration::from_secs(10)), 0);
+        assert_eq!(hub.evict_idle(finished + Duration::from_secs(11)), 1);
     }
 }

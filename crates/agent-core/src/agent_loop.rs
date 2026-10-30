@@ -28,6 +28,8 @@ pub struct LoopConfig {
     pub max_tokens: Option<u32>,
     /// 单次运行的总 token 预算：达到后再给模型一次“不带工具、直接给出最终答复”的机会，然后停止
     pub token_budget: Option<u64>,
+    /// 单次运行的时间上限；None 表示不限时。
+    pub run_timeout: Option<std::time::Duration>,
 }
 
 fn drain(q: &Queue) -> Vec<Message> {
@@ -141,9 +143,22 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
         max_tokens: cfg.max_tokens,
     };
     emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&cfg.model)) });
-    let mut stream = cfg.provider.stream(req, cancel);
+    let mut stream = cfg.provider.stream(req, cancel.clone());
     let mut final_msg = None;
-    while let Some(ev) = stream.next().await {
+    loop {
+        let ev = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                let message = AssistantMessage::failed(&cfg.model, StopReason::Aborted, "aborted");
+                emit(AgentEvent::MessageUpdate { assistant_message_event: AssistantEvent::Error { message: message.clone() } });
+                final_msg = Some(message);
+                break;
+            }
+            ev = stream.next() => match ev {
+                Some(ev) => ev,
+                None => break,
+            },
+        };
         match &ev {
             AssistantEvent::Done { message } | AssistantEvent::Error { message } => final_msg = Some(message.clone()),
             _ => {}
@@ -275,6 +290,7 @@ mod tests {
             max_turns: 5,
             max_tokens: None,
             token_budget: None,
+            run_timeout: None,
         };
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
@@ -321,6 +337,7 @@ mod tests {
             max_turns: 50,
             max_tokens: None,
             token_budget: Some(250),
+            run_timeout: None,
         };
         let emit: Emit = Arc::new(|_| {});
         let ctx = Mutex::new(vec![]);

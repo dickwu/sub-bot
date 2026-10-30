@@ -5,6 +5,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -13,6 +14,7 @@ pub struct OpenAiProvider {
     api_key: crate::secrets::Secret,
     base_url: String,
     http: reqwest::Client,
+    stream_idle_timeout: Duration,
     /// 运行时从 400 错误里学到的推理强度能力
     effort_cache: EffortCache,
     /// auto 模式下运行时发现必须走 Responses 的模型
@@ -64,10 +66,15 @@ fn parse_effort_error(body: &str) -> Option<EffortError> {
 impl OpenAiProvider {
     /// key 只在进程内存中，从不通过对外接口返回。
     pub fn new(api_key: crate::secrets::Secret, base_url: Option<String>) -> Self {
+        Self::with_stream_idle_timeout(api_key, base_url, Duration::from_secs(300))
+    }
+
+    pub fn with_stream_idle_timeout(api_key: crate::secrets::Secret, base_url: Option<String>, stream_idle_timeout: Duration) -> Self {
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client"),
+            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().expect("http client"),
+            stream_idle_timeout,
             effort_cache: Default::default(),
             api_cache: Default::default(),
         }
@@ -156,7 +163,14 @@ impl Provider for OpenAiProvider {
 
     fn stream(&self, req: Request, cancel: CancellationToken) -> EventStream {
         let (tx, rx) = mpsc::channel(64);
-        let ctx = CallCtx { http: self.http.clone(), base_url: self.base_url.clone(), key: self.api_key.clone(), effort_cache: self.effort_cache.clone(), api_cache: self.api_cache.clone() };
+        let ctx = CallCtx {
+            http: self.http.clone(),
+            base_url: self.base_url.clone(),
+            key: self.api_key.clone(),
+            effort_cache: self.effort_cache.clone(),
+            api_cache: self.api_cache.clone(),
+            stream_idle_timeout: self.stream_idle_timeout,
+        };
         let api = self.resolve_api(&req);
         let span = tracing::info_span!("llm", provider = "openai", model = %req.model, api = tracing::field::Empty, reasoning_effort = tracing::field::Empty);
         tokio::spawn(tracing::Instrument::instrument(
@@ -208,6 +222,7 @@ struct PartialCall {
 }
 
 struct CallCtx {
+    stream_idle_timeout: Duration,
     http: reqwest::Client,
     base_url: String,
     key: crate::secrets::Secret,
@@ -235,13 +250,16 @@ async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Assi
             span.record("api", api.as_str());
             span.record("reasoning_effort", effort.map(|l| l.as_str()).unwrap_or("-"));
         };
-        let resp = ctx.http.post(&url).bearer_auth(ctx.key.expose()).json(&body).send().await.map_err(|e| redact(&e.to_string()))?;
+        let resp = tokio::time::timeout(Duration::from_secs(120), ctx.http.post(&url).bearer_auth(ctx.key.expose()).json(&body).send())
+            .await
+            .map_err(|_| "response headers timeout after 120s".to_string())?
+            .map_err(|e| redact(&e.to_string()))?;
         if resp.status().is_success() {
             record(api, req.reasoning);
             break resp;
         }
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = tokio::time::timeout(ctx.stream_idle_timeout, resp.text()).await.map_err(|_| idle_timeout_error(ctx.stream_idle_timeout))?.unwrap_or_default();
         let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {text}", api.as_str()));
         if status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
             record(api, req.reasoning);
@@ -286,8 +304,8 @@ async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Assi
         }
     };
     let mut msg = match api {
-        Api::Responses => crate::responses::parse_stream(resp, &req.model, &tx).await?,
-        _ => parse_chat(resp, &req.model, &tx).await?,
+        Api::Responses => crate::responses::parse_stream(resp, &req.model, &tx, ctx.stream_idle_timeout).await?,
+        _ => parse_chat(resp, &req.model, &tx, ctx.stream_idle_timeout).await?,
     };
     msg.api = Some(api);
     msg.reasoning_effort = req.reasoning;
@@ -307,7 +325,11 @@ pub(crate) fn drain_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
     out
 }
 
-async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
+pub(crate) fn idle_timeout_error(timeout: Duration) -> String {
+    format!("stream idle timeout after {}s", timeout.as_secs_f64())
+}
+
+async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: Duration) -> Result<AssistantMessage, String> {
     let _ = tx.send(AssistantEvent::Start).await;
     let mut msg = AssistantMessage::empty(model);
     let mut text = String::new();
@@ -315,7 +337,7 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
     let mut finish: Option<String> = None;
     let mut buf: Vec<u8> = Vec::new();
     let mut bytes = resp.bytes_stream();
-    while let Some(chunk) = bytes.next().await {
+    'stream: while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| idle_timeout_error(idle_timeout))? {
         buf.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
         // 按字节切分 LF，避免多字节 UTF-8 字符跨 chunk 被截断
         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
@@ -325,7 +347,7 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
                 continue;
             };
             if data == "[DONE]" {
-                continue;
+                break 'stream;
             }
             let Ok(v) = serde_json::from_str::<Value>(data) else {
                 continue;
@@ -412,6 +434,46 @@ pub(crate) fn redact(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_idle_timeout(api: Api) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            let event = match api {
+                Api::Responses => r#"{"type":"response.output_text.delta","delta":"partial"}"#,
+                _ => r#"{"choices":[{"delta":{"content":"partial"}}]}"#,
+            };
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {event}\n\n").as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let provider = OpenAiProvider::with_stream_idle_timeout(crate::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(200));
+        let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None };
+        let started = std::time::Instant::now();
+        let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.expect("stream hung");
+        server.abort();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(events.iter().any(|e| matches!(e, AssistantEvent::TextDelta { delta, .. } if delta == "partial")));
+        assert!(
+            matches!(events.last(), Some(AssistantEvent::Error { message }) if message.stop_reason == StopReason::Error && message.error_message.as_deref() == Some("stream idle timeout after 0.2s"))
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_idle_timeout() {
+        assert_idle_timeout(Api::Chat).await;
+    }
+
+    #[tokio::test]
+    async fn responses_stream_idle_timeout() {
+        assert_idle_timeout(Api::Responses).await;
+    }
+
     #[test]
     fn parses_effort_errors() {
         use EffortError::*;

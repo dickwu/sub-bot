@@ -27,6 +27,9 @@ pub struct Profile {
     /// 单次运行（一个 prompt）的总 token 预算；达到后让模型不带工具给出最终答复
     #[serde(default)]
     pub token_budget: Option<u64>,
+    /// 单次运行超时（秒）；默认不限时，超时等同 abort。
+    #[serde(default)]
+    pub run_timeout_secs: Option<u64>,
     /// 工具白名单：工具名或 `preset:<name>`；默认是 pi 的编码工具集
     #[serde(default = "default_tools")]
     pub tools: Vec<String>,
@@ -72,6 +75,12 @@ pub struct Client {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    /// LLM 流连续无字节的超时（秒）。
+    #[serde(default = "default_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
+    /// /v1/chat 非流式等待上限（秒）。
+    #[serde(default = "default_chat_timeout_secs")]
+    pub chat_timeout_secs: u64,
     #[serde(default = "default_model")]
     pub default_model: String,
     /// 所有 profile 的默认推理强度（profile 自己的 reasoningEffort 优先）
@@ -105,6 +114,12 @@ fn default_chat_session_ttl() -> u64 {
 }
 fn default_max_sessions() -> usize {
     64
+}
+fn default_stream_idle_timeout_secs() -> u64 {
+    300
+}
+fn default_chat_timeout_secs() -> u64 {
+    900
 }
 
 fn default_model() -> String {
@@ -140,6 +155,7 @@ impl Config {
                 api: None,
                 max_output_tokens: None,
                 token_budget: None,
+                run_timeout_secs: None,
                 tools: default_tools(),
                 workspace_roots: vec![workspace],
                 load_context_files: true,
@@ -151,6 +167,8 @@ impl Config {
             },
         );
         Config {
+            stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            chat_timeout_secs: default_chat_timeout_secs(),
             default_model: model,
             default_reasoning_effort: None,
             default_api: Default::default(),
@@ -188,6 +206,14 @@ mod tests {
     }
 
     #[test]
+    fn fallback_preserves_session_limits_and_timeouts() {
+        let cfg = Config::fallback("faux".into(), "test-token", PathBuf::from("."));
+        assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
+        assert_eq!((cfg.stream_idle_timeout_secs, cfg.chat_timeout_secs), (300, 900));
+        assert_eq!(cfg.profiles["default"].run_timeout_secs, None);
+    }
+
+    #[test]
     fn api_key_file_is_relative_to_config_and_shell_env_parses() {
         let dir = std::env::temp_dir().join(format!("sub-bot-cfg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -195,6 +221,13 @@ mod tests {
         std::fs::write(&path, r#"{"apiKeyFile":"keys/openai","profiles":{"p":{"workspaceRoots":["."],"shellEnv":{"mode":"allowlist","allow":["CARGO_*"]}}}}"#).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.api_key_file.as_deref(), Some(dir.join("keys/openai").as_path()));
+        assert_eq!(cfg.stream_idle_timeout_secs, 300);
+        assert_eq!(cfg.chat_timeout_secs, 900);
+        assert_eq!(cfg.profiles["p"].run_timeout_secs, None);
+        let custom: Config = serde_json::from_str(r#"{"streamIdleTimeoutSecs":42,"chatTimeoutSecs":17,"profiles":{"p":{"workspaceRoots":["."],"runTimeoutSecs":3}}}"#).unwrap();
+        assert_eq!(custom.stream_idle_timeout_secs, 42);
+        assert_eq!(custom.chat_timeout_secs, 17);
+        assert_eq!(custom.profiles["p"].run_timeout_secs, Some(3));
         let se = &cfg.profiles["p"].shell_env;
         assert_eq!(se.mode, agent_tools::EnvMode::Allowlist);
         assert_eq!(se.allow, vec!["CARGO_*".to_string()]);

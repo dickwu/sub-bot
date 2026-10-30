@@ -59,9 +59,35 @@ impl Agent {
         }
         let token = CancellationToken::new();
         state.cancel = Some(token.clone());
+        let settled = CancellationToken::new();
+        let settled_guard = settled.clone().drop_guard();
+        if let Some(timeout) = self.config.run_timeout {
+            let token = token.clone();
+            let settled = settled.clone();
+            let this = self.clone();
+            tokio::spawn(
+                async move {
+                    tokio::select! {
+                        biased;
+                        _ = settled.cancelled() => {}
+                        _ = token.cancelled() => {}
+                        _ = tokio::time::sleep(timeout) => {
+                            // 与 settle 共用 state 锁，避免结束后才报超时。
+                            let _state = this.state.lock().unwrap();
+                            if !settled.is_cancelled() && !token.is_cancelled() {
+                                tracing::warn!("run timed out");
+                                token.cancel();
+                            }
+                        }
+                    }
+                }
+                .in_current_span(),
+            );
+        }
         let this = self.clone();
         tokio::spawn(
             async move {
+                let _settled_guard = settled_guard;
                 let tx = this.events.clone();
                 let emit: Emit = Arc::new(move |e| {
                     let _ = tx.send(e);
@@ -81,6 +107,7 @@ impl Agent {
                         follow_up.clear();
                         tracing::warn!(discarded, "discarded queued messages after abort");
                         state.cancel = None;
+                        settled.cancel();
                         let _ = this.events.send(AgentEvent::AgentSettled { aborted: true });
                         break;
                     }
@@ -88,6 +115,7 @@ impl Agent {
                     pending.extend(this.config.follow_up.lock().unwrap().drain(..));
                     if pending.is_empty() {
                         state.cancel = None;
+                        settled.cancel();
                         let _ = this.events.send(AgentEvent::AgentSettled { aborted: token.is_cancelled() });
                         break;
                     }

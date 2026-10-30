@@ -44,6 +44,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         max_turns: 10,
         max_tokens: None,
         token_budget: None,
+        run_timeout: None,
     }
 }
 
@@ -106,6 +107,22 @@ async fn concurrent_submits_are_atomic() {
         settled(&mut rx).await;
         assert_users(&agent, &["one", "two"]).await;
     }
+}
+
+#[tokio::test]
+async fn run_timeout_cancels_uncooperative_provider() {
+    let provider = Arc::new(BlockedProvider { entered: Arc::new(Notify::new()), release: Arc::new(Notify::new()), calls: AtomicUsize::new(0) });
+    let mut cfg = config(provider);
+    cfg.run_timeout = Some(Duration::from_millis(100));
+    let agent = Agent::new(cfg, vec![]);
+    let mut rx = agent.subscribe();
+    agent.submit(Message::user_text("stall"), None);
+    assert!(settled(&mut rx).await);
+    assert!(!agent.is_running());
+    assert!(matches!(agent.messages().await.last(), Some(Message::Assistant(a)) if a.stop_reason == StopReason::Aborted));
+    // A settled run's timer must not affect the next run.
+    agent.submit(Message::user_text("fresh"), None);
+    assert!(!settled(&mut rx).await);
 }
 
 #[tokio::test]

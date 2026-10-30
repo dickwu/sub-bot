@@ -253,6 +253,15 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - 日志过滤在解析 `RUST_LOG` 后追加网络依赖的 `warn` 抑制指令，覆盖同名用户指令，避免请求头进入 trace 日志。
 - CI：fmt 检查、全 workspace/all-targets clippy（`-D warnings`），Ubuntu/macOS 跑 locked 测试。release 先检查 tag 与 workspace 版本一致并通过相同门禁，再构建四个目标、打包和发布校验和。
 
+## v0.4.0 webhooks
+
+- `/v1/chat` 支持 `async:true`（与 stream 互斥），返回 202、Location 和 taskId/sessionId/statusUrl；后台任务不依赖请求连接。同步/异步共用 `http::collect_chat`，沿用临时会话、事件快照修复、timeoutSecs/chatTimeoutSecs、部分文本和 5 秒 abort 收尾语义。
+- Hub 持有 owner 隔离的 `Mutex<HashMap<taskId, Task>>`，记录 running/succeeded/failed/timeout/aborted、Unix 毫秒时间、结果和投递状态。`GET /v1/tasks/{id}` 对未知/非 owner 返回 404。完成后独立按 taskTtlSecs（默认 3600）清理；单调时钟控制过期，既有 sweeper 同时处理任务。关机取消运行并等待任务状态收尾。
+- client 配置 webhookUrl/webhookSecretFile/webhookAllowedHosts；secret 相对配置目录加载、trim、不可读/空值报错，Debug 打码。回调 URL 限 http/https 且匹配 host/host:port 白名单（默认 URL 的 host 隐式允许），禁重定向，错误不回显 URL。
+- 每个有目标的任务一个 mpsc 队列/worker，串行调用 Hub 共享的 `webhook::Deliverer`；`all` 模式的工具结束/assistant 消息结束生成 progress，完成后排入 task.completed（含任务结果快照）。慢投递不阻塞 chat 的超时处理；on_update 更新最近投递状态。任务/队列不持久化，进程退出不保证排空，广播过载仍可能丢进度事件（最终结果用 AgentEnd 快照补齐）。
+- 投递协议：JSON envelope `{deliveryId,event,timestamp,data}`，X-SubBot-Event/Delivery/Timestamp，配置 secret 时 HMAC-SHA256 签名 `<timestamp>.<raw body>`，接收端按 delivery id 去重并校验时间窗口。完整重试策略由独立 webhook 模块负责（默认 6 次，1s/60s 退避、10s attempt timeout，次数由 webhookMaxAttempts 配置）。W1 暂存单次 POST stub，合并时由并行模块实现替换，调用方仅依赖共享接口。
+- 测试使用 faux provider、router oneshot 和本地 axum receiver，覆盖 202/Location、轮询/owner/TTL、poll-only、白名单、超时和有序事件投递、签名验证、关机及 secret 加载打码。
+
 ## (e) MVP 里程碑
 
 | 里程碑 | 内容 | 验收 |

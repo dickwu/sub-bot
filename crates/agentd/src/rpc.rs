@@ -33,7 +33,7 @@ fn send_response(out: &mpsc::UnboundedSender<Value>, id: Option<Value>, command:
 
 /// stdio 的调用方就是父进程本身，视为可用全部 profile 的本地 client。
 pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
-    let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect() };
+    let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect(), ..Default::default() };
     let session = hub.create_session(&client, req)?;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
 

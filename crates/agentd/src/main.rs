@@ -16,6 +16,7 @@ mod hub;
 mod logging;
 mod prompt;
 mod rpc;
+mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
@@ -102,7 +103,7 @@ enum Cmd {
 }
 
 fn local_client(cfg: &config::Config) -> config::Client {
-    config::Client { name: "local".into(), token_sha256: String::new(), profiles: cfg.profiles.keys().cloned().collect() }
+    config::Client { name: "local".into(), token_sha256: String::new(), profiles: cfg.profiles.keys().cloned().collect(), ..Default::default() }
 }
 
 #[tokio::main]

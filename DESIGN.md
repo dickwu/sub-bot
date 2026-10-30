@@ -11,6 +11,13 @@
 
 ---
 
+## LLM transient retry / webhook progress
+
+OpenAI provider 在每次尝试内新建流解析器，通过单独事件通道转发增量并跟踪工具调用边界。连接/请求超时、body read 错误、未完成 EOF、idle timeout、HTTP 408/429/5xx 可重试；其它 HTTP 4xx（包括认证、上下文溢出）不可重试。文本或思考增量允许回滚，工具事件一旦出现则禁止重试。
+`llmMaxRetries` 全局默认 3，profile 可覆盖（0 禁用）；1s 指数退避加 jitter，最大 30s，`Retry-After` 是额外的最短等待约束（先限制到最多 60s）。整个重试循环在取消 select 内运行，abort 同时取消网络和 sleep。
+`AssistantEvent::Retry` 转为 `AgentEvent::MessageRetry`，消费者清理当前部分输出，hub 只增加 `llm_retry` warn 映射；最终失败沿用 `llm_*`。日志标注 `issue="typed"` 防止重复上报。只有最终消息进入 context/AgentEnd。
+异步任务过滤空白助手 progress；webhook Retry-After 支持 delta-seconds 和 HTTP-date，过去日期为零、上限 60s。
+
 ## (a) pi 的架构
 
 pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`。

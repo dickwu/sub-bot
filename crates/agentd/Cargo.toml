@@ -33,6 +33,7 @@ sha2.workspace = true
 hmac.workspace = true
 reqwest.workspace = true
 regex = "1"
+httpdate = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

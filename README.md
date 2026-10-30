@@ -9,6 +9,14 @@
 
 > 状态：v0.5.0。支持问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
+## LLM 重试与进度
+
+OpenAI Responses / Chat Completions 遇到连接失败、超时、流中断、HTTP 408/429/5xx 时自动重试。
+全局或 profile 可设置 `llmMaxRetries`（默认 3 次额外尝试，0 禁用；profile 优先）。退避从 1 秒指数增长，加入 jitter，上限 30 秒；服务端 `Retry-After`（秒或 HTTP-date）作为最短等待时间（先限制到最多 60 秒）。abort 会立即取消请求或等待。
+仅文本/思考的部分输出可以丢弃后重试；一旦发出工具调用事件就不重试，避免重复工具操作。SSE/JSONL 消费者收到 `message_retry {attempt, reason}` 时应清空当前未完成的助手消息；最终历史只含成功尝试。每次重试产生 warn `llm_retry` issue，最终失败仍产生 `llm_*` issue。
+
+`task.progress` 不发送空白助手文本（工具执行进度仍保留）。Webhook 的 `Retry-After` 同时支持秒和 HTTP-date，过去日期按 0 秒处理，最长等待 60 秒。
+
 ## Install
 
 ### Homebrew

@@ -108,12 +108,8 @@ impl Deliverer {
                         let code = response.status();
                         status.last_status = Some(code.as_u16());
                         if matches!(code.as_u16(), 429 | 503) {
-                            retry_after = response
-                                .headers()
-                                .get(reqwest::header::RETRY_AFTER)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.trim().parse::<u64>().ok())
-                                .map(|seconds| Duration::from_secs(seconds).min(self.policy.max_backoff));
+                            retry_after =
+                                response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| parse_retry_after(v, SystemTime::now(), self.policy.max_backoff));
                         }
                         if !code.is_success() {
                             let snippet = response_snippet(response).await?;
@@ -173,6 +169,12 @@ impl Deliverer {
         }
         status
     }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime, max_backoff: Duration) -> Option<Duration> {
+    let value = value.trim();
+    let delay = value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(now).unwrap_or_default()))?;
+    Some(delay.min(max_backoff).min(agent_ai::MAX_RETRY_AFTER))
 }
 
 fn retryable(code: u16) -> bool {
@@ -252,6 +254,19 @@ mod tests {
         collections::HashSet,
         sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn retry_after_dates_and_seconds() {
+        let now = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
+        let max = Duration::from_secs(60);
+        for (value, seconds) in [("0", 0), (" 12 ", 12), ("9999", 60), ("Wed, 21 Oct 2015 07:27:59 GMT", 0), ("Wed, 21 Oct 2015 07:28:25 GMT", 25), ("Wed, 21 Oct 2015 07:30:00 GMT", 60)] {
+            assert_eq!(parse_retry_after(value, now, max), Some(Duration::from_secs(seconds)), "{value}");
+        }
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:25 GMT", now, Duration::from_secs(5)), Some(Duration::from_secs(5)));
+        for invalid in ["", "-1", "garbage"] {
+            assert_eq!(parse_retry_after(invalid, now, max), None);
+        }
+    }
 
     #[test]
     fn signatures() {

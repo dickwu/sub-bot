@@ -24,6 +24,9 @@ pub struct Profile {
     /// 单次模型调用的输出 token 上限（含推理 token）
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+    /// 覆盖全局 LLM 瞬时错误重试次数；0 禁用。
+    #[serde(default)]
+    pub llm_max_retries: Option<u32>,
     /// 单次运行（一个 prompt）的总 token 预算；达到后让模型不带工具给出最终答复
     #[serde(default)]
     pub token_budget: Option<u64>,
@@ -211,6 +214,8 @@ pub struct Config {
     /// LLM 流连续无字节的超时（秒）。
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
+    #[serde(default = "default_llm_max_retries")]
+    pub llm_max_retries: u32,
     /// /v1/chat 非流式等待上限（秒）。
     #[serde(default = "default_chat_timeout_secs")]
     pub chat_timeout_secs: u64,
@@ -252,6 +257,10 @@ fn default_chat_session_ttl() -> u64 {
 fn default_max_sessions() -> usize {
     64
 }
+fn default_llm_max_retries() -> u32 {
+    3
+}
+
 fn default_stream_idle_timeout_secs() -> u64 {
     300
 }
@@ -343,6 +352,7 @@ impl Config {
                 reasoning_effort: None,
                 api: None,
                 max_output_tokens: None,
+                llm_max_retries: None,
                 token_budget: None,
                 run_timeout_secs: None,
                 tools: default_tools(),
@@ -360,6 +370,7 @@ impl Config {
             task_ttl_secs: default_session_idle_ttl(),
             webhook_max_attempts: default_webhook_attempts(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
+            llm_max_retries: default_llm_max_retries(),
             chat_timeout_secs: default_chat_timeout_secs(),
             default_model: model,
             default_reasoning_effort: None,
@@ -456,6 +467,16 @@ mod tests {
         std::fs::remove_file(dir.join("secret")).unwrap();
         assert_eq!(Config::load(&path).unwrap_err().to_string(), "cannot read webhookSecretFile");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn llm_retry_defaults_and_profile_override() {
+        let cfg: Config = serde_json::from_str(r#"{"profiles":{"p":{"workspaceRoots":["."]}}}"#).unwrap();
+        assert_eq!(cfg.llm_max_retries, 3);
+        assert_eq!(cfg.profiles["p"].llm_max_retries, None);
+        let cfg: Config = serde_json::from_str(r#"{"llmMaxRetries":7,"profiles":{"p":{"workspaceRoots":["."],"llmMaxRetries":0}}}"#).unwrap();
+        assert_eq!(cfg.llm_max_retries, 7);
+        assert_eq!(cfg.profiles["p"].llm_max_retries, Some(0));
     }
 
     #[test]

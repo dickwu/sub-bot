@@ -26,6 +26,7 @@ pub struct LoopConfig {
     pub max_turns: usize,
     /// 每次模型调用的输出 token 上限（含推理 token）
     pub max_tokens: Option<u32>,
+    pub llm_max_retries: Option<u32>,
     /// 单次运行的总 token 预算：达到后再给模型一次“不带工具、直接给出最终答复”的机会，然后停止
     pub token_budget: Option<u64>,
     /// 单次运行的时间上限；None 表示不限时。
@@ -143,6 +144,7 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
         reasoning: cfg.reasoning,
         api: cfg.api,
         max_tokens: cfg.max_tokens,
+        llm_max_retries: cfg.llm_max_retries,
     };
     emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&cfg.model)) });
     let mut stream = cfg.provider.stream(req, cancel.clone());
@@ -162,6 +164,10 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
             },
         };
         match &ev {
+            AssistantEvent::Retry { attempt, reason } => {
+                emit(AgentEvent::MessageRetry { attempt: *attempt, reason: reason.clone() });
+                continue;
+            }
             AssistantEvent::Done { message } | AssistantEvent::Error { message } => final_msg = Some(message.clone()),
             _ => {}
         }
@@ -291,6 +297,7 @@ mod tests {
             follow_up: Default::default(),
             max_turns: 5,
             max_tokens: None,
+            llm_max_retries: None,
             token_budget: None,
             run_timeout: None,
         };
@@ -338,6 +345,7 @@ mod tests {
             follow_up: Default::default(),
             max_turns: 50,
             max_tokens: None,
+            llm_max_retries: None,
             token_budget: Some(250),
             run_timeout: None,
         };

@@ -1,5 +1,5 @@
 //! 配置文件（JSON）：profiles（预设）+ clients（每个 bot 一个 token，映射到允许的 profile）。
-//! 示例见仓库根目录 `agentd.example.json`。
+//! 示例见仓库根目录 `sub-bot.example.json`。
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, path::PathBuf};
@@ -12,6 +12,12 @@ pub struct Profile {
     /// 追加到系统提示末尾（对应 pi `appendSystemPrompt`）
     pub append_system_prompt: Option<String>,
     pub model: Option<String>,
+    /// 允许调用方选择的模型（精确名或 `*` 通配，如 `gpt-5*`）；不填则不限制
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    /// 默认推理强度：none | minimal | low | medium | high | xhigh；不填则不发送
+    #[serde(default)]
+    pub reasoning_effort: Option<agent_ai::ThinkingLevel>,
     /// 工具白名单：工具名或 `preset:<name>`；默认是 pi 的编码工具集
     #[serde(default = "default_tools")]
     pub tools: Vec<String>,
@@ -46,7 +52,7 @@ fn default_max_turns() -> usize {
 #[serde(rename_all = "camelCase")]
 pub struct Client {
     pub name: String,
-    /// token 的 SHA-256（hex）。用 `pi-agentd hash-token <token>` 生成，配置文件里不存明文。
+    /// token 的 SHA-256（hex）。用 `sub-bot hash-token <token>` 生成，配置文件里不存明文。
     pub token_sha256: String,
     pub profiles: Vec<String>,
 }
@@ -56,6 +62,9 @@ pub struct Client {
 pub struct Config {
     #[serde(default = "default_model")]
     pub default_model: String,
+    /// 所有 profile 的默认推理强度（profile 自己的 reasoningEffort 优先）
+    #[serde(default)]
+    pub default_reasoning_effort: Option<agent_ai::ThinkingLevel>,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -83,6 +92,8 @@ impl Config {
                 system_prompt: None,
                 append_system_prompt: None,
                 model: None,
+                allowed_models: None,
+                reasoning_effort: None,
                 tools: default_tools(),
                 workspace_roots: vec![workspace],
                 load_context_files: true,
@@ -92,7 +103,12 @@ impl Config {
                 max_turns: 30,
             },
         );
-        Config { default_model: model, profiles, clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }] }
+        Config { default_model: model, default_reasoning_effort: None, profiles, clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }] }
+    }
+
+    /// profile 是否允许使用该模型。
+    pub fn model_allowed(p: &Profile, model: &str) -> bool {
+        p.allowed_models.as_ref().map_or(true, |list| list.iter().any(|pat| agent_ai::models::model_matches(pat, model)))
     }
 
     /// 常量时间比较哈希，找出 token 对应的客户端。

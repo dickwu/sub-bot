@@ -6,7 +6,7 @@ edition.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "pi-agentd"
+name = "sub-bot"
 path = "src/main.rs"
 
 [dependencies]

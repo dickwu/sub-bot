@@ -3,7 +3,8 @@
 use crate::{provider::*, types::*};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
@@ -12,12 +13,41 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
+    /// 运行时从 400 错误里学到的 reasoning_effort 能力：model -> None(不支持) / Some(可选值)
+    effort_cache: EffortCache,
+}
+
+type EffortCache = Arc<Mutex<HashMap<String, Option<Vec<ThinkingLevel>>>>>;
+
+/// 结合运行时缓存，算出这次真正要发送的 reasoning_effort。
+fn effective_effort(cache: &EffortCache, model: &str, requested: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
+    let requested = requested?;
+    match cache.lock().unwrap().get(model) {
+        Some(None) => None,
+        Some(Some(levels)) => requested.nearest_in(levels),
+        None => Some(requested),
+    }
+}
+
+/// 解析 OpenAI 关于 reasoning_effort 的 400 错误。返回 Some(None)=模型不支持该参数，Some(Some(levels))=可选值。
+fn parse_effort_error(body: &str) -> Option<Option<Vec<ThinkingLevel>>> {
+    if !body.contains("reasoning_effort") {
+        return None;
+    }
+    // 有的模型（如 gpt-6.1-sol）在 Chat Completions 上不允许“函数工具 + reasoning_effort”，只能不发该参数
+    if body.contains("Unrecognized request argument") || body.contains("Function tools with reasoning_effort are not supported") {
+        return Some(None);
+    }
+    let tail = &body[body.find("Supported values are:")? ..];
+    let tail = &tail[..tail.find('.').unwrap_or(tail.len())];
+    let levels: Vec<ThinkingLevel> = tail.split('\'').skip(1).step_by(2).filter_map(|w| w.parse().ok()).collect();
+    Some(if levels.is_empty() { None } else { Some(levels) })
 }
 
 impl OpenAiProvider {
     /// key 只在进程内存中，从不通过对外接口返回。
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
-        Self { api_key, base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()), http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client") }
+        Self { api_key, base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()), http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client"), effort_cache: Default::default() }
     }
 }
 
@@ -63,9 +93,7 @@ pub fn build_body(req: &Request) -> Value {
         body["max_completion_tokens"] = json!(n);
     }
     if let Some(level) = req.reasoning {
-        if level != ThinkingLevel::Off {
-            body["reasoning_effort"] = serde_json::to_value(level).unwrap();
-        }
+        body["reasoning_effort"] = json!(level.as_str());
     }
     body
 }
@@ -75,17 +103,39 @@ impl Provider for OpenAiProvider {
         "openai"
     }
 
+    fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::models::ModelInfo>, String>> {
+        Box::pin(async move {
+            let started = std::time::Instant::now();
+            let resp = self.http.get(format!("{}/models", self.base_url)).bearer_auth(&self.api_key).timeout(std::time::Duration::from_secs(30)).send().await.map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(|e| e.to_string())?;
+            if !status.is_success() {
+                tracing::error!(status = status.as_u16(), "list models failed");
+                return Err(redact(&format!("OpenAI HTTP {status}: {body}")));
+            }
+            let v: Value = serde_json::from_str(&body).map_err(|e| e.to_string())?;
+            let mut out: Vec<_> = v["data"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|m| Some(crate::models::info_for(m["id"].as_str()?.to_string(), m["owned_by"].as_str().map(String::from), m["created"].as_i64()))).collect())
+                .unwrap_or_default();
+            out.sort_by(|a: &crate::models::ModelInfo, b| a.id.cmp(&b.id));
+            tracing::info!(count = out.len(), latency_ms = started.elapsed().as_millis() as u64, "listed models");
+            Ok(out)
+        })
+    }
+
     fn stream(&self, req: Request, cancel: CancellationToken) -> EventStream {
         let (tx, rx) = mpsc::channel(64);
         let http = self.http.clone();
         let url = format!("{}/chat/completions", self.base_url);
         let key = self.api_key.clone();
-        let span = tracing::info_span!("llm", provider = "openai", model = %req.model);
+        let cache = self.effort_cache.clone();
+        let span = tracing::info_span!("llm", provider = "openai", model = %req.model, reasoning_effort = tracing::field::Empty);
         tokio::spawn(tracing::Instrument::instrument(async move {
             let model = req.model.clone();
             let started = std::time::Instant::now();
             tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
-            let fut = run(http, url, key, req, tx.clone());
+            let fut = run(http, url, key, req, cache, tx.clone());
             let final_ev = tokio::select! {
                 r = fut => match r {
                     Ok(msg) => AssistantEvent::Done { message: msg },
@@ -113,13 +163,31 @@ struct PartialCall {
     args: String,
 }
 
-async fn run(http: reqwest::Client, url: String, key: String, req: Request, tx: mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
-    let resp = http.post(&url).bearer_auth(&key).json(&build_body(&req)).send().await.map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
+async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, cache: EffortCache, tx: mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
+    let requested = req.reasoning;
+    let mut attempt = 0;
+    let resp = loop {
+        attempt += 1;
+        req.reasoning = effective_effort(&cache, &req.model, requested);
+        let resp = http.post(&url).bearer_auth(&key).json(&build_body(&req)).send().await.map_err(|e| e.to_string())?;
+        if resp.status().is_success() {
+            tracing::Span::current().record("reasoning_effort", req.reasoning.map(|l| l.as_str()).unwrap_or("-"));
+            break resp;
+        }
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
+        // 模型不支持所选 reasoning_effort：从错误里学到能力，缓存后降级重试一次（此时还没有发出任何流事件）
+        if status == reqwest::StatusCode::BAD_REQUEST && attempt <= 2 && req.reasoning.is_some() {
+            if let Some(learned) = parse_effort_error(&body) {
+                cache.lock().unwrap().insert(req.model.clone(), learned.clone());
+                let next = effective_effort(&cache, &req.model, requested);
+                tracing::warn!(model = %req.model, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("(omitted)"), supported = ?learned, "model does not support requested reasoning_effort; adjusting and retrying");
+                continue;
+            }
+        }
+        tracing::Span::current().record("reasoning_effort", req.reasoning.map(|l| l.as_str()).unwrap_or("-"));
         return Err(redact(&format!("OpenAI HTTP {status}: {body}")));
-    }
+    };
     let _ = tx.send(AssistantEvent::Start).await;
     let mut msg = AssistantMessage::empty(&req.model);
     let mut text = String::new();
@@ -211,6 +279,19 @@ fn redact(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn parses_effort_errors() {
+        let e = r#"{"error":{"message":"Unsupported value: 'reasoning_effort' does not support 'minimal' with this model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."}}"#;
+        assert_eq!(parse_effort_error(e), Some(Some(vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Xhigh])));
+        assert_eq!(parse_effort_error("Unrecognized request argument supplied: reasoning_effort"), Some(None));
+        assert_eq!(parse_effort_error("Function tools with reasoning_effort are not supported for x in /v1/chat/completions"), Some(None));
+        assert_eq!(parse_effort_error("model not found"), None);
+        let cache: EffortCache = Default::default();
+        cache.lock().unwrap().insert("m".into(), Some(vec![ThinkingLevel::Off, ThinkingLevel::Low]));
+        assert_eq!(effective_effort(&cache, "m", Some(ThinkingLevel::Minimal)), Some(ThinkingLevel::Low));
+        assert_eq!(effective_effort(&cache, "x", Some(ThinkingLevel::Minimal)), Some(ThinkingLevel::Minimal));
+    }
+
     #[test]
     fn redacts_keys() {
         let r = redact(r#"{"message":"Incorrect API key provided: sk-proj-abc***xyz. See"}"#);

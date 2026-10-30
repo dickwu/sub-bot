@@ -102,14 +102,57 @@ pub struct ToolSpec {
     pub parameters: Value,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+/// 推理强度（OpenAI `reasoning_effort`）。`Off` 序列化为 `"none"`（也接受 `"off"`）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
+    #[serde(rename = "none", alias = "off")]
     Off,
     Minimal,
     Low,
     Medium,
     High,
+    Xhigh,
+}
+
+impl ThinkingLevel {
+    pub const ALL: [ThinkingLevel; 6] = [Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::Xhigh];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+    /// 在模型支持的取值里挑最接近的（距离相同取更高的一档）。
+    pub fn nearest_in(self, supported: &[ThinkingLevel]) -> Option<ThinkingLevel> {
+        let idx = |l: ThinkingLevel| l as i32;
+        supported.iter().copied().min_by_key(|s| ((idx(*s) - idx(self)).abs(), -idx(*s)))
+    }
+}
+
+impl std::fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ThinkingLevel {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" | "off" => Ok(Self::Off),
+            "minimal" => Ok(Self::Minimal),
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "xhigh" => Ok(Self::Xhigh),
+            o => Err(format!("unknown reasoning effort '{o}' (none|minimal|low|medium|high|xhigh)")),
+        }
+    }
 }
 
 /// 流式事件。对应 `AssistantMessageEvent`（去掉每条事件里的 partial，参照 `packages/agent/src/proxy.ts` 的瘦身格式）。

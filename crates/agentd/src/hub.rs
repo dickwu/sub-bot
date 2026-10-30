@@ -1,5 +1,5 @@
 use crate::config::{Client, Config, Profile};
-use agent_ai::{faux::FauxProvider, openai::OpenAiProvider, Message, Provider};
+use agent_ai::{faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
 use agent_session::Session;
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
@@ -52,7 +52,8 @@ impl SessionHandle {
         }
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
-        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile);
+        let effort = self.agent.config.reasoning.map(|l| l.as_str()).unwrap_or("-");
+        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, model = %self.agent.config.model, reasoning_effort = effort);
         tracing::Instrument::instrument(async move {
             let started = std::time::Instant::now();
             tracing::info!(prompt_chars = msg_len, "run started");
@@ -101,7 +102,10 @@ pub struct SessionRequest {
     pub cwd: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
+    /// 覆盖 profile 的默认模型；受 profile.allowedModels 限制
     pub model: Option<String>,
+    /// 推理强度 none|minimal|low|medium|high|xhigh；模型不支持时忽略并记 warn 日志
+    pub reasoning_effort: Option<ThinkingLevel>,
     /// 只能从 profile 已启用的工具里再收窄
     pub tools: Option<Vec<String>>,
     #[serde(default)]
@@ -115,6 +119,24 @@ pub struct Hub {
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     http: reqwest::Client,
+    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
+}
+
+/// 按模型能力处理推理强度：不支持则忽略（warn），取值不支持则换成最接近的（warn），未知模型原样发送。
+pub fn resolve_effort(model: &str, requested: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
+    let level = requested?;
+    match reasoning_support(model) {
+        ReasoningSupport::Unsupported => {
+            tracing::warn!(model, requested = %level, "model does not support reasoning_effort; ignoring");
+            None
+        }
+        ReasoningSupport::Levels(ls) if !ls.contains(&level) => {
+            let n = level.nearest_in(ls);
+            tracing::warn!(model, requested = %level, using = %n.map(|l| l.as_str()).unwrap_or("-"), "reasoning_effort not supported by model; using nearest");
+            n
+        }
+        _ => Some(level),
+    }
 }
 
 fn expand_tools(names: &[String]) -> Result<Vec<String>> {
@@ -164,7 +186,7 @@ impl Hub {
                 }
             }
         }
-        Ok(Arc::new(Self { config, provider, registry, session_dir, sessions: Mutex::new(HashMap::new()), http: reqwest::Client::new() }))
+        Ok(Arc::new(Self { config, provider, registry, session_dir, sessions: Mutex::new(HashMap::new()), http: reqwest::Client::new(), models_cache: Default::default() }))
     }
 
     pub fn create_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
@@ -207,9 +229,18 @@ impl Hub {
             tools.push(Arc::new(CallbackTool { spec, session_id: id.clone(), http: self.http.clone() }));
         }
 
+        let model = match req.model {
+            Some(m) if !Config::model_allowed(p, &m) => bail!("model '{m}' is not allowed in profile '{profile_name}' (allowedModels)"),
+            Some(m) => m,
+            None => p.model.clone().unwrap_or_else(|| self.config.default_model.clone()),
+        };
+        if !Config::model_allowed(p, &model) {
+            bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
+        }
+        let reasoning = resolve_effort(&model, req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort));
         let config = LoopConfig {
             provider: self.provider.clone(),
-            model: req.model.or_else(|| p.model.clone()).unwrap_or_else(|| self.config.default_model.clone()),
+            model,
             system_prompt: Some(crate::prompt::build(crate::prompt::PromptInput {
                 custom: req.system_prompt.as_deref().or(p.system_prompt.as_deref()),
                 append: &[p.append_system_prompt.as_deref().unwrap_or(""), req.append_system_prompt.as_deref().unwrap_or("")],
@@ -219,12 +250,12 @@ impl Hub {
                 load_context_files: p.load_context_files,
             })),
             tools,
-            reasoning: None,
+            reasoning,
             steering: Default::default(),
             follow_up: Default::default(),
             max_turns: p.max_turns,
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle { id: id.clone(), owner: client.name.clone(), profile: profile_name, cwd, agent: Agent::new(config, vec![]), store: Mutex::new(store) });
         self.sessions.lock().unwrap().insert(id, h.clone());
         Ok(h)
@@ -233,6 +264,25 @@ impl Hub {
     /// 只返回属于该 client 的会话；别的 bot 的会话一律当作不存在。
     pub fn get(&self, client: &Client, id: &str) -> Option<Arc<SessionHandle>> {
         self.sessions.lock().unwrap().get(id).filter(|h| h.owner == client.name).cloned()
+    }
+
+    /// 实时模型列表（缓存 10 分钟）。`all=false` 时只保留可用于对话的模型并去掉日期快照。
+    pub async fn list_models(&self, all: bool) -> Result<Vec<ModelInfo>> {
+        let mut cache = self.models_cache.lock().await;
+        let fresh = cache.as_ref().filter(|(t, _)| t.elapsed() < std::time::Duration::from_secs(600)).map(|(_, m)| m.clone());
+        let models = match fresh {
+            Some(m) => m,
+            None => {
+                let m = self.provider.list_models().await.map_err(|e| anyhow::anyhow!(e))?;
+                *cache = Some((std::time::Instant::now(), m.clone()));
+                m
+            }
+        };
+        Ok(if all || self.provider.id() != "openai" { models } else { models.into_iter().filter(|m| agent_ai::models::is_chat_model(&m.id) && !agent_ai::models::is_snapshot(&m.id)).collect() })
+    }
+
+    pub fn provider_id(&self) -> &str {
+        self.provider.id()
     }
 
     pub fn tool_names(&self) -> Vec<String> {

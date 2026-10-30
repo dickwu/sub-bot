@@ -9,7 +9,7 @@
 *.log
 logs/
 
-# 机密与本地配置（只提交 agentd.example.json）
+# 机密与本地配置（只提交 sub-bot.example.json）
 .env
 .env.*
 agentd.json

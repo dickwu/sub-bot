@@ -1,4 +1,4 @@
-# pi-agentd 设计文档：用 Rust 仿 pi coding-agent 做一个可被其它 bot 调用的本地编码 agent
+# sub-bot 设计文档：用 Rust 仿 pi coding-agent 做一个可被其它 bot 调用的本地编码 agent
 
 > 目标：我要用 Rust 写一个**以编码为核心**的 agent，架构上尽量贴近 Mario Zechner 的 pi coding-agent（`badlogic/pi-mono`）。
 > 它的核心能力是编码：读、写、编辑文件，执行 shell 命令。
@@ -107,7 +107,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 ## (c) 给其它 bot 的接口
 
 ### 鉴权与隔离
-- 每个 bot 一个 token。配置里**只存 SHA-256**（用 `pi-agentd hash-token <token>` 生成），比较时用常量时间比较。
+- 每个 bot 一个 token。配置里**只存 SHA-256**（用 `sub-bot hash-token <token>` 生成），比较时用常量时间比较。
 - 请求头为 `Authorization: Bearer <token>`。
 - 每个 client 有一个 profile 白名单（`clients[].profiles`）。
 - 会话按 owner 隔离：别的 bot 访问时一律返回 404。会话文件存放在 `<sessionDir>/<client>/` 下。
@@ -122,8 +122,9 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | 方法和路径 | 说明 |
 |---|---|
 | `GET /health` | 无需鉴权 |
-| `GET /profiles` | 当前 bot 可用的 profile，包括 model、tools 和 workspaceRoots |
-| `POST /sessions` | 请求体为 `{profile, cwd?, model?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, tools}` |
+| `GET /profiles` | 当前 bot 可用的 profile，包括 model、allowedModels、reasoningEffort、tools 和 workspaceRoots |
+| `GET /models?profile=&all=` | 调用 provider 的 `/v1/models` 实时取模型列表（Hub 缓存 10 分钟），默认过滤掉非对话模型（embedding/tts/image/realtime/codex/-pro 等）和日期快照；每项带 `reasoning`、`reasoningEfforts` |
+| `POST /sessions` | 请求体为 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, model, reasoningEffort, tools}`；model 不在 profile 的 `allowedModels` 内返回 400 |
 | `POST /sessions/{id}/prompt` | 请求体为 `{message, mode?: "steer"|"follow_up"}`，返回 202 和 `started`/`queuedSteer`/`queuedFollowUp`（语义同 pi：运行中只能 steer 或 follow_up） |
 | `GET /sessions/{id}/events` | SSE，`event:` 名称与 pi 的 `AgentEvent.type` 一致，额外有 `agent_settled{aborted}` |
 | `POST /sessions/{id}/abort` | 中止当前运行 |
@@ -136,7 +137,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
   -d '{"message":"修复 src/lib.rs 里的编译错误并运行 cargo test","session":{"profile":"coder","cwd":"projA"}}'
 ```
 
-### stdio JSONL RPC（`pi-agentd rpc --profile coder`）
+### stdio JSONL RPC（`sub-bot rpc --profile coder`）
 - 父进程直接拉起 agent，命令和响应格式与 pi 的 `modes/rpc/rpc-types.ts` 一致：
   ```
   → {"id":"1","type":"prompt","message":"..."}
@@ -178,10 +179,10 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - **作为服务运行**：
   - Linux 用 systemd user unit；
   - macOS 用 launchd plist（`~/Library/LaunchAgents`）；
-  - M5 提供 `pi-agentd service install` 命令。
+  - M5 提供 `sub-bot service install` 命令。
 - **配置和数据目录**：用 `directories` crate 按操作系统决定：
-  - Linux：`~/.config/pi-agentd`，数据放在 `~/.local/share`；
-  - macOS：`~/Library/Application Support/pi-agentd`；
+  - Linux：`~/.config/sub-bot`，数据放在 `~/.local/share`；
+  - macOS：`~/Library/Application Support/sub-bot`；
 - **API Key 来源**：环境变量，或者系统钥匙串（`keyring` crate，M3）。Key 不写进配置文件。
 
 ---
@@ -189,19 +190,19 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 ## (d2) 日志（tracing）
 
 - **框架**：`tracing`，加上 `tracing-subscriber`（`EnvFilter`）和 `tracing-appender`。实现见 `agentd/src/logging.rs`。
-- **级别**：用 `--log-level`（环境变量 `PI_AGENTD_LOG`，默认 `info`）设置；`RUST_LOG` 优先，可以按模块细调，例如 `agentd=debug,agent_ai=trace`。
+- **级别**：用 `--log-level`（环境变量 `SUB_BOT_LOG`，默认 `info`）设置；`RUST_LOG` 优先，可以按模块细调，例如 `agentd=debug,agent_ai=trace`。
   - 依赖库 `hyper`、`reqwest`、`h2`、`rustls` 默认压到 `warn`，防止请求头在 trace 级被打印出来。
 - **输出**：
   - stderr 输出人类可读格式。stdout 只留给 RPC 协议，永远不写日志。
-  - 文件日志按天滚动，保留 14 天，文件名为 `pi-agentd.YYYY-MM-DD.log`，默认是 JSON 格式（`--log-format json|text`）。
+  - 文件日志按天滚动，保留 14 天，文件名为 `sub-bot.YYYY-MM-DD.log`，默认是 JSON 格式（`--log-format json|text`）。
   - 默认目录：
-    - Linux：`~/.local/share/pi-agentd/logs`
-    - macOS：`~/Library/Application Support/pi-agentd/logs`
+    - Linux：`~/.local/share/sub-bot/logs`
+    - macOS：`~/Library/Application Support/sub-bot/logs`
   - 用 `--log-dir <dir>` 改目录，传 `-` 关闭文件日志。
 - **Span 层级**（JSON 日志的每一行都带完整的 span 列表）：
   - `http{request_id, method, path, bot}`：request_id 沿用调用方的 `X-Request-Id`，否则自动生成，并回写到响应头；
-  - 其下是 `session_run{session_id, bot, profile}`；
-  - 再往下是 `llm{provider, model}` 和 `tool{tool, tool_call_id}`。
+  - 其下是 `session_run{session_id, bot, profile, model, reasoning_effort}`；
+  - 再往下是 `llm{provider, model, reasoning_effort}`（实际发送的值）和 `tool{tool, tool_call_id}`。
 - **关键事件**：
   - 请求结束（status、latency_ms，4xx 记为 warn，5xx 记为 error）；
   - `session created`（cwd、model、tools）；
@@ -218,6 +219,13 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - 已实测：日志文件和会话 JSONL 里都搜不到 key、`sk-` 或 bot token。
 
 ---
+
+### 模型选择与推理强度（v0.2）
+- `ThinkingLevel`：`none`（别名 `off`）/ `minimal` / `low` / `medium` / `high` / `xhigh`，对应 OpenAI 的 `reasoning_effort`。
+- 优先级：会话请求（HTTP `model`/`reasoningEffort`、CLI `--model`/`--reasoning-effort`）> profile > 全局默认；`allowedModels` 支持 `*` 通配。
+- `agent-ai/src/models.rs` 有一张静态能力表（2026-10 实测）：gpt-4.x/gpt-4o 不支持；gpt-5/-mini/-nano 为 minimal..high；gpt-5.1 为 none/low/medium/high；gpt-5.2 及以后加 xhigh；o3 为 low..xhigh；chat-latest 只有 medium。建会话时按表处理：不支持就忽略并 warn，档位不支持就取最接近的并 warn。
+- 实测：gpt-5.4 及以后在 Chat Completions 上拒绝“函数工具 + reasoning_effort”（只能 none），gpt-6.x 带工具时完全不可用（要求 /v1/responses）。前者自动降级为不发送；后者等 M1 的 Responses API。
+- 表外模型（如 gpt-6.x）先原样发送；OpenAI 返回 400 时 `openai.rs` 解析错误（`Unrecognized request argument` → 不支持；`Supported values are: ...` → 可选档位），按模型缓存，warn 后自动重试一次。
 
 ## (e) MVP 里程碑
 
@@ -238,14 +246,14 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 cd /workspace/rust-agent
 cargo build --release
 export OPENAI_API_KEY=sk-...          # 只在本机环境中
-./target/release/pi-agentd hash-token my-bot-token   # 把结果填进配置的 tokenSha256
-./target/release/pi-agentd --config agentd.example.json serve           # HTTP 服务
-./target/release/pi-agentd --workspace ~/code rpc                       # stdio RPC
-./target/release/pi-agentd --provider faux --config agentd.example.json serve   # 离线测试，不调用 OpenAI
+./target/release/sub-bot hash-token my-bot-token   # 把结果填进配置的 tokenSha256
+./target/release/sub-bot --config sub-bot.example.json serve           # HTTP 服务
+./target/release/sub-bot --workspace ~/code rpc                       # stdio RPC
+./target/release/sub-bot --provider faux --config sub-bot.example.json serve   # 离线测试，不调用 OpenAI
 ```
-`agentd.example.json` 中有三个 profile：
+`sub-bot.example.json` 中有三个 profile：
 - `coder`：全部核心工具；
 - `reviewer`：只读，`preset:readonly`；
 - `docs-writer`：不能执行 shell，外加 `http_fetch`。
 
-另有两个 client：`ci-bot` 只能用 reviewer；`dev-bot` 三个都能用。示例里的 `tokenSha256` 是占位符，必须换成 `pi-agentd hash-token <随机 token>` 的输出。
+另有两个 client：`ci-bot` 只能用 reviewer；`dev-bot` 三个都能用。示例里的 `tokenSha256` 是占位符，必须换成 `sub-bot hash-token <随机 token>` 的输出。

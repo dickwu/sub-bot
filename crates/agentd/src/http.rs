@@ -1,8 +1,8 @@
-use crate::{config::Client, hub::{Hub, SessionRequest}};
+use crate::{config::{Client, Config}, hub::{Hub, SessionRequest}};
 use agent_ai::Message;
 use agent_core::AgentEvent;
 use axum::{
-    extract::{Extension, Path, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{sse::Event, IntoResponse, Response, Sse},
@@ -87,6 +87,7 @@ pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
         .route("/v1/sessions/{id}/messages", get(messages))
         .route("/v1/chat", post(chat))
         .route("/v1/profiles", get(profiles))
+        .route("/v1/models", get(models))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     let app = Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st);
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -108,15 +109,37 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
     let list: Vec<_> = c
         .profiles
         .iter()
-        .filter_map(|n| st.hub.config.profiles.get(n).map(|p| json!({"name": n, "model": p.model, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})))
+        .filter_map(|n| st.hub.config.profiles.get(n).map(|p| json!({"name": n, "model": p.model.clone().unwrap_or_else(|| st.hub.config.default_model.clone()), "allowedModels": p.allowed_models, "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort), "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})))
         .collect();
     Ok(Json(json!({"client": c.name, "profiles": list, "registeredTools": st.hub.tool_names()})).into_response())
+}
+
+#[derive(Deserialize, Default)]
+struct ModelsQuery {
+    /// 只返回该 profile 允许的模型
+    profile: Option<String>,
+    /// 不过滤（包含 embedding、语音、快照等）
+    #[serde(default)]
+    all: bool,
+}
+
+/// 实时模型列表（来自 provider 的 /v1/models，缓存 10 分钟），附带推断的推理强度。
+async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Query<ModelsQuery>) -> ApiResult {
+    let mut list = st.hub.list_models(q.all).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
+    if let Some(name) = &q.profile {
+        if !c.profiles.contains(name) {
+            return Err(bad_request(format!("profile '{name}' is not allowed for this client")));
+        }
+        let p = st.hub.config.profiles.get(name).ok_or_else(|| bad_request(format!("unknown profile '{name}'")))?;
+        list.retain(|m| Config::model_allowed(p, &m.id));
+    }
+    Ok(Json(json!({"provider": st.hub.provider_id(), "models": list})).into_response())
 }
 
 async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: Option<Json<SessionRequest>>) -> ApiResult {
     let b = body.map(|b| b.0).unwrap_or_default();
     let h = st.hub.create_session(&c, b).map_err(bad_request)?;
-    Ok((StatusCode::CREATED, Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()}))).into_response())
+    Ok((StatusCode::CREATED, Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "model": h.agent.config.model, "reasoningEffort": h.agent.config.reasoning, "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()}))).into_response())
 }
 
 #[derive(Deserialize)]

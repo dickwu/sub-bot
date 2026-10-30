@@ -19,12 +19,13 @@ enum Command {
     Abort,
     GetMessages,
     GetState,
+    GetAvailableModels,
 }
 
 /// stdio 的调用方就是父进程本身，视为可用全部 profile 的本地 client。
-pub async fn run(hub: Arc<Hub>, profile: Option<String>) -> anyhow::Result<()> {
+pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect() };
-    let session = hub.create_session(&client, SessionRequest { profile, ..Default::default() })?;
+    let session = hub.create_session(&client, req)?;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
 
     // 单一 writer，保证每条记录整行写出
@@ -65,7 +66,11 @@ pub async fn run(hub: Arc<Hub>, profile: Option<String>) -> anyhow::Result<()> {
             Ok(Command::FollowUp { message }) => json!({"success": true, "data": {"disposition": session.submit(message, Some("follow_up"))}}),
             Ok(Command::Abort) => { session.agent.abort(); json!({"success": true}) }
             Ok(Command::GetMessages) => json!({"success": true, "data": {"messages": session.agent.messages().await}}),
-            Ok(Command::GetState) => json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model}}),
+            Ok(Command::GetState) => json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "profile": session.profile}}),
+            Ok(Command::GetAvailableModels) => match hub.list_models(false).await {
+                Ok(models) => json!({"success": true, "data": {"models": models}}),
+                Err(e) => json!({"success": false, "error": e.to_string()}),
+            },
         };
         let mut r = json!({"type": "response", "command": cmd_name});
         if let Some(id) = id { r["id"] = id; }

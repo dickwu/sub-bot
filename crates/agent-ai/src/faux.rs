@@ -15,6 +15,9 @@ impl Provider for FauxProvider {
     fn id(&self) -> &str {
         "faux"
     }
+    fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::models::ModelInfo>, String>> {
+        Box::pin(async { Ok(vec![crate::models::info_for("faux".into(), Some("sub-bot".into()), None)]) })
+    }
     fn stream(&self, req: Request, _cancel: CancellationToken) -> EventStream {
         let mut msg = AssistantMessage::empty(&req.model);
         let mut events = vec![AssistantEvent::Start];

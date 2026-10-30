@@ -7,8 +7,8 @@ use tracing_appender::{non_blocking::WorkerGuard, rolling};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 pub fn default_log_dir() -> Option<PathBuf> {
-    // Linux: ~/.local/share/pi-agentd/logs；macOS: ~/Library/Application Support/pi-agentd/logs
-    directories::ProjectDirs::from("", "", "pi-agentd").map(|d| d.data_local_dir().join("logs"))
+    // Linux: ~/.local/share/sub-bot/logs；macOS: ~/Library/Application Support/sub-bot/logs
+    directories::ProjectDirs::from("", "", "sub-bot").map(|d| d.data_local_dir().join("logs"))
 }
 
 pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<WorkerGuard>> {
@@ -26,7 +26,7 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
         return Ok(None);
     };
     std::fs::create_dir_all(&dir)?;
-    let appender = rolling::Builder::new().rotation(rolling::Rotation::DAILY).filename_prefix("pi-agentd").filename_suffix("log").max_log_files(14).build(&dir)?;
+    let appender = rolling::Builder::new().rotation(rolling::Rotation::DAILY).filename_prefix("sub-bot").filename_suffix("log").max_log_files(14).build(&dir)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
     let file = fmt::layer().with_writer(writer).with_ansi(false);
     let file = if format == "text" { file.boxed() } else { file.json().with_current_span(true).with_span_list(true).boxed() };

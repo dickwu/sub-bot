@@ -21,6 +21,10 @@ pub struct Request {
 pub trait Provider: Send + Sync {
     fn id(&self) -> &str;
     fn stream(&self, req: Request, cancel: CancellationToken) -> EventStream;
+    /// 实时拉取 provider 的模型列表（未过滤）。默认不支持。
+    fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::models::ModelInfo>, String>> {
+        Box::pin(async { Err("this provider does not support listing models".to_string()) })
+    }
 }
 
 /// provider 注册表，对应 `models.ts` 里按 model.api 分发。

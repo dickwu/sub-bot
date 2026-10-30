@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agent-ai"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -20,7 +20,7 @@ dependencies = [
 
 [[package]]
 name = "agent-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agent-ai",
  "anyhow",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "agent-session"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agent-ai",
  "anyhow",
@@ -47,7 +47,7 @@ dependencies = [
 
 [[package]]
 name = "agent-tools"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agent-ai",
  "agent-core",
@@ -63,7 +63,7 @@ dependencies = [
 
 [[package]]
 name = "agentd"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agent-ai",
  "agent-core",

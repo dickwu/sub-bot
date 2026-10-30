@@ -46,9 +46,9 @@ jobs:
       - name: package
         shell: bash
         run: |
-          name=pi-agentd-${GITHUB_REF_NAME}-${{ matrix.target }}
+          name=sub-bot-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir -p "$name"
-          cp "target/${{ matrix.target }}/release/pi-agentd" agentd.example.json README.md DESIGN.md "$name/"
+          cp "target/${{ matrix.target }}/release/sub-bot" sub-bot.example.json README.md DESIGN.md "$name/"
           tar czf "$name.tar.gz" "$name"; f="$name.tar.gz"
           (command -v sha256sum >/dev/null && sha256sum "$f" || shasum -a 256 "$f") > "$f.sha256"
           echo "ASSET=$f" >> "$GITHUB_ENV"

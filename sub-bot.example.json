@@ -1,7 +1,14 @@
 {
   "defaultModel": "gpt-4.1",
+  "defaultReasoningEffort": "low",
   "profiles": {
     "coder": {
+      "model": "gpt-5.4-mini",
+      "allowedModels": [
+        "gpt-5*",
+        "gpt-4.1*"
+      ],
+      "reasoningEffort": "medium",
       "workspaceRoots": [
         "./work"
       ],
@@ -36,14 +43,14 @@
   "clients": [
     {
       "name": "ci-bot",
-      "tokenSha256": "REPLACE_ME: output of `pi-agentd hash-token <a long random token for ci-bot>`",
+      "tokenSha256": "REPLACE_ME: output of `sub-bot hash-token <a long random token for ci-bot>`",
       "profiles": [
         "reviewer"
       ]
     },
     {
       "name": "dev-bot",
-      "tokenSha256": "REPLACE_ME: output of `pi-agentd hash-token <a long random token for dev-bot>`",
+      "tokenSha256": "REPLACE_ME: output of `sub-bot hash-token <a long random token for dev-bot>`",
       "profiles": [
         "coder",
         "reviewer",

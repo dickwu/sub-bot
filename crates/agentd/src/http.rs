@@ -471,11 +471,14 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
         };
         match event {
             Ok(AgentEvent::AgentStart) => segment_start = new_messages.len(),
+            Ok(AgentEvent::MessageRetry { .. }) => partial_text.clear(),
             Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
             Ok(AgentEvent::MessageEnd { message }) => {
                 if let (Some((id, queue)), Message::Assistant(a)) = (progress, &message) {
-                    for queue in queue {
-                        let _ = queue.send(("task.progress", json!({"taskId": id, "text": a.text()})));
+                    if let Some(payload) = assistant_progress(id, a) {
+                        for queue in queue {
+                            let _ = queue.send(("task.progress", payload.clone()));
+                        }
                     }
                 }
                 new_messages.push(message);
@@ -533,6 +536,11 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
     }
 }
 
+fn assistant_progress(id: &str, message: &agent_ai::AssistantMessage) -> Option<serde_json::Value> {
+    let text = message.text();
+    (!text.trim().is_empty()).then(|| json!({"taskId": id, "text": text}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,6 +548,17 @@ mod tests {
     use axum::body::{to_bytes, Body};
     use serde_json::Value;
     use tower::ServiceExt;
+
+    #[test]
+    fn empty_assistant_progress_is_skipped() {
+        let mut message = agent_ai::AssistantMessage::empty("test");
+        message.content.push(agent_ai::Content::ToolCall(agent_ai::ToolCall { id: "c".into(), name: "read".into(), arguments: serde_json::json!({}) }));
+        assert!(super::assistant_progress("task", &message).is_none());
+        message.content.push(agent_ai::Content::Text { text: " \n\t".into() });
+        assert!(super::assistant_progress("task", &message).is_none());
+        message.content.push(agent_ai::Content::Text { text: "answer".into() });
+        assert!(super::assistant_progress("task", &message).is_some());
+    }
 
     fn config() -> Config {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
@@ -846,13 +865,12 @@ mod tests {
             assert_eq!(last["data"]["result"], task["result"]);
             assert_eq!(last["data"]["status"], task["status"]);
             if all {
-                assert_eq!(received.len(), 4); // assistant tool call, tool end, assistant answer, final
-                assert!(received[..3].iter().all(|e| e["event"] == "task.progress"));
-                assert!(received[0]["data"]["text"].is_string());
-                assert_eq!(received[1]["data"]["toolName"], "bash");
-                assert!(received[1]["data"]["toolCallId"].is_string());
-                assert_eq!(received[1]["data"]["isError"], false);
-                assert!(received[2]["data"]["text"].as_str().unwrap().contains("webhook-result"));
+                assert_eq!(received.len(), 3); // tool-only assistant is skipped; tool end, answer, final
+                assert!(received[..2].iter().all(|e| e["event"] == "task.progress"));
+                assert_eq!(received[0]["data"]["toolName"], "bash");
+                assert!(received[0]["data"]["toolCallId"].is_string());
+                assert_eq!(received[0]["data"]["isError"], false);
+                assert!(received[1]["data"]["text"].as_str().unwrap().contains("webhook-result"));
             } else {
                 assert_eq!(received.len(), 1);
             }

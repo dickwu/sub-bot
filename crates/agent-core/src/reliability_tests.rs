@@ -8,6 +8,101 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Barrier, Notify};
 use tokio_util::sync::CancellationToken;
 
+#[tokio::test]
+async fn openai_stream_retries_keep_only_successful_message() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    for api in [Api::Chat, Api::Responses] {
+        for scenario in ["500", "text", "idle", "tool", "401", "400", "408", "429", "exhaust", "cancel"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let count = Arc::new(AtomicUsize::new(0));
+            let requests = count.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let index = requests.fetch_add(1, Ordering::SeqCst);
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(socket.read_u8().await.unwrap());
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length: usize = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").map(|s| s.parse().unwrap())).unwrap();
+                    socket.read_exact(&mut vec![0; length]).await.unwrap();
+                    if scenario == "exhaust" || (index == 0 && matches!(scenario, "500" | "401" | "400" | "408" | "429" | "cancel")) {
+                        let code = if scenario == "exhaust" || scenario == "cancel" { "500" } else { scenario };
+                        socket.write_all(format!("HTTP/1.1 {code} Test\r\nContent-Length: 0\r\nRetry-After: 0\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+                        continue;
+                    }
+                    let failed = index == 0;
+                    let text = if failed { "discard me" } else { "successful" };
+                    let delta = match (api, failed && scenario == "tool") {
+                        (Api::Chat, true) => serde_json::json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call","function":{"name":"read","arguments":"{"}}]}}]}),
+                        (Api::Responses, true) => {
+                            serde_json::json!({"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call","name":"read","arguments":""}})
+                        }
+                        (Api::Chat, false) => serde_json::json!({"choices":[{"delta":{"content":text}}]}),
+                        _ => serde_json::json!({"type":"response.output_text.delta","delta":text}),
+                    };
+                    let mut body = format!("data: {delta}\n\n");
+                    if !failed {
+                        let done = if api == Api::Chat {
+                            serde_json::json!({"choices":[{"delta":{},"finish_reason":"stop"}]})
+                        } else {
+                            serde_json::json!({"type":"response.completed","response":{"status":"completed"}})
+                        };
+                        body.push_str(&format!("data: {done}\n\n"));
+                    }
+                    // An incomplete Content-Length forces a real mid-body read failure.
+                    let length = body.len() + if failed { 100 } else { 0 };
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}").as_bytes()).await.unwrap();
+                    if failed && scenario == "idle" {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    socket.shutdown().await.unwrap();
+                }
+            });
+            let provider = agent_ai::openai::OpenAiProvider::with_stream_idle_timeout(agent_ai::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(150));
+            let mut cfg = config(Arc::new(provider));
+            cfg.api = api;
+            cfg.llm_max_retries = Some(1);
+            let context = std::sync::Mutex::new(vec![]);
+            let events = Arc::new(std::sync::Mutex::new(vec![]));
+            let captured = events.clone();
+            let cancel = CancellationToken::new();
+            let abort = cancel.clone();
+            let emit: crate::agent_loop::Emit = Arc::new(move |ev| {
+                if scenario == "cancel" && matches!(ev, AgentEvent::MessageRetry { .. }) {
+                    abort.cancel();
+                }
+                captured.lock().unwrap().push(ev);
+            });
+            let messages = tokio::time::timeout(Duration::from_secs(8), crate::agent_loop::run_loop(&context, vec![Message::user_text("test")], &cfg, cancel, emit)).await.unwrap();
+            server.abort();
+            let success = matches!(scenario, "500" | "text" | "idle" | "408" | "429");
+            assert_eq!(count.load(Ordering::SeqCst), if success || scenario == "exhaust" { 2 } else { 1 }, "{api:?} {scenario}");
+            let assistants: Vec<_> = messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).collect();
+            assert_eq!(assistants.len(), 1);
+            assert_eq!(assistants[0].text(), if success { "successful" } else { "" });
+            assert_eq!(
+                assistants[0].stop_reason,
+                if success {
+                    StopReason::Stop
+                } else if scenario == "cancel" {
+                    StopReason::Aborted
+                } else {
+                    StopReason::Error
+                }
+            );
+            assert_eq!(*context.lock().unwrap(), messages);
+            let events = events.lock().unwrap();
+            assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::MessageRetry { attempt: 1, .. })).count(), usize::from(success || scenario == "exhaust" || scenario == "cancel"));
+            if scenario == "text" {
+                assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { assistant_message_event: AssistantEvent::TextDelta { delta, .. } } if delta == "discard me")));
+            }
+        }
+    }
+}
+
 struct BlockedProvider {
     entered: Arc<Notify>,
     release: Arc<Notify>,
@@ -43,6 +138,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         follow_up: Default::default(),
         max_turns: 10,
         max_tokens: None,
+        llm_max_retries: None,
         token_budget: None,
         run_timeout: None,
     }

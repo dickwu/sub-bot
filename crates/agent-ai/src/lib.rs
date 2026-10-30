@@ -12,6 +12,9 @@ pub mod responses;
 pub mod secrets;
 pub mod types;
 
+/// Maximum server-requested retry delay for LLM calls and webhook delivery.
+pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub use models::default_api;
 pub use models::{ModelInfo, ReasoningSupport};
 pub use provider::{EventStream, Provider, ProviderRegistry, Request};

@@ -2,6 +2,7 @@
 //! 按 `Request.api` 选择；`auto` 时由 `models::default_api` 按模型决定。
 use crate::{models::default_api, provider::*, types::*};
 use futures::StreamExt;
+use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -179,7 +180,7 @@ impl Provider for OpenAiProvider {
                 let started = std::time::Instant::now();
                 tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), api = %api, "request sent");
                 let mut attempt = (api, req.reasoning);
-                let fut = run(ctx, req, api, tx.clone(), &mut attempt);
+                let fut = run_with_retries(&ctx, req, api, &tx, &mut attempt);
                 let r = tokio::select! {
                     r = fut => Some(r),
                     _ = cancel.cancelled() => None,
@@ -197,13 +198,16 @@ impl Provider for OpenAiProvider {
                 };
                 let latency_ms = started.elapsed().as_millis() as u64;
                 match &final_ev {
+                    AssistantEvent::Done { message: m } if m.stop_reason == StopReason::Error => {
+                        tracing::warn!(issue = "typed", latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed")
+                    }
                     AssistantEvent::Done { message: m } => {
                         tracing::info!(latency_ms, stop_reason = ?m.stop_reason, input_tokens = m.usage.input, output_tokens = m.usage.output, reasoning_tokens = m.usage.reasoning, cached_tokens = m.usage.cache_read, tool_calls = m.tool_calls().len(), "llm call finished")
                     }
                     AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => {
                         tracing::info!(latency_ms, "llm call aborted")
                     }
-                    AssistantEvent::Error { message: m } => tracing::error!(issue = "typed", latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
+                    AssistantEvent::Error { message: m } => tracing::warn!(issue = "typed", latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
                     _ => {}
                 }
                 let _ = tx.send(final_ev).await;
@@ -230,8 +234,89 @@ struct CallCtx {
     api_cache: Arc<Mutex<HashMap<String, Api>>>,
 }
 
+struct CallError {
+    reason: String,
+    transient: bool,
+    retry_after: Option<Duration>,
+}
+
+impl CallError {
+    fn transport(error: reqwest::Error) -> Self {
+        Self { transient: error.is_connect() || error.is_timeout() || error.is_request() || error.is_body(), reason: redact(&error.to_string()), retry_after: None }
+    }
+}
+
+impl From<String> for CallError {
+    fn from(reason: String) -> Self {
+        let transient = reason.starts_with("stream idle timeout ")
+            || reason == "response headers timeout after 120s"
+            || reason == "stream body read error"
+            || reason == "OpenAI stream ended without finish_reason (connection dropped?)"
+            || reason == "OpenAI responses stream ended without response.completed";
+        Self { reason, transient, retry_after: None }
+    }
+}
+
+fn retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    value
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
+        .or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(std::time::SystemTime::now()).unwrap_or_default()))
+        .map(|delay| delay.min(crate::MAX_RETRY_AFTER))
+}
+
+/// A fresh parser/message per attempt. Forward deltas immediately, but never retry once
+/// any tool event has escaped. The outer cancellation select drops requests and sleeps.
+async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
+    let max_retries = req.llm_max_retries.unwrap_or(3);
+    for retry in 0..=max_retries {
+        let (attempt_tx, mut rx) = mpsc::channel(64);
+        let mut tool_started = false;
+        let forward = |ev: &AssistantEvent, tool_started: &mut bool| {
+            *tool_started |= matches!(ev, AssistantEvent::ToolcallStart { .. } | AssistantEvent::ToolcallDelta { .. } | AssistantEvent::ToolcallEnd { .. });
+        };
+        let result = {
+            let call = run(ctx, req.clone(), api, attempt_tx, attempt);
+            tokio::pin!(call);
+            loop {
+                tokio::select! {
+                    Some(ev) = rx.recv() => {
+                        forward(&ev, &mut tool_started);
+                        if tx.send(ev).await.is_err() { return Err("consumer closed".into()); }
+                    },
+                    result = &mut call => break result,
+                }
+            }
+        };
+        // run may finish with events still buffered; inspect these before deciding safety.
+        while let Ok(ev) = rx.try_recv() {
+            forward(&ev, &mut tool_started);
+            if tx.send(ev).await.is_err() {
+                return Err("consumer closed".into());
+            }
+        }
+        match result {
+            Ok(message) => return Ok(message),
+            Err(error) if error.transient && !tool_started && retry < max_retries => {
+                let base = Duration::from_secs(1u64 << retry.min(5));
+                let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=250));
+                let delay = (base + jitter).min(Duration::from_secs(30)).max(error.retry_after.unwrap_or_default());
+                tracing::warn!(issue = "typed", attempt = retry + 1, delay_ms = delay.as_millis() as u64, "retrying transient LLM failure; discarding partial message");
+                if tx.send(AssistantEvent::Retry { attempt: retry + 1, reason: error.reason }).await.is_err() {
+                    return Err("consumer closed".into());
+                }
+                tokio::time::sleep(delay).await;
+            }
+            Err(error) => return Err(error.reason),
+        }
+    }
+    unreachable!("retry loop always returns on its last attempt")
+}
+
 /// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。
-async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
+async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, CallError> {
     let requested = req.reasoning;
     let auto = req.api == Api::Auto;
     let mut retries = 0;
@@ -253,46 +338,48 @@ async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Assi
         let resp = tokio::time::timeout(Duration::from_secs(120), ctx.http.post(&url).bearer_auth(ctx.key.expose()).json(&body).send())
             .await
             .map_err(|_| "response headers timeout after 120s".to_string())?
-            .map_err(|e| redact(&e.to_string()))?;
+            .map_err(CallError::transport)?;
         if resp.status().is_success() {
             record(api, req.reasoning);
             break resp;
         }
         let status = resp.status();
-        let text = tokio::time::timeout(ctx.stream_idle_timeout, resp.text()).await.map_err(|_| idle_timeout_error(ctx.stream_idle_timeout))?.unwrap_or_default();
+        let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(retry_after);
+        // Preserve HTTP classification even if reading the error body fails/times out.
+        let text = tokio::time::timeout(ctx.stream_idle_timeout, resp.text()).await.ok().and_then(Result::ok).unwrap_or_default();
         let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {text}", api.as_str()));
         if status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
             record(api, req.reasoning);
-            return Err(err_msg);
+            return Err(CallError { reason: err_msg, transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after });
         }
         let Some(kind) = parse_effort_error(&text) else {
             record(api, req.reasoning);
-            return Err(err_msg);
+            return Err(err_msg.into());
         };
         retries += 1;
         match kind {
             // auto：直接换 Responses（不再在 Chat 上试 none / 省略，避免白白浪费请求）
             EffortError::ToolsConflict if auto && api == Api::Chat => {
                 ctx.api_cache.lock().unwrap().insert(req.model.clone(), Api::Responses);
-                tracing::warn!(model = %req.model, "chat completions rejects tools + reasoning_effort for this model; switching to responses API");
+                tracing::warn!(issue = "typed", model = %req.model, "chat completions rejects tools + reasoning_effort for this model; switching to responses API");
                 api = Api::Responses;
             }
             // 已经没发推理强度了还报这个错（gpt-6.x）：再在 Chat 上重试没有意义
             EffortError::ToolsConflict if req.reasoning.is_none() => {
                 record(api, req.reasoning);
-                return Err(format!("{err_msg} (hint: this model needs api=responses for function tools)"));
+                return Err(format!("{err_msg} (hint: this model needs api=responses for function tools)").into());
             }
             EffortError::ToolsConflict => {
                 ctx.effort_cache.lock().unwrap().insert(key, None);
-                tracing::warn!(model = %req.model, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "chat completions rejects tools + reasoning_effort; retrying without it (use api=responses to keep reasoning effort)");
+                tracing::warn!(issue = "typed", model = %req.model, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "chat completions rejects tools + reasoning_effort; retrying without it (use api=responses to keep reasoning effort)");
             }
             EffortError::Unsupported => {
                 ctx.effort_cache.lock().unwrap().insert(key, None);
-                tracing::warn!(model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "model does not accept reasoning effort; retrying without it");
+                tracing::warn!(issue = "typed", model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "model does not accept reasoning effort; retrying without it");
             }
             EffortError::Levels(levels) => {
                 let next = requested.and_then(|r| r.nearest_in(&levels));
-                tracing::warn!(model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("-"), supported = ?levels, "reasoning effort not supported by model; using nearest");
+                tracing::warn!(issue = "typed", model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("-"), supported = ?levels, "reasoning effort not supported by model; using nearest");
                 ctx.effort_cache.lock().unwrap().insert(key, Some(levels));
             }
         }
@@ -300,7 +387,7 @@ async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Assi
         let next_key = (req.model.clone(), api, !req.tools.is_empty());
         if tried.contains(&(api, effective_effort(&ctx.effort_cache, &next_key, requested))) {
             record(api, req.reasoning);
-            return Err(err_msg);
+            return Err(err_msg.into());
         }
     };
     let mut msg = match api {
@@ -338,7 +425,7 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
     let mut buf: Vec<u8> = Vec::new();
     let mut bytes = resp.bytes_stream();
     'stream: while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| idle_timeout_error(idle_timeout))? {
-        buf.extend_from_slice(&chunk.map_err(|e| e.to_string())?);
+        buf.extend_from_slice(&chunk.map_err(|_| "stream body read error".to_string())?);
         // 按字节切分 LF，避免多字节 UTF-8 字符跨 chunk 被截断
         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
             let line = String::from_utf8_lossy(&buf[..pos]).trim_end_matches('\r').to_string();
@@ -453,7 +540,7 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let provider = OpenAiProvider::with_stream_idle_timeout(crate::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(200));
-        let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None };
+        let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None, llm_max_retries: Some(0) };
         let started = std::time::Instant::now();
         let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.expect("stream hung");
         server.abort();
@@ -472,6 +559,52 @@ mod tests {
     #[tokio::test]
     async fn responses_stream_idle_timeout() {
         assert_idle_timeout(Api::Responses).await;
+    }
+
+    #[tokio::test]
+    async fn effort_adjustment_does_not_emit_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for api in [Api::Chat, Api::Responses] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                for index in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        headers.push(socket.read_u8().await.unwrap());
+                    }
+                    let headers = String::from_utf8(headers).unwrap();
+                    let length: usize = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length: ").map(|s| s.parse().unwrap())).unwrap();
+                    socket.read_exact(&mut vec![0; length]).await.unwrap();
+                    let (status, body) = if index == 0 {
+                        ("400 Bad Request", "Unsupported parameter: reasoning_effort")
+                    } else if api == Api::Chat {
+                        ("200 OK", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+                    } else {
+                        ("200 OK", "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n")
+                    };
+                    socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+            });
+            let provider = OpenAiProvider::new(crate::Secret::new("test"), Some(format!("http://{addr}")));
+            let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: Some(ThinkingLevel::High), api, max_tokens: None, llm_max_retries: Some(0) };
+            let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.unwrap();
+            server.await.unwrap();
+            assert!(matches!(events.last(), Some(AssistantEvent::Done { .. })));
+            assert!(!events.iter().any(|event| matches!(event, AssistantEvent::Retry { .. })));
+        }
+    }
+
+    #[test]
+    fn retry_after_seconds_and_dates() {
+        assert_eq!(retry_after(" 42 "), Some(Duration::from_secs(42)));
+        assert_eq!(retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(Duration::ZERO));
+        let future = httpdate::fmt_http_date(std::time::SystemTime::now() + Duration::from_secs(120));
+        assert_eq!(retry_after(&future), Some(crate::MAX_RETRY_AFTER));
+        assert_eq!(retry_after("86400"), Some(crate::MAX_RETRY_AFTER));
+        assert_eq!(retry_after(&u64::MAX.to_string()), Some(crate::MAX_RETRY_AFTER));
+        assert_eq!(retry_after("invalid"), None);
     }
 
     #[test]

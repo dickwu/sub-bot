@@ -208,11 +208,36 @@ impl std::str::FromStr for ThinkingLevel {
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AssistantEvent {
     Start,
-    TextDelta { content_index: usize, delta: String },
-    ThinkingDelta { content_index: usize, delta: String },
-    ToolcallStart { content_index: usize, id: String, tool_name: String },
-    ToolcallDelta { content_index: usize, delta: String },
-    ToolcallEnd { content_index: usize, tool_call: ToolCall },
-    Done { message: AssistantMessage },
-    Error { message: AssistantMessage },
+    /// Discard all text/thinking from the previous attempt of this call.
+    Retry {
+        attempt: u32,
+        reason: String,
+    },
+    TextDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ThinkingDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ToolcallStart {
+        content_index: usize,
+        id: String,
+        tool_name: String,
+    },
+    ToolcallDelta {
+        content_index: usize,
+        delta: String,
+    },
+    ToolcallEnd {
+        content_index: usize,
+        tool_call: ToolCall,
+    },
+    Done {
+        message: AssistantMessage,
+    },
+    Error {
+        message: AssistantMessage,
+    },
 }

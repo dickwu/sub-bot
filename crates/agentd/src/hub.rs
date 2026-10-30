@@ -158,6 +158,9 @@ impl SessionHandle {
 
     fn report_event(&self, event: &AgentEvent) {
         match event {
+            AgentEvent::MessageRetry { attempt, .. } => {
+                self.report_issue(Severity::Warn, "llm_retry", "llm", "Retrying LLM call; partial message discarded", serde_json::json!({"attempt": attempt}));
+            }
             AgentEvent::MessageEnd { message: Message::Assistant(a) }
                 if a.stop_reason == agent_ai::StopReason::Error || (a.error_message.is_some() && a.stop_reason != agent_ai::StopReason::Aborted) =>
             {
@@ -631,6 +634,7 @@ impl Hub {
             max_turns: p.max_turns,
             max_tokens: p.max_output_tokens,
             token_budget: p.token_budget,
+            llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
         };
         tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
@@ -1185,6 +1189,7 @@ mod tests {
         assert_eq!(hub.sweep_interval(), Some(Duration::from_secs(2)));
         assert_eq!(hub.evict_idle(Instant::now() + Duration::from_secs(7200)), 1);
         assert!(hub.get(client, &regular.id).is_some());
+        drop(hub);
         cfg.chat_session_ttl_secs = 0;
         let hub = Hub::new(cfg, "faux", None, None).unwrap();
         assert_eq!(hub.sweep_interval(), Some(Duration::from_secs(60)));

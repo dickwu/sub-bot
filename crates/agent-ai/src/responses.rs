@@ -228,7 +228,7 @@ pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc
     let mut bytes = resp.bytes_stream();
     let mut out = vec![];
     while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| crate::openai::idle_timeout_error(idle_timeout))? {
-        buf.extend_from_slice(&chunk.map_err(|e| crate::openai::redact(&e.to_string()))?);
+        buf.extend_from_slice(&chunk.map_err(|_| "stream body read error".to_string())?);
         for data in crate::openai::drain_sse_lines(&mut buf) {
             if data == "[DONE]" {
                 continue;
@@ -276,6 +276,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             api: Api::Responses,
             max_tokens: Some(1000),
+            llm_max_retries: None,
         }
     }
 

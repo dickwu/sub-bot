@@ -134,12 +134,8 @@ impl Deliverer {
                         let code = response.status();
                         status.last_status = Some(code.as_u16());
                         if matches!(code.as_u16(), 429 | 503) {
-                            retry_after = response
-                                .headers()
-                                .get(reqwest::header::RETRY_AFTER)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|v| v.trim().parse::<u64>().ok())
-                                .map(|seconds| Duration::from_secs(seconds).min(self.policy.max_backoff));
+                            retry_after =
+                                response.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(|v| parse_retry_after(v, SystemTime::now(), self.policy.max_backoff));
                         }
                         if !code.is_success() {
                             let snippet = response_snippet(response).await?;
@@ -199,6 +195,12 @@ impl Deliverer {
         }
         status
     }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime, max_backoff: Duration) -> Option<Duration> {
+    let value = value.trim();
+    let delay = value.parse::<u64>().ok().map(Duration::from_secs).or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(now).unwrap_or_default()))?;
+    Some(delay.min(max_backoff).min(agent_ai::MAX_RETRY_AFTER))
 }
 
 fn retryable(code: u16) -> bool {
@@ -278,6 +280,19 @@ mod tests {
         collections::HashSet,
         sync::{Arc, Mutex},
     };
+
+    #[test]
+    fn retry_after_dates_and_seconds() {
+        let now = httpdate::parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
+        let max = Duration::from_secs(60);
+        for (value, seconds) in [("0", 0), (" 12 ", 12), ("9999", 60), ("Wed, 21 Oct 2015 07:27:59 GMT", 0), ("Wed, 21 Oct 2015 07:28:25 GMT", 25), ("Wed, 21 Oct 2015 07:30:00 GMT", 60)] {
+            assert_eq!(parse_retry_after(value, now, max), Some(Duration::from_secs(seconds)), "{value}");
+        }
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:25 GMT", now, Duration::from_secs(5)), Some(Duration::from_secs(5)));
+        for invalid in ["", "-1", "garbage"] {
+            assert_eq!(parse_retry_after(invalid, now, max), None);
+        }
+    }
 
     #[test]
     fn signatures() {
@@ -446,6 +461,49 @@ mod tests {
             let (status, _) = deliver(receiver, policy()).await;
             assert_eq!(status.state, DeliveryState::Delivered);
             assert_eq!(status.attempts, 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_after_http_date_applies_to_fresh_and_resumed_deliveries() {
+        for code in [429, 503] {
+            for resume in [false, true] {
+                let mut receiver = Receiver::new(vec![code, 200]);
+                // A past HTTP-date means zero delay, not the 30-second fallback backoff.
+                receiver.retry_after = Some("Wed, 21 Oct 2015 07:28:00 GMT");
+                let (target, _server) = server(receiver.clone()).await;
+                let policy = RetryPolicy { initial_backoff: Duration::from_secs(30), max_backoff: Duration::from_secs(60), ..policy() };
+                let deliverer = Deliverer::new(reqwest::Client::new(), policy);
+                let updates = Mutex::new(Vec::new());
+                let on_update = |status: &DeliveryStatus| updates.lock().unwrap().push(status.clone());
+                let payload = serde_json::json!({"ok": true});
+                let status = tokio::time::timeout(Duration::from_secs(3), async {
+                    if resume {
+                        let saved = DeliveryStatus {
+                            delivery_id: "journaled-delivery".into(),
+                            event: "task.done".into(),
+                            state: DeliveryState::Pending,
+                            attempts: 1,
+                            last_status: Some(500),
+                            last_error: None,
+                        };
+                        deliverer.resume(&target, &payload, saved, &on_update).await
+                    } else {
+                        deliverer.deliver(&target, "task.done", &payload, &on_update).await
+                    }
+                })
+                .await
+                .expect("HTTP-date must override fallback backoff, including after restart");
+                assert_eq!(status.state, DeliveryState::Delivered);
+                assert_eq!(status.attempts, if resume { 3 } else { 2 });
+                if resume {
+                    assert_eq!(status.delivery_id, "journaled-delivery");
+                    assert_eq!(updates.lock().unwrap().iter().map(|s| s.attempts).collect::<Vec<_>>(), vec![2, 2, 3, 3]);
+                }
+                let seen = receiver.seen.lock().unwrap();
+                assert_eq!(seen.len(), 2);
+                assert!(seen.iter().all(|(id, body)| id == &status.delivery_id && body == &seen[0].1));
+            }
         }
     }
 

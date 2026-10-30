@@ -22,7 +22,7 @@
 - Unix 测试覆盖实际 UDS/TCP、uid/username/any 映射、无匹配 401、Bearer 优先级、IPv6/mapped loopback、伪造转发头、socket mode/残留清理/文件保护、faux provider 下同步和异步 ask。系统调用使用 Unix cfg，适用于 Linux/macOS CI。
 ## 持久化与恢复（agentd/store.rs）
 
-- `Store` 管理 append-only `tasks.jsonl` 和 `deliveries.jsonl`，每次状态更新追加完整快照并 sync_data。启动按 ID 取最新记录，再通过临时文件 + rename + 目录 fsync 压缩；仅忽略崩溃留下的最后一个不完整行；完整行损坏时将原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），保留损坏行之前的记录，reporter 挂载后报告 error 级 `store_corrupt`。目录/文件权限分别为 0700/0600；同一 dataDir 不可被多个进程同时使用。
+- `Store` 管理 append-only `tasks.jsonl` 和 `deliveries.jsonl`，每次状态更新追加完整快照并 sync_data。启动按 ID 取最新记录，再通过临时文件 + rename + 目录 fsync 压缩；仅忽略崩溃留下的最后一个不完整行；完整行损坏时将原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），保留损坏行之前的记录，reporter 挂载后报告 error 级 `store_corrupt`。目录/文件权限分别为 0700/0600；`Store::open` 在读取/压缩前对 `<dataDir>/state/lock` 获取非阻塞排他 flock，文件句柄持有到 Store 释放，进程退出（含崩溃）自动解锁；同一 dataDir 的第二个服务启动失败，lock 文件不删除以避免 inode 竞争。
 - `dataDir` / CLI `--data-dir` 由 `Config::data_dir()` 统一解析，默认系统数据目录/sub-bot；journal 存放在 `<dataDir>/state`，不受 session-dir 影响。`shutdownGraceSecs` 默认 10，限制退出等待。task TTL 使用持久化的墙钟完成时间，重启不会延长 TTL。
 - task 入队和运行前记录 queued/running，完成记录结果/error 和各目标 delivery 状态。启动发现 queued/running 时转 failed（`interrupted by restart`），发出 error 级 `task_interrupted`，不重放工具副作用。结果只允许 owner 查询。
 - webhook 入队先落盘再启动网络请求；保留 URL、event、payload、client、task/index、deliveryId、attempts 和状态，不序列化 WebhookTarget/签名 secret。恢复时仅在原 client 当前配置和管理员 alerts 中解析目标 URL；找不到则终止投递并报告。请求级 callback 若希望跨重启恢复，应将 URL 配置在原 client 下。
@@ -32,6 +32,12 @@
 ## Issue 的 owner 路由
 
 SessionHandle 在 submit 前订阅 `ScopeKey::Session`，覆盖同步 chat、SSE、普通 session 及 RPC 运行；async task 使用 `ScopeKey::Task`。settled 后 250ms 再取消 session 订阅，并用运行代数防止旧运行清理新订阅。Reporter 的路由始终校验 scope.client 与订阅 owner，按 events/minSeverity 过滤；取消订阅后保存至少 dedupWindowSecs 的缓存。入队 issue 捕获路由快照，窗口汇总不会因 task/session 已结束而丢失路由；dedup key 包含 task ID，避免同一 session 连续任务混并。管理员 alerts 是独立路由，不参与 client 间广播。issue webhook 同样进入持久化队列，失败通知禁止递归。
+## LLM transient retry / webhook progress
+
+OpenAI provider 在每次尝试内新建流解析器，通过单独事件通道转发增量并跟踪工具调用边界。连接/请求超时、body read 错误、未完成 EOF、idle timeout、HTTP 408/429/5xx 可重试；其它 HTTP 4xx（包括认证、上下文溢出）不可重试。文本或思考增量允许回滚，工具事件一旦出现则禁止重试。
+`llmMaxRetries` 全局默认 3，profile 可覆盖（0 禁用）；1s 指数退避加 jitter，最大 30s，`Retry-After` 是额外的最短等待约束（先限制到最多 60s）。整个重试循环在取消 select 内运行，abort 同时取消网络和 sleep。
+`AssistantEvent::Retry` 转为 `AgentEvent::MessageRetry`，消费者清理当前部分输出，hub 只增加 `llm_retry` warn 映射；最终失败沿用 `llm_*`。日志标注 `issue="typed"` 防止重复上报。只有最终消息进入 context/AgentEnd。
+异步任务过滤空白助手 progress；webhook Retry-After 支持 delta-seconds 和 HTTP-date，过去日期为零、上限 60s。
 
 ## (a) pi 的架构
 
@@ -282,7 +288,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - client 配置 webhookUrl/webhookSecretFile/webhookAllowedHosts；secret 相对配置目录加载、trim、不可读/空值报错，Debug 打码。回调 URL 限 http/https 且匹配 host/host:port 白名单（默认 URL 的 host 隐式允许），禁重定向，错误不回显 URL。
 - 每个有目标的任务一个 mpsc 队列/worker，串行调用 Hub 共享的 `webhook::Deliverer`；`all` 模式的工具结束/assistant 消息结束生成 progress，完成后排入 task.completed（含任务结果快照）。慢投递不阻塞 chat 的超时处理；on_update 更新最近投递状态。任务/队列不持久化，进程退出不保证排空，广播过载仍可能丢进度事件（最终结果用 AgentEnd 快照补齐）。
 - 投递协议：POST、`Content-Type: application/json`、`User-Agent: sub-bot/0.4.0`，JSON envelope `{deliveryId,event,timestamp,data}`；请求头为 `X-SubBot-Event`、`X-SubBot-Delivery`、`X-SubBot-Timestamp`（Unix 秒）。配置 secret 时附 `X-SubBot-Signature: t=<秒>,v1=<小写十六进制 HMAC-SHA256>`，签名输入为 `<t>.<raw body>`；`t` 来自签名头，与 `X-SubBot-Timestamp` 相同，每次尝试重新取当前时间并签名。delivery id、原始正文和正文中的 timestamp 在重试间不变，验签不能用正文 timestamp 代替 `t`。接收端使用原始字节验签、校验时间窗口并按 delivery id 去重。
-- `webhook::Deliverer` 实现完整重试：默认最多 6 次（含首次，webhookMaxAttempts 可覆盖），每次超时 10 秒（含错误响应体读取）。网络错误/超时/408/429/5xx 重试，其它 4xx 不重试；2xx 成功，3xx 不重试且不跟随重定向（Deliverer 自建禁重定向 client）。指数退避从 1 秒起逐次翻倍，加 0–10% 随机抖动，总等待上限 60 秒；429/503 的非负整数秒 `Retry-After` 优先（同样最多 60 秒），不支持 HTTP-date，无效值回退到指数退避。取消 delivery future 会停止请求和退避，不另起后台任务。
+- `webhook::Deliverer` 实现完整重试：默认最多 6 次（含首次，webhookMaxAttempts 可覆盖），每次超时 10 秒（含错误响应体读取）。网络错误/超时/408/429/5xx 重试，其它 4xx 不重试；2xx 成功，3xx 不重试且不跟随重定向（Deliverer 自建禁重定向 client）。指数退避从 1 秒起逐次翻倍，加 0–10% 随机抖动，总等待上限 60 秒；429/503 的 `Retry-After` 优先（支持非负整数秒和 HTTP-date，过去日期为零，同样最多 60 秒），普通及恢复投递共用解析路径，无效值回退到指数退避。取消 delivery future 会停止请求和退避，不另起后台任务。
 - 测试使用 faux provider、router oneshot 和本地 axum receiver，覆盖 202/Location、轮询/owner/TTL、poll-only、白名单、超时和有序事件投递、签名验证、关机及 secret 加载打码。
 
 ## (e) MVP 里程碑

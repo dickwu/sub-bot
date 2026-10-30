@@ -16,6 +16,8 @@ pub struct Request {
     /// 走哪个 OpenAI API（其它 provider 忽略）
     pub api: Api,
     pub max_tokens: Option<u32>,
+    /// Additional transient-error attempts; None uses the default (3).
+    pub llm_max_retries: Option<u32>,
 }
 
 /// Provider 抽象，对应 pi-ai 中每个 `api/*.ts` 的 `streamSimple`。

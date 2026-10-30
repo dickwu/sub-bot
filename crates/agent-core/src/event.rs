@@ -27,6 +27,11 @@ pub enum AgentEvent {
     MessageStart {
         message: Message,
     },
+    /// Discard the partial assistant message; attempt is the 1-based retry number.
+    MessageRetry {
+        attempt: u32,
+        reason: String,
+    },
     MessageUpdate {
         assistant_message_event: AssistantEvent,
     },

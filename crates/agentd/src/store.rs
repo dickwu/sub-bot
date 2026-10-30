@@ -37,6 +37,9 @@ pub struct Store {
     lanes: Mutex<HashMap<DeliveryLane, Arc<tokio::sync::Mutex<()>>>>,
     workers: Mutex<Vec<tokio::task::AbortHandle>>,
     corrupt_journals: Mutex<Vec<&'static str>>,
+    // Keep the same inode locked until all journal handles have been closed. Never unlink it.
+    #[cfg(unix)]
+    _lock: File,
 }
 
 fn private_file(path: &Path) -> Result<File> {
@@ -114,6 +117,20 @@ impl Store {
         }
         #[cfg(not(unix))]
         std::fs::create_dir_all(dir)?;
+        #[cfg(unix)]
+        let lock = {
+            use std::os::fd::AsRawFd;
+            let lock = private_file(&dir.join("lock"))?;
+            // SAFETY: lock owns a valid descriptor for the duration of this call and the Store.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    anyhow::bail!("dataDir {} is in use by another sub-bot server", dir.parent().unwrap_or(dir).display());
+                }
+                return Err(anyhow::Error::new(error).context(format!("failed to lock {}", dir.join("lock").display())));
+            }
+            lock
+        };
         let mut corrupt_journals = vec![];
         let (records, corrupt) = load::<Task>(&dir.join("tasks.jsonl"))?;
         if corrupt {
@@ -156,6 +173,8 @@ impl Store {
             lanes: Mutex::new(HashMap::new()),
             workers: Mutex::new(vec![]),
             corrupt_journals: Mutex::new(corrupt_journals),
+            #[cfg(unix)]
+            _lock: lock,
         }))
     }
 
@@ -265,6 +284,33 @@ mod tests {
     use super::*;
     use crate::hub::TaskStatus;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_lock_prevents_concurrent_journal_access_and_releases_on_drop() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let data_dir = std::env::temp_dir().join(format!("sub-bot-lock-{}", uuid::Uuid::new_v4()));
+        let dir = data_dir.join("state");
+        let ttl = Duration::from_secs(60);
+        let store = Store::open(&dir, ttl).unwrap();
+        let retained = store.clone();
+        let metadata = std::fs::metadata(dir.join("lock")).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        // A rejected opener must not even load/quarantine/compact the journals.
+        private_file(&dir.join("tasks.jsonl")).unwrap().write_all(b"{torn").unwrap();
+        drop(store);
+        let error = Store::open(&dir, ttl).err().expect("second store must fail");
+        assert_eq!(error.to_string(), format!("dataDir {} is in use by another sub-bot server", data_dir.display()));
+        assert_eq!(std::fs::read(dir.join("tasks.jsonl")).unwrap(), b"{torn");
+        let other = Store::open(&data_dir.join("other/state"), ttl).unwrap();
+        drop(other);
+        drop(retained);
+        let reopened = Store::open(&dir, ttl).unwrap();
+        assert_eq!(std::fs::metadata(dir.join("lock")).unwrap().ino(), metadata.ino());
+        assert!(std::fs::read(dir.join("tasks.jsonl")).unwrap().is_empty());
+        drop(reopened);
+        std::fs::remove_dir_all(data_dir).unwrap();
+    }
 
     #[test]
     fn load_compacts_latest_states_ttl_and_torn_tail() {

@@ -1,4 +1,6 @@
 {
+  "dataDir": "/var/lib/sub-bot",
+  "shutdownGraceSecs": 10,
   "defaultModel": "gpt-4.1",
   "defaultReasoningEffort": "low",
   "defaultApi": "auto",

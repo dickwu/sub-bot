@@ -224,6 +224,8 @@ pub struct Config {
     #[serde(default)]
     pub local_clients: Vec<LocalClient>,
     pub trust_loopback: Option<TrustLoopback>,
+    #[serde(default = "default_shutdown_grace")]
+    pub shutdown_grace_secs: u64,
     #[serde(default)]
     pub alerts: AlertsConfig,
     #[serde(default = "default_session_idle_ttl")]
@@ -259,6 +261,10 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
+}
+
+fn default_shutdown_grace() -> u64 {
+    10
 }
 
 fn default_webhook_attempts() -> u32 {
@@ -419,6 +425,7 @@ impl Config {
             #[cfg(not(unix))]
             local_clients: vec![],
             trust_loopback: None,
+            shutdown_grace_secs: default_shutdown_grace(),
             alerts: AlertsConfig::default(),
             task_ttl_secs: default_session_idle_ttl(),
             webhook_max_attempts: default_webhook_attempts(),

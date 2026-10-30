@@ -1,7 +1,7 @@
 use crate::{
     config::{Client, Config, Profile, ResolvedTarget},
     issues::{IssueEvent, IssueScope, Reporter, Severity},
-    webhook::{Deliverer, DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
+    webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
 use agent_ai::{faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
@@ -26,6 +26,8 @@ pub struct SessionHandle {
     pub cwd: PathBuf,
     pub agent: Arc<Agent>,
     pub issues: Arc<Reporter>,
+    issue_targets: Vec<ResolvedTarget>,
+    run_generation: std::sync::atomic::AtomicU64,
     issue_scope: Mutex<IssueScope>,
     caller_tools: Vec<String>,
     observing: AtomicBool,
@@ -44,6 +46,10 @@ pub use agent_core::Disposition;
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
+        self.run_generation.fetch_add(1, Ordering::Relaxed);
+        if self.scope().task_id.is_none() {
+            self.issues.subscribe(crate::issues::ScopeKey::Session(self.id.clone()), self.owner.clone(), self.issue_targets.clone());
+        }
         if !self.observing.swap(true, Ordering::Relaxed) {
             let mut rx = self.subscribe();
             let weak = Arc::downgrade(self);
@@ -52,7 +58,21 @@ impl SessionHandle {
                     let event = rx.recv().await;
                     let Some(h) = weak.upgrade() else { break };
                     match event {
-                        Ok(event) => h.report_event(&event),
+                        Ok(event) => {
+                            h.report_event(&event);
+                            if matches!(event, AgentEvent::AgentSettled { .. }) {
+                                let generation = h.run_generation.load(Ordering::Relaxed);
+                                let weak = Arc::downgrade(&h);
+                                tokio::spawn(async move {
+                                    tokio::time::sleep(Duration::from_millis(250)).await;
+                                    if let Some(h) = weak.upgrade() {
+                                        if h.run_generation.load(Ordering::Relaxed) == generation && !h.agent.is_running() {
+                                            h.issues.unsubscribe(&crate::issues::ScopeKey::Session(h.id.clone()));
+                                        }
+                                    }
+                                });
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => h.report_lag(n),
                         Err(_) => break,
                     }
@@ -207,9 +227,10 @@ impl std::fmt::Display for TooManySessions {
 
 impl std::error::Error for TooManySessions {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
+    Queued,
     Running,
     Succeeded,
     Failed,
@@ -234,14 +255,14 @@ pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
     (kind, status)
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct TargetDelivery {
     pub host: String,
     #[serde(flatten)]
     pub status: DeliveryStatus,
 }
 
-#[derive(Clone, serde::Serialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
     pub task_id: String,
@@ -258,11 +279,39 @@ pub struct Task {
     finished: Option<Instant>,
 }
 
-fn unix_ms() -> u64 {
+pub(crate) fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-pub type WebhookQueue = tokio::sync::mpsc::UnboundedSender<(&'static str, serde_json::Value)>;
+#[derive(Clone)]
+pub struct WebhookQueue {
+    store: std::sync::Weak<crate::store::Store>,
+    reporter: Arc<Reporter>,
+    target: WebhookTarget,
+    client: String,
+    session_id: String,
+    task_id: String,
+    index: usize,
+    policy: RetryPolicy,
+}
+
+impl WebhookQueue {
+    pub fn send(&self, (event, payload): (&'static str, serde_json::Value)) -> Result<()> {
+        let store = self.store.upgrade().ok_or_else(|| anyhow::anyhow!("hub stopped"))?;
+        let delivery = crate::store::Delivery {
+            url: self.target.url.clone(),
+            payload,
+            client: Some(self.client.clone()),
+            session_id: Some(self.session_id.clone()),
+            task_id: Some(self.task_id.clone()),
+            index: Some(self.index),
+            status: DeliveryStatus { delivery_id: uuid::Uuid::new_v4().to_string(), event: event.into(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
+        };
+        store.save_delivery(&delivery)?;
+        store.start(delivery, Some(self.target.clone()), &self.reporter, self.policy.clone());
+        Ok(())
+    }
+}
 
 pub struct Hub {
     pub config: Config,
@@ -271,8 +320,7 @@ pub struct Hub {
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
-    tasks: Mutex<HashMap<String, Task>>,
-    deliverer: Deliverer,
+    store: Arc<crate::store::Store>,
     shutting_down: AtomicBool,
     http: reqwest::Client,
     #[cfg(test)]
@@ -328,6 +376,10 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
 impl Hub {
     /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
     pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>) -> Result<Arc<Self>> {
+        Self::with_reporter(config, provider_name, session_dir, openai_key_file, crate::issues::global().unwrap_or_else(Reporter::noop))
+    }
+
+    pub fn with_reporter(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>, issues: Arc<Reporter>) -> Result<Arc<Self>> {
         config.validate()?;
         let provider: Arc<dyn Provider> = match provider_name {
             "faux" => Arc::new(FauxProvider),
@@ -342,12 +394,42 @@ impl Hub {
             other => bail!("unknown provider {other}"),
         };
         let registry = ToolRegistry::with_builtins();
-        let webhook_http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
-        let deliverer = Deliverer::new(webhook_http, RetryPolicy { max_attempts: config.webhook_max_attempts, ..Default::default() });
+        let dir = config.data_dir().join("state");
+        let store = crate::store::Store::open(&dir, Duration::from_secs(config.task_ttl_secs))?;
+        let pending = store.pending();
+        issues.attach_store(&store);
+        for task in store.tasks.lock().unwrap().values_mut() {
+            if matches!(task.status, TaskStatus::Queued | TaskStatus::Running) {
+                task.status = TaskStatus::Failed;
+                task.error = Some("interrupted by restart".into());
+                task.finished_at = Some(unix_ms());
+                store.save_task(task)?;
+                let scope = IssueScope { client: Some(task.owner.clone()), task_id: Some(task.task_id.clone()), session_id: Some(task.session_id.clone()), ..Default::default() };
+                if let Some(client) = config.clients.iter().find(|c| c.name == task.owner) {
+                    issues.subscribe(crate::issues::ScopeKey::Task(task.task_id.clone()), task.owner.clone(), client.resolved_webhooks.clone());
+                }
+                issues.report(IssueEvent::new(Severity::Error, "task_interrupted", "store", "interrupted by restart").scope(scope));
+                issues.unsubscribe(&crate::issues::ScopeKey::Task(task.task_id.clone()));
+            }
+        }
+        for delivery in pending {
+            let targets = match &delivery.client {
+                Some(client) => config.clients.iter().find(|c| &c.name == client).map(|c| c.resolved_webhooks.as_slice()).unwrap_or(&[]),
+                None => config.alerts.resolved.as_slice(),
+            };
+            let route = delivery.task_id.as_ref().map(|id| crate::issues::ScopeKey::Task(id.clone()));
+            if let (Some(key), Some(client)) = (&route, &delivery.client) {
+                issues.subscribe(key.clone(), client.clone(), targets.to_vec());
+            }
+            let target = targets.iter().chain(config.alerts.resolved.iter()).find(|t| t.target.url == delivery.url).map(|t| t.target.clone());
+            store.start(delivery, target, &issues, RetryPolicy { max_attempts: config.webhook_max_attempts, ..Default::default() });
+            if let Some(key) = route {
+                issues.unsubscribe(&key);
+            }
+        }
         Ok(Arc::new(Self {
-            issues: crate::issues::global().unwrap_or_else(Reporter::noop),
-            tasks: Mutex::new(HashMap::new()),
-            deliverer,
+            issues,
+            store,
             config,
             provider,
             registry,
@@ -372,11 +454,11 @@ impl Hub {
             return None;
         }
         let h = sessions.get(session_id).filter(|h| h.owner == client.name)?;
-        let task = Task {
+        let mut task = Task {
             task_id: uuid::Uuid::new_v4().to_string(),
             owner: client.name.clone(),
             session_id: session_id.into(),
-            status: TaskStatus::Running,
+            status: TaskStatus::Queued,
             created_at: unix_ms(),
             finished_at: None,
             result: None,
@@ -385,8 +467,15 @@ impl Hub {
             deliveries: vec![],
             finished: None,
         };
+        if self.store.save_task(&task).is_err() {
+            return None;
+        }
+        task.status = TaskStatus::Running;
+        if self.store.save_task(&task).is_err() {
+            return None;
+        }
         h.issue_scope.lock().unwrap().task_id = Some(task.task_id.clone());
-        self.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
+        self.store.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
         let issue_targets: Vec<_> = targets.iter().filter(|t| t.wants("issues")).cloned().collect();
         if !issue_targets.is_empty() {
             // I1 routes each matching scope independently; task events already carry task_id.
@@ -406,55 +495,45 @@ impl Hub {
     }
 
     pub fn get_task(&self, client: &Client, id: &str) -> Option<Task> {
-        self.tasks.lock().unwrap().get(id).filter(|t| t.owner == client.name).cloned()
+        self.store.tasks.lock().unwrap().get(id).filter(|t| t.owner == client.name).cloned()
     }
 
     pub fn finish_task(&self, id: &str, status: TaskStatus, result: serde_json::Value) -> Option<Task> {
-        let mut tasks = self.tasks.lock().unwrap();
+        let mut tasks = self.store.tasks.lock().unwrap();
         let task = tasks.get_mut(id)?;
         task.status = status;
         task.error = result["error"].as_str().map(str::to_owned);
         task.result = Some(result);
         task.finished_at = Some(unix_ms());
         task.finished = Some(Instant::now());
+        if self.store.save_task(task).is_err() {
+            self.issues.report(IssueEvent::new(Severity::Error, "store_write_failed", "store", "Task journal write failed"));
+        }
         Some(task.clone())
     }
 
-    /// One sequential worker per receiver, so retries never block other targets.
+    /// Enqueue durably before spawning network work. Workers never retain the hub.
     pub fn webhook_queue(self: &Arc<Self>, id: String, target: WebhookTarget) -> WebhookQueue {
-        let host = reqwest::Url::parse(&target.url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
-        let (index, scope) = {
-            let mut tasks = self.tasks.lock().unwrap();
-            let task = tasks.get_mut(&id).expect("registered task");
-            let index = task.deliveries.len();
-            task.deliveries.push(TargetDelivery {
-                host: host.clone(),
-                status: DeliveryStatus { delivery_id: String::new(), event: String::new(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
-            });
-            (index, IssueScope { client: Some(task.owner.clone()), session_id: Some(task.session_id.clone()), task_id: Some(id.clone()), ..Default::default() })
-        };
-        // Retries may finish after HTTP removes the task subscription; retain its issue routes.
-        let issue_targets = self.issues.subscription_targets(&scope);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, serde_json::Value)>();
-        let hub = self.clone();
-        tokio::spawn(async move {
-            while let Some((event, payload)) = rx.recv().await {
-                let update = |status: &DeliveryStatus| {
-                    if let Some(task) = hub.tasks.lock().unwrap().get_mut(&id) {
-                        task.deliveries[index].status = status.clone();
-                        if index == 0 && event == "task.completed" && status.state != DeliveryState::Pending {
-                            task.delivery = Some(status.clone());
-                        }
-                    }
-                };
-                let final_status = hub.deliverer.deliver(&target, event, &payload, &update).await;
-                update(&final_status);
-                if final_status.state == DeliveryState::Failed {
-                    hub.issues.on_delivery_failed(&final_status, &target.url, scope.clone(), &issue_targets);
-                }
-            }
+        let mut tasks = self.store.tasks.lock().unwrap();
+        let task = tasks.get_mut(&id).expect("registered task");
+        let index = task.deliveries.len();
+        task.deliveries.push(TargetDelivery {
+            host: crate::issues::host(&target.url),
+            status: DeliveryStatus { delivery_id: String::new(), event: String::new(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
         });
-        tx
+        if self.store.save_task(task).is_err() {
+            self.issues.report(IssueEvent::new(Severity::Error, "store_write_failed", "store", "Task journal write failed"));
+        }
+        WebhookQueue {
+            store: Arc::downgrade(&self.store),
+            reporter: self.issues.clone(),
+            target,
+            client: task.owner.clone(),
+            session_id: task.session_id.clone(),
+            task_id: id,
+            index,
+            policy: RetryPolicy { max_attempts: self.config.webhook_max_attempts, ..Default::default() },
+        }
     }
 
     pub fn create_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
@@ -557,6 +636,8 @@ impl Hub {
         tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
+            issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
+            run_generation: std::sync::atomic::AtomicU64::new(0),
             issue_scope: Mutex::new(IssueScope {
                 client: Some(client.name.clone()),
                 session_id: Some(id.clone()),
@@ -616,7 +697,7 @@ impl Hub {
             sessions.drain().map(|(_, h)| h).collect()
         };
         let n = sessions.iter().filter(|h| h.agent.is_running()).count();
-        let m = self.tasks.lock().unwrap().values().filter(|t| t.status == TaskStatus::Running).count();
+        let m = self.store.tasks.lock().unwrap().values().filter(|t| t.status == TaskStatus::Running).count();
         if n > 0 || m > 0 {
             self.issues.report(IssueEvent::new(Severity::Warn, "shutdown_inflight", "runtime", "Shutdown with in-flight work").details(serde_json::json!({"sessions": n, "tasks": m})));
         }
@@ -624,13 +705,23 @@ impl Hub {
             h.agent.abort();
         }
         // Agent 在持久化回调之后才清除 running；不持有 map 锁跨 await。
-        while sessions.iter().any(|h| h.agent.is_running()) || self.tasks.lock().unwrap().values().any(|t| t.status == TaskStatus::Running) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        let _ = tokio::time::timeout(Duration::from_secs(self.config.shutdown_grace_secs), async {
+            while sessions.iter().any(|h| h.agent.is_running()) || self.store.tasks.lock().unwrap().values().any(|t| t.status == TaskStatus::Running) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            self.issues.flush(Duration::from_secs(self.config.shutdown_grace_secs)).await;
+            self.store.flush().await;
+        })
+        .await;
     }
 
     pub fn evict_idle(&self, now: Instant) -> usize {
-        self.tasks.lock().unwrap().retain(|_, t| t.finished.is_none_or(|finished| now.saturating_duration_since(finished) <= Duration::from_secs(self.config.task_ttl_secs)));
+        self.store.tasks.lock().unwrap().retain(|_, t| {
+            t.finished.map_or_else(
+                || t.finished_at.is_none_or(|finished| unix_ms().saturating_sub(finished) <= self.config.task_ttl_secs.saturating_mul(1000)),
+                |finished| now.saturating_duration_since(finished) <= Duration::from_secs(self.config.task_ttl_secs),
+            )
+        });
         Self::evict_idle_from(&mut self.sessions.lock().unwrap(), now, None)
     }
 
@@ -696,8 +787,189 @@ mod tests {
 
     fn config() -> Config {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.data_dir = Some(std::env::temp_dir().join(format!("sub-bot-state-{}", uuid::Uuid::new_v4())));
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         cfg
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_same_delivery_and_interrupts_running_task() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        let healthy = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let app = Router::new().route(
+            "/hook",
+            post({
+                let healthy = healthy.clone();
+                let seen = seen.clone();
+                move |Json(payload): Json<serde_json::Value>| {
+                    let healthy = healthy.clone();
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push(payload);
+                        if healthy.load(Ordering::Relaxed) {
+                            StatusCode::NO_CONTENT
+                        } else {
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = WebhookTarget { url: format!("http://{}/hook", listener.local_addr().unwrap()), secret: Some("PRIVATE-WEBHOOK-KEY".into()) };
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("sub-bot-resume-{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.data_dir = Some(dir.clone());
+        cfg.clients[0].resolved_webhooks = vec![ResolvedTarget { target: target.clone(), events: None, min_severity: None }];
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let h = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
+        let task = hub.submit_task(&cfg.clients[0], &h.id, "hello".into(), &cfg.clients[0].resolved_webhooks).unwrap();
+        let queue = hub.webhook_queue(task.task_id.clone(), target);
+        queue.send(("task.completed", serde_json::json!({"ok": true}))).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while hub.store.pending().iter().all(|d| d.status.last_status != Some(500)) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let delivery_id = hub.store.pending()[0].status.delivery_id.clone();
+        let weak = Arc::downgrade(&hub.store);
+        drop(queue);
+        drop(hub);
+        assert!(weak.upgrade().is_none());
+        healthy.store(true, Ordering::Relaxed);
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let restored = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
+        assert_eq!(restored.status, TaskStatus::Failed);
+        assert_eq!(restored.error.as_deref(), Some("interrupted by restart"));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if hub.get_task(&cfg.clients[0], &task.task_id).unwrap().delivery.is_some_and(|d| d.state == DeliveryState::Delivered) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        reporter.flush(Duration::from_secs(3)).await;
+        hub.store.flush().await;
+        let restored = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
+        let delivered = restored.delivery.unwrap();
+        assert_eq!(delivered.delivery_id, delivery_id);
+        assert_eq!(delivered.attempts, 2);
+        assert!(reporter.recent(Some("default"), 0, 100).iter().any(|e| e.kind == "task_interrupted" && e.scope.task_id.as_deref() == Some(&task.task_id)));
+        let payloads = seen.lock().unwrap().clone();
+        let completed: Vec<_> = payloads.iter().filter(|p| p["event"] == "task.completed").collect();
+        assert_eq!(completed.len(), 2);
+        assert!(completed.iter().all(|p| p["deliveryId"] == delivery_id));
+        for name in ["tasks.jsonl", "deliveries.jsonl"] {
+            assert!(!std::fs::read_to_string(dir.join("state").join(name)).unwrap().contains("PRIVATE-WEBHOOK-KEY"));
+        }
+        drop(hub);
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn removed_target_is_failed_and_shutdown_wait_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-removed-{}", uuid::Uuid::new_v4()));
+        let mut cfg = config();
+        cfg.data_dir = Some(dir.clone());
+        cfg.shutdown_grace_secs = 0;
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let h = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
+        let task = hub.submit_task(&cfg.clients[0], &h.id, "hello".into(), &[]).unwrap();
+        let queue = hub.webhook_queue(task.task_id.clone(), WebhookTarget { url: "http://127.0.0.1:1/removed".into(), secret: None });
+        queue.send(("task.completed", serde_json::json!({}))).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), hub.abort_all()).await.unwrap();
+        assert!(hub.is_shutting_down());
+        assert!(!hub.store.pending().is_empty());
+        drop(queue);
+        drop(hub);
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), hub.store.flush()).await.unwrap();
+        reporter.flush(Duration::from_secs(3)).await;
+        let task = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
+        let delivery = task.delivery.unwrap();
+        assert_eq!(delivery.state, DeliveryState::Failed);
+        assert_eq!(delivery.last_error.as_deref(), Some("target no longer configured"));
+        assert!(reporter.recent(Some("default"), 0, 100).iter().any(|e| e.kind == "webhook_target_removed"));
+        drop(hub);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sync_chat_routes_issues_and_late_summary_only_to_owner() {
+        use tower::ServiceExt;
+        let seen = Arc::new(Mutex::new(Vec::<(String, serde_json::Value)>::new()));
+        let app = axum::Router::new().route(
+            "/{owner}",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |axum::extract::Path(owner): axum::extract::Path<String>, axum::Json(payload): axum::Json<serde_json::Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.lock().unwrap().push((owner, payload));
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let mut cfg = config();
+        cfg.alerts.dedup_window_secs = 1;
+        cfg.profiles.get_mut("default").unwrap().max_turns = 0;
+        let target =
+            |owner: &str, severity| ResolvedTarget { target: WebhookTarget { url: format!("{base}/{owner}"), secret: None }, events: Some(vec!["issues".into()]), min_severity: Some(severity) };
+        cfg.clients[0].resolved_webhooks = vec![target("own", Severity::Warn), target("filtered", Severity::Fatal)];
+        cfg.clients.push(Client { name: "other".into(), resolved_webhooks: vec![target("other", Severity::Warn)], ..cfg.clients[0].clone() });
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone()).unwrap();
+        let session = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
+        let app = crate::http::test_router(hub.clone());
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer test-token")
+            .body(axum::body::Body::from(serde_json::json!({"message": "hello", "sessionId": session.id}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while reporter.recent(Some("default"), 0, 100).is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        session.report_issue(Severity::Warn, "max_turns", "runtime", "max_turns", serde_json::json!({}));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        reporter.unsubscribe(&crate::issues::ScopeKey::Session(session.id.clone()));
+        // Exercise actual window expiration, not an explicit flush while the route is active.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if seen.lock().unwrap().iter().any(|(_, p)| p["data"]["count"].as_u64().is_some_and(|n| n > 1)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let payloads = seen.lock().unwrap().clone();
+        assert_eq!(payloads.len(), 2);
+        assert!(payloads.iter().all(|(owner, p)| owner == "own" && p["data"]["client"] == "default"));
+        hub.abort_all().await;
+        server.abort();
     }
 
     #[tokio::test]

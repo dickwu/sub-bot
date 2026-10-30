@@ -3,7 +3,7 @@
 
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
     fmt,
@@ -22,7 +22,7 @@ impl fmt::Debug for WebhookTarget {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryState {
     Pending,
@@ -30,7 +30,7 @@ pub enum DeliveryState {
     Failed,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeliveryStatus {
     pub delivery_id: String,
@@ -70,7 +70,25 @@ impl Deliverer {
     /// Delivers one event, with a stable UUID and body across retries. Calls `on_update` after
     /// every attempt, including the final one. Cancellation drops all in-flight work.
     pub async fn deliver(&self, target: &WebhookTarget, event: &str, payload: &serde_json::Value, on_update: &(dyn Fn(&DeliveryStatus) + Send + Sync)) -> DeliveryStatus {
-        let mut status = DeliveryStatus { delivery_id: uuid::Uuid::new_v4().to_string(), event: event.to_owned(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None };
+        let status = DeliveryStatus { delivery_id: uuid::Uuid::new_v4().to_string(), event: event.to_owned(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None };
+        self.deliver_status(target, payload, status, on_update, false).await
+    }
+
+    /// Resume a journaled delivery without resetting its identity or attempt budget.
+    pub async fn resume(&self, target: &WebhookTarget, payload: &serde_json::Value, status: DeliveryStatus, on_update: &(dyn Fn(&DeliveryStatus) + Send + Sync)) -> DeliveryStatus {
+        self.deliver_status(target, payload, status, on_update, true).await
+    }
+
+    async fn deliver_status(
+        &self,
+        target: &WebhookTarget,
+        payload: &serde_json::Value,
+        mut status: DeliveryStatus,
+        on_update: &(dyn Fn(&DeliveryStatus) + Send + Sync),
+        journal: bool,
+    ) -> DeliveryStatus {
+        let event_name = status.event.clone();
+        let event = event_name.as_str();
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct Envelope<'a> {
@@ -84,10 +102,18 @@ impl Deliverer {
         let mut backoff = self.policy.initial_backoff.min(self.policy.max_backoff);
         // Even a zero-attempt policy gets a terminal result and a store notification.
         let max_attempts = self.policy.max_attempts.max(1);
-        for attempt in 1..=max_attempts {
+        if status.attempts >= max_attempts {
+            status.state = DeliveryState::Failed;
+            on_update(&status);
+            return status;
+        }
+        for attempt in status.attempts.saturating_add(1)..=max_attempts {
             status.attempts = attempt;
             status.last_status = None;
             status.last_error = None;
+            if journal {
+                on_update(&status);
+            }
             let mut retry_after = None;
             let retry = match (&self.http, &body) {
                 (Ok(http), Ok(body)) => {

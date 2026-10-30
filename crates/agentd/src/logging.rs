@@ -8,7 +8,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 
 pub fn default_log_dir() -> Option<PathBuf> {
     // Linux: ~/.local/share/sub-bot/logs；macOS: ~/Library/Application Support/sub-bot/logs
-    directories::ProjectDirs::from("", "", "sub-bot").map(|d| d.data_local_dir().join("logs"))
+    Some(crate::config::Config::default_data_dir().join("logs"))
 }
 
 fn build_filter(rust_log: Option<&str>, level: &str) -> EnvFilter {

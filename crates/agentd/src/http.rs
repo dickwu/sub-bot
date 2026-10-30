@@ -84,6 +84,11 @@ async fn trace_request(mut req: Request, next: Next) -> Response {
     .await
 }
 
+#[cfg(test)]
+pub(crate) fn test_router(hub: Arc<Hub>) -> Router {
+    router(AppState { hub })
+}
+
 fn router(st: AppState) -> Router {
     let api = Router::new()
         .route("/v1/sessions", post(create_session))
@@ -536,8 +541,14 @@ mod tests {
     use serde_json::Value;
     use tower::ServiceExt;
 
-    fn app(cap: usize) -> (Router, Arc<Hub>) {
+    fn config() -> Config {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.data_dir = Some(std::env::temp_dir().join(format!("sub-bot-http-{}", uuid::Uuid::new_v4())));
+        cfg
+    }
+
+    fn app(cap: usize) -> (Router, Arc<Hub>) {
+        let mut cfg = config();
         cfg.max_sessions_per_client = cap;
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()], ..Default::default() });
@@ -626,7 +637,7 @@ mod tests {
         );
         let mut servers = tokio::task::JoinSet::new();
         servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
-        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        let mut cfg = config();
         cfg.webhook_max_attempts = 2;
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         cfg.clients[0].webhook_allowed_hosts = vec![address.to_string()];
@@ -705,7 +716,7 @@ mod tests {
     }
     #[tokio::test]
     async fn provider_panic_fails_task_and_shutdown_completes() {
-        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        let mut cfg = config();
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
         Arc::get_mut(&mut hub).unwrap().provider = Arc::new(PanicProvider);
@@ -793,7 +804,7 @@ mod tests {
             );
             let mut servers = tokio::task::JoinSet::new();
             servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
-            let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+            let mut cfg = config();
             cfg.profiles.get_mut("default").unwrap().load_context_files = false;
             cfg.clients[0].webhook_allowed_hosts = vec![address.to_string()];
             cfg.clients[0].webhook_secret = Some("integration-test-key".into());
@@ -874,7 +885,7 @@ mod tests {
         let mut servers = tokio::task::JoinSet::new();
         servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
 
-        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        let mut cfg = config();
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
         if slow {
@@ -1072,7 +1083,7 @@ mod tests {
     async fn chat_timeout_aborts_faux_tool_run() {
         // Faux 可以请求一个阻塞的 bash 工具，无需真实 provider 或外部网络。
         for timeout_secs in [None, Some(1)] {
-            let mut config = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+            let mut config = config();
             config.chat_timeout_secs = if timeout_secs.is_none() { 1 } else { 900 };
             let client = Arc::new(config.clients[0].clone());
             let hub = Hub::new(config, "faux", None, None).unwrap();

@@ -25,6 +25,7 @@ impl Drop for TempDir {
 }
 fn config() -> Config {
     let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+    cfg.data_dir = Some(std::env::temp_dir().join(format!("sub-bot-local-{}", uuid::Uuid::new_v4())));
     cfg.profiles.get_mut("default").unwrap().load_context_files = false;
     cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()], ..Default::default() });
     cfg

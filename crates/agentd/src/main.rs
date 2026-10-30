@@ -22,6 +22,7 @@ mod logging;
 mod prompt;
 mod rpc;
 mod server;
+mod store;
 pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
@@ -245,7 +246,7 @@ async fn main() -> anyhow::Result<()> {
         loaded.unix_socket = Some(path.clone().unwrap_or_else(|| loaded.data_dir().join("sub-bot.sock")));
     }
     install_reporter(&loaded, &cli);
-    let new_hub = |cfg| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
+    let new_hub = |cfg: config::Config| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
     // Construct before dispatch so initialization failures get the short synchronous alert path.
     let prepared_hub = if matches!(cli.cmd, Cmd::Issues { .. }) {
         None
@@ -300,10 +301,7 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("no --config: single client 'default'; same-user Unix socket access enabled (use --unix-socket); TCP requires a token");
             }
             let hub = prepared_hub.clone().expect("prepared hub");
-            let reporter = hub.issues.clone();
-            let result = http::serve(hub, bind).await;
-            reporter.flush(std::time::Duration::from_secs(5)).await;
-            result?;
+            http::serve(hub, bind).await?;
         }
         Cmd::Rpc { ref profile } => {
             let hub = prepared_hub.clone().expect("prepared hub");

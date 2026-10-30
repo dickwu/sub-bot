@@ -79,6 +79,11 @@ async fn trace_request(mut req: Request, next: Next) -> Response {
     .await
 }
 
+#[cfg(test)]
+pub(crate) fn test_router(hub: Arc<Hub>) -> Router {
+    router(AppState { hub })
+}
+
 fn router(st: AppState) -> Router {
     let api = Router::new()
         .route("/v1/sessions", post(create_session))

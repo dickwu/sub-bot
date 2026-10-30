@@ -11,6 +11,19 @@
 
 ---
 
+## 持久化与恢复（agentd/store.rs）
+
+- `Store` 管理 append-only `tasks.jsonl` 和 `deliveries.jsonl`，每次状态更新追加完整快照并 sync_data。启动按 ID 取最新记录，再通过临时文件 + rename + 目录 fsync 压缩；仅忽略崩溃留下的最后一个不完整行，完整行损坏则拒绝启动。目录/文件权限分别为 0700/0600；同一 dataDir 不可被多个进程同时使用。
+- `dataDir` / CLI `--data-dir` 指定存储位置，默认系统数据目录/sub-bot，或 session-dir/state。`shutdownGraceSecs` 默认 10，限制退出等待。task TTL 使用持久化的墙钟完成时间，重启不会延长 TTL。
+- task 入队和运行前记录 queued/running，完成记录结果/error 和各目标 delivery 状态。启动发现 queued/running 时转 failed（`interrupted by restart`），发出 error 级 `task_interrupted`，不重放工具副作用。结果只允许 owner 查询。
+- webhook 入队先落盘再启动网络请求；保留 URL、event、payload、client、task/index、deliveryId、attempts 和状态，不序列化 WebhookTarget/签名 secret。恢复时仅在原 client 当前配置和管理员 alerts 中解析目标 URL；找不到则终止投递并报告。请求级 callback 若希望跨重启恢复，应将 URL 配置在原 client 下。
+- `Deliverer::resume` 接受既有 DeliveryStatus，保持 ID 与尝试预算；网络前记录尝试，响应后记录状态。接收端按 ID 去重，崩溃发生在接收成功与本地确认之间时可能重复。每个 task/URL 独立串行通道，失败目标不会阻塞其它目标。
+- worker 使用 Weak<Store>，Store drop 取消后台重试，不让 worker 保活 hub；SIGINT/SIGTERM 沿现有 abort_all 路径阻止 admission、abort agent，并有界 flush reporter 与持久化投递。超时仍 pending 的记录下次恢复。数据含业务 payload，权限控制不能替代磁盘加密/备份策略。
+
+## Issue 的 owner 路由
+
+SessionHandle 在 submit 前订阅 `ScopeKey::Session`，覆盖同步 chat、SSE、普通 session 及 RPC 运行；async task 使用 `ScopeKey::Task`。settled 后 250ms 再取消 session 订阅，并用运行代数防止旧运行清理新订阅。Reporter 的路由始终校验 scope.client 与订阅 owner，按 events/minSeverity 过滤；取消订阅后保存至少 dedupWindowSecs 的缓存。入队 issue 捕获路由快照，窗口汇总不会因 task/session 已结束而丢失路由；dedup key 包含 task ID，避免同一 session 连续任务混并。管理员 alerts 是独立路由，不参与 client 间广播。issue webhook 同样进入持久化队列，失败通知禁止递归。
+
 ## (a) pi 的架构
 
 pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`。

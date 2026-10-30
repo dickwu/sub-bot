@@ -9,6 +9,25 @@
 
 > 状态：v0.5.0。支持问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
+## 持久化、重启恢复与 issue 路由
+
+异步 task 状态和待投递 webhook 自动写入 `dataDir` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，指定 `--session-dir` 时默认使用其 `state` 子目录。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
+
+```json
+{
+  "dataDir": "/var/lib/sub-bot",
+  "shutdownGraceSecs": 10
+}
+```
+
+启动时压缩日志、清理超过 `taskTtlSecs` 的结果。上次处于 queued/running 的任务不会重新执行工具，而是标记 failed，error 为 `interrupted by restart`，并上报 client/task 范围的 error issue `task_interrupted`。任务仍可由所属 client 通过 `GET /v1/tasks/{id}` 查询，直到 TTL 到期。
+
+待投递 webhook 继续原来的 `deliveryId` 和尝试次数；接收端必须按 ID 去重（至少一次投递，不保证恰好一次）。日志不保存 webhook 签名密钥，重启时按 URL 从当前配置重新解析；目标已删除（包括未保留到配置的请求级 callback URL）则标记 failed 并上报 issue。请在当前 client 的 webhook 配置中保留需要恢复的 callback 目标。
+
+SIGINT/SIGTERM 阻止新任务、取消运行中的 agent，并在 `shutdownGraceSecs`（默认 10 秒）内等待任务、issue reporter 和 webhook 投递队列；超时未完成的投递留在日志中，下次启动恢复。会话聊天历史仍由独立的 `--session-dir` 控制；这里不自动恢复 agent 执行。
+
+同步 `POST /v1/chat`、SSE 和会话运行也订阅所属 client 配置中接受 `issues` 的 webhook，遵守 `events` / `minSeverity`。运行结束后保留短暂订阅宽限期；取消订阅后路由缓存至少保留 `alerts.dedupWindowSecs`，已聚合 issue 还携带原始路由快照。因此窗口结束时的 `count > 1` 汇总仍到原 client，不会广播给其它 client（管理员全局 alerts 保持独立）。
+
 ## Install
 
 ### Homebrew

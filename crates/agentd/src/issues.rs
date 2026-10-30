@@ -168,17 +168,19 @@ fn clean_details(value: &mut Value, secrets: &[String]) {
 struct State {
     queue: VecDeque<IssueEvent>,
     recent: VecDeque<IssueEvent>,
+    routes: HashMap<ScopeKey, (String, Vec<ResolvedTarget>, tokio::time::Instant)>,
     subscriptions: HashMap<ScopeKey, (String, Vec<ResolvedTarget>)>,
     dropped: u64,
     busy: bool,
 }
-type DedupKey = (String, String, Option<String>, Option<String>);
+type DedupKey = (String, String, Option<String>, Option<String>, Option<String>);
 struct Aggregate {
     first: IssueEvent,
     deadline: tokio::time::Instant,
     suppressed: u64,
 }
 pub struct Reporter {
+    store: Mutex<Option<std::sync::Weak<crate::store::Store>>>,
     state: Mutex<State>,
     notify: Notify,
     capacity: usize,
@@ -195,6 +197,10 @@ pub struct Reporter {
     disabled: bool,
 }
 impl Reporter {
+    pub(crate) fn attach_store(&self, store: &Arc<crate::store::Store>) {
+        *self.store.lock().unwrap() = Some(Arc::downgrade(store));
+    }
+
     pub fn noop() -> Arc<Self> {
         Arc::new(Self::build(&AlertsConfig::default(), None, vec![], RetryPolicy::default(), true))
     }
@@ -204,6 +210,7 @@ impl Reporter {
     fn build(cfg: &AlertsConfig, log_dir: Option<PathBuf>, mut secrets: Vec<String>, policy: RetryPolicy, disabled: bool) -> Self {
         secrets.extend(cfg.resolved.iter().filter_map(|t| t.target.secret.clone()));
         Self {
+            store: Mutex::new(None),
             state: Mutex::new(State::default()),
             notify: Notify::new(),
             capacity: cfg.queue_capacity.max(1),
@@ -265,7 +272,10 @@ impl Reporter {
         if self.disabled {
             return;
         }
-        let event = self.sanitize(event);
+        let mut event = self.sanitize(event);
+        if event.subscription_targets.is_none() {
+            event.subscription_targets = Some(self.subscription_targets(&event.scope));
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.queue.len() >= self.capacity {
             state.queue.pop_front();
@@ -279,7 +289,12 @@ impl Reporter {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).subscriptions.insert(key, (client, targets));
     }
     pub fn unsubscribe(&self, key: &ScopeKey) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).subscriptions.remove(key);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((client, targets)) = state.subscriptions.remove(key) {
+            if let Some(deadline) = tokio::time::Instant::now().checked_add(self.window) {
+                state.routes.insert(key.clone(), (client, targets, deadline));
+            }
+        }
     }
     pub fn recent(&self, client: Option<&str>, since_ms: u64, limit: usize) -> Vec<IssueEvent> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -290,6 +305,7 @@ impl Reporter {
     fn drain(self: &Arc<Self>, dedup: &mut HashMap<DedupKey, Aggregate>) {
         let (events, dropped) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.routes.retain(|_, (_, _, deadline)| *deadline > tokio::time::Instant::now());
             state.busy = true;
             (std::mem::take(&mut state.queue), std::mem::take(&mut state.dropped))
         };
@@ -313,7 +329,7 @@ impl Reporter {
             self.emit(event);
         }
         for event in events {
-            let key = (event.kind.clone(), event.component.clone(), event.scope.session_id.clone(), event.scope.client.clone());
+            let key = (event.kind.clone(), event.component.clone(), event.scope.session_id.clone(), event.scope.client.clone(), event.scope.task_id.clone());
             if let Some(a) = dedup.get_mut(&key) {
                 a.suppressed = a.suppressed.saturating_add(1);
                 // Do not suppress a severity escalation below a receiver's threshold.
@@ -346,10 +362,12 @@ impl Reporter {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).busy = false;
     }
     pub fn subscription_targets(&self, scope: &IssueScope) -> Vec<ResolvedTarget> {
-        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.routes.retain(|_, (_, _, deadline)| *deadline > tokio::time::Instant::now());
         let mut targets = Vec::new();
         for key in [scope.session_id.as_ref().map(|s| ScopeKey::Session(s.clone())), scope.task_id.as_ref().map(|s| ScopeKey::Task(s.clone()))].into_iter().flatten() {
-            if let Some((client, ts)) = state.subscriptions.get(&key) {
+            let route = state.subscriptions.get(&key).map(|(client, targets)| (client, targets)).or_else(|| state.routes.get(&key).map(|(c, ts, _)| (c, ts)));
+            if let Some((client, ts)) = route {
                 if scope.client.as_ref() == Some(client) {
                     targets.extend(ts.iter().cloned());
                 }
@@ -382,6 +400,23 @@ impl Reporter {
             }
         }
         for target in targets {
+            if let Some(store) = self.store.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
+                let delivery = crate::store::Delivery {
+                    url: target.target.url.clone(),
+                    payload: json!(event),
+                    client: event.scope.client.clone(),
+                    session_id: event.scope.session_id.clone(),
+                    task_id: event.scope.task_id.clone(),
+                    index: None,
+                    status: DeliveryStatus { delivery_id: uuid::Uuid::new_v4().to_string(), event: "issue".into(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
+                };
+                if store.save_delivery(&delivery).is_ok() {
+                    store.start(delivery, Some(target.target), self, RetryPolicy::default());
+                } else {
+                    self.io_errors.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
             let r = self.clone();
             let event = event.clone();
             self.inflight.fetch_add(1, Ordering::SeqCst);
@@ -405,7 +440,7 @@ impl Reporter {
         failure.subscription_targets = Some(targets.to_vec());
         self.report(failure);
     }
-    fn delivery_failure(status: &DeliveryStatus, url: &str, client: Option<&str>) -> IssueEvent {
+    pub(crate) fn delivery_failure(status: &DeliveryStatus, url: &str, client: Option<&str>) -> IssueEvent {
         let mut failure = IssueEvent::new(Severity::Error, "webhook_delivery_failed", "webhook", "webhook delivery exhausted retries")
             .scope(IssueScope { client: client.map(str::to_owned), ..Default::default() })
             .details(json!({"event": status.event, "host": host(url), "attempts": status.attempts, "lastStatus": status.last_status}));
@@ -425,6 +460,15 @@ impl Reporter {
                     s.queue.is_empty() && s.dropped == 0 && !s.busy
                 };
                 if empty && self.inflight.load(Ordering::SeqCst) == 0 && self.summaries.load(Ordering::SeqCst) == 0 {
+                    let store = self.store.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade);
+                    if let Some(store) = store {
+                        store.flush().await;
+                        // Delivery failures may have enqueued new issues while we waited.
+                        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if !state.queue.is_empty() || state.busy {
+                            continue;
+                        }
+                    }
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

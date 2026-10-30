@@ -17,6 +17,7 @@ pub mod issues;
 mod logging;
 mod prompt;
 mod rpc;
+mod store;
 pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
@@ -59,6 +60,9 @@ struct Cli {
     /// 会话 JSONL 存放目录（按 client 分子目录）；不填则不持久化
     #[arg(long, global = true, env = "SUB_BOT_SESSION_DIR")]
     session_dir: Option<PathBuf>,
+    /// Async task and webhook journal directory
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
     /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile > OPENAI_API_KEY
     #[arg(long, global = true)]
     openai_key_file: Option<PathBuf>,
@@ -203,7 +207,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     install_reporter(&loaded, &cli);
-    let new_hub = |cfg| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
+    let new_hub = |mut cfg: config::Config| {
+        if cli.data_dir.is_some() {
+            cfg.data_dir = cli.data_dir.clone();
+        }
+        hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())
+    };
     // Construct before dispatch so initialization failures get the short synchronous alert path.
     let prepared_hub = if matches!(cli.cmd, Cmd::Issues { .. }) {
         None

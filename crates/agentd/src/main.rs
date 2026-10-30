@@ -16,6 +16,7 @@ mod hub;
 mod logging;
 mod prompt;
 mod rpc;
+pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;

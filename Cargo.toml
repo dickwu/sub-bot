@@ -28,6 +28,7 @@ tracing-appender = "0.2"
 directories = "5"
 rand = "0.8"
 sha2 = "0.10"
+hmac = "0.12"
 agent-ai = { path = "crates/agent-ai" }
 agent-core = { path = "crates/agent-core" }
 agent-tools = { path = "crates/agent-tools" }

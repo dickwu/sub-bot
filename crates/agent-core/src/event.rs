@@ -8,6 +8,10 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AgentEvent {
     AgentStart,
+    /// Runtime outcomes that cannot be inferred from provider messages.
+    RunOutcome {
+        kind: String,
+    },
     AgentEnd {
         messages: Vec<Message>,
     },

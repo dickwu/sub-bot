@@ -66,11 +66,13 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             turns += 1;
             let over_budget = cfg.token_budget.is_some_and(|b| used_tokens >= b);
             let assistant = if turns > cfg.max_turns {
+                emit(AgentEvent::RunOutcome { kind: "max_turns".into() });
                 AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded")
             } else if over_budget && budget_forced {
                 AssistantMessage::failed(&cfg.model, StopReason::Error, "token budget exceeded")
             } else if over_budget {
                 budget_forced = true;
+                emit(AgentEvent::RunOutcome { kind: "token_budget_exceeded".into() });
                 tracing::warn!(used_tokens, budget = cfg.token_budget, "token budget reached; asking for a final answer without tools");
                 let m = Message::user_text("[sub-bot] Token budget reached. Do not call any more tools; give your final answer now based on what you have.");
                 emit(AgentEvent::MessageStart { message: m.clone() });

@@ -1,5 +1,7 @@
 use crate::{agent_loop::*, event::AgentEvent};
 use agent_ai::Message;
+use futures::FutureExt;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -75,6 +77,7 @@ impl Agent {
                             // 与 settle 共用 state 锁，避免结束后才报超时。
                             let _state = this.state.lock().unwrap();
                             if !settled.is_cancelled() && !token.is_cancelled() {
+                                let _ = this.events.send(AgentEvent::RunOutcome { kind: "run_timeout".into() });
                                 tracing::warn!("run timed out");
                                 token.cancel();
                             }
@@ -92,33 +95,52 @@ impl Agent {
                 let emit: Emit = Arc::new(move |e| {
                     let _ = tx.send(e);
                 });
-                let mut pending = vec![message];
-                loop {
-                    let out = run_loop(&this.messages, pending, &this.config, token.clone(), emit.clone()).await;
-                    on_messages(out);
-                    // run_loop 最后一次 drain 与清除 running 之间的提交也必须被接走。
-                    // 锁顺序固定为 state -> queues；没有 std 锁跨越 await。
-                    let mut state = this.state.lock().unwrap();
-                    if token.is_cancelled() {
-                        let mut steering = this.config.steering.lock().unwrap();
-                        let mut follow_up = this.config.follow_up.lock().unwrap();
-                        let discarded = steering.len() + follow_up.len();
-                        steering.clear();
-                        follow_up.clear();
-                        tracing::warn!(discarded, "discarded queued messages after abort");
-                        state.cancel = None;
-                        settled.cancel();
-                        let _ = this.events.send(AgentEvent::AgentSettled { aborted: true });
-                        break;
-                    }
-                    pending = this.config.steering.lock().unwrap().drain(..).collect();
-                    pending.extend(this.config.follow_up.lock().unwrap().drain(..));
-                    if pending.is_empty() {
-                        state.cancel = None;
-                        settled.cancel();
-                        let _ = this.events.send(AgentEvent::AgentSettled { aborted: token.is_cancelled() });
-                        break;
-                    }
+                let outcome = {
+                    let this = &this;
+                    let token = &token;
+                    let settled = &settled;
+                    AssertUnwindSafe(async move {
+                        let mut pending = vec![message];
+                        loop {
+                            let out = run_loop(&this.messages, pending, &this.config, token.clone(), emit.clone()).await;
+                            on_messages(out);
+                            // run_loop 最后一次 drain 与清除 running 之间的提交也必须被接走。
+                            // 锁顺序固定为 state -> queues；没有 std 锁跨越 await。
+                            let mut state = this.state.lock().unwrap();
+                            if token.is_cancelled() {
+                                let mut steering = this.config.steering.lock().unwrap();
+                                let mut follow_up = this.config.follow_up.lock().unwrap();
+                                let discarded = steering.len() + follow_up.len();
+                                steering.clear();
+                                follow_up.clear();
+                                tracing::warn!(discarded, "discarded queued messages after abort");
+                                state.cancel = None;
+                                settled.cancel();
+                                let _ = this.events.send(AgentEvent::AgentSettled { aborted: true });
+                                break;
+                            }
+                            pending = this.config.steering.lock().unwrap().drain(..).collect();
+                            pending.extend(this.config.follow_up.lock().unwrap().drain(..));
+                            if pending.is_empty() {
+                                state.cancel = None;
+                                settled.cancel();
+                                let _ = this.events.send(AgentEvent::AgentSettled { aborted: token.is_cancelled() });
+                                break;
+                            }
+                        }
+                    })
+                    .catch_unwind()
+                    .await
+                };
+                if outcome.is_err() {
+                    // Never retain the panic payload: it may contain provider/tool secrets.
+                    token.cancel();
+                    this.config.steering.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    this.config.follow_up.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                    this.state.lock().unwrap_or_else(|e| e.into_inner()).cancel = None;
+                    settled.cancel();
+                    let _ = this.events.send(AgentEvent::RunOutcome { kind: "task_panic".into() });
+                    let _ = this.events.send(AgentEvent::AgentSettled { aborted: false });
                 }
             }
             .in_current_span(),

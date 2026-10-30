@@ -32,6 +32,8 @@ rand.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 reqwest.workspace = true
+regex = "1"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }

@@ -3,6 +3,20 @@
   "defaultReasoningEffort": "low",
   "defaultApi": "auto",
   "apiKeyFile": "/etc/sub-bot/openai.key",
+  "alerts": {
+    "webhookUrl": [
+      "https://ops.example.com/sub-bot/issues",
+      {
+        "url": "https://backup.example.com/sub-bot/issues",
+        "secretFile": "/etc/sub-bot/backup-webhook.key",
+        "minSeverity": "fatal"
+      }
+    ],
+    "webhookSecretFile": "/etc/sub-bot/alerts-webhook.key",
+    "minSeverity": "error",
+    "dedupWindowSecs": 60,
+    "queueCapacity": 1000
+  },
   "profiles": {
     "coder": {
       "model": "gpt-5.4-mini",
@@ -71,6 +85,16 @@
     },
     {
       "name": "dev-bot",
+      "webhookSecretFile": "/etc/sub-bot/dev-webhook.key",
+      "webhookUrl": [
+        "https://dev.example.com/sub-bot/completed",
+        {
+          "url": "https://dev.example.com/sub-bot/events",
+          "secretFile": "/etc/sub-bot/dev-events.key",
+          "events": ["task.completed", "task.progress", "issues"],
+          "minSeverity": "warn"
+        }
+      ],
       "tokenSha256": "REPLACE_ME: output of `sub-bot hash-token <a long random token for dev-bot>`",
       "profiles": [
         "coder",

@@ -7,7 +7,71 @@
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.4.0。支持异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.5.0。支持问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+
+## 问题上报 (issues)
+
+v0.5.0 将运行异常统一为 `IssueEvent`，写入日志目录下的 **`issues.log`（JSONL）**，并可投递到多个告警接收器。Webhook 沿用 v0.4 的 HMAC-SHA256 签名、独立 delivery ID、超时与重试；事件名为 **`issue`**，信封 `data` 是以下对象：
+
+```json
+{
+  "id": "uuid", "ts": 1740000000000, "severity": "error",
+  "kind": "tool_timeout", "component": "tool", "message": "operation timed out",
+  "requestId": "optional", "client": "dev-bot", "sessionId": "optional",
+  "taskId": "optional", "profile": "coder", "model": "optional", "tool": "bash",
+  "details": {}, "count": 1
+}
+```
+
+`ts` 为 Unix 毫秒；severity 为 `warn | error | fatal`。作用域字段和 `tool` 可省略。
+运行侧来源（I2 接入）包括：LLM 错误、工具失败/超时、run timeout / max_turns / token budget、abort、持久化 I/O、广播 lag、关闭时仍有在途工作、429 容量拒绝、调用方工具 callback 失败。核心还接入 webhook 最终投递失败、启动/配置失败、panic，以及本项目 crate 的 WARN/ERROR 日志（跳过 reporter/webhook 自身，防止循环）。
+
+### 配置
+
+```json
+{
+  "alerts": {
+    "webhookUrl": [
+      "https://ops.example/alerts",
+      {"url": "https://backup.example/alerts", "secretFile": "keys/backup", "minSeverity": "fatal"}
+    ],
+    "webhookSecretFile": "keys/alerts",
+    "minSeverity": "error",
+    "dedupWindowSecs": 60,
+    "queueCapacity": 1000
+  },
+  "clients": [{
+    "name": "dev-bot", "tokenSha256": "<sha256>", "profiles": ["coder"],
+    "webhookSecretFile": "keys/client",
+    "webhookUrl": [
+      "https://bot.example/completed",
+      {"url": "https://bot.example/events", "secretFile": "keys/events",
+       "events": ["task.completed", "task.progress", "issues"], "minSeverity": "warn"}
+    ]
+  }]
+}
+```
+
+- `webhookUrl` 保留单字符串兼容，也接受字符串/对象混合数组；每个列表最多 **10** 项，只允许无 URL 用户凭据的 HTTP/HTTPS 地址。
+- `secretFile` 相对于配置文件目录，必须可读且非空；未指定则继承该 client/alerts 的 `webhookSecretFile`。密钥内容不进入 Debug。
+- Client 条目省略 `events` 时只选 `task.completed`；必须显式列出 `issues` 才订阅问题，默认问题阈值 `warn`。订阅按 client + session/task 隔离。
+- 全局 `alerts` 不受 client 作用域限制，忽略条目 `events`；默认阈值 `error`，条目 `minSeverity` 可覆盖。
+- 请求 `callbackUrl` 的数组解析、任务订阅与 `GET /v1/issues` 由 I2 HTTP 接入；请求不能提供 `secretFile`，使用 client 默认 secret，所有 URL 必须匹配允许的 host。配置中的所有 webhook host 都隐式允许；请求 targets 替换该任务的默认 targets。
+
+### CLI 与保证
+
+```bash
+sub-bot --config sub-bot.json issues test --severity error --message 'alert pipeline test'
+sub-bot --config sub-bot.json issues tail -n 20
+```
+
+`issues test` 不需要初始化 LLM provider，向**所有** alert targets 发送一个 `test` 问题（诊断时忽略阈值），等待投递结果，只打印 host、state、attempts；任意失败退出非零。`issues tail` 打印 `issues.log` 最后 N 行。`--log-dir -` 禁用文件落盘，但不禁用告警。
+
+- `report()` 不等待网络或文件 I/O；队列默认 1000，满时丢弃最旧项，随后输出带丢弃计数的 `issues_dropped`。内存保留最近 1000 个已处理问题。
+- 同 `(kind, component, sessionId, client)` 在默认 60 秒窗口内首次立即发出，其余合并；窗口结束的摘要 `count = 被抑制次数 + 1`，**包含已经发出的首条，不应重复相加**。关闭 flush 会提前输出待发摘要。
+- 各目标独立签名、delivery ID 和重试，最多 32 个网络投递并发；慢目标不阻塞其它目标/问题队列。失败生成 `webhook_delivery_failed`，仅去 alerts 和 JSONL，不回到订阅者；失败问题自身的投递不会递归生成问题。外部失败回调只有 host，保守排除同 host 的 alert targets；issue 内部失败可精确排除原 URL。
+- 安全约定：来源不得传入 prompts/bodies/工具原文；details 递归剔除 prompt/content/body/text/messages/arguments/output 与密钥字段，掩盖 `sk-…`、Bearer、GitHub tokens、敏感 key=value 和已加载的 webhook secrets。message 最多 500 字符，details 超过 2 KiB 替换为 `{"truncated":true}`。不要将原始输入输出拼入自由文本 message；模式脱敏不能识别任意无标记的私密文本。
+- JSONL I/O 失败只计数，不使服务失败；启动失败的同步告警最多等 5 秒，正常退出 flush 最多等 5 秒。panic 仅 best-effort 入队并调用原 hook；进程被强杀、超时退出或磁盘故障时不保证投递。问题不是持久化消息队列，接收端仍需按 delivery ID 幂等处理。
 
 ## 安装
 

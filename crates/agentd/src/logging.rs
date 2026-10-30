@@ -31,7 +31,7 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
         None => default_log_dir(),
     };
     let Some(dir) = dir else {
-        tracing_subscriber::registry().with(stderr).init();
+        tracing_subscriber::registry().with(IssuesLayer).with(stderr).init();
         return Ok(None);
     };
     std::fs::create_dir_all(&dir)?;
@@ -40,9 +40,55 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
     let file = fmt::layer().with_writer(writer).with_ansi(false);
     // text 文件层用独立的字段格式化类型：否则它和 stderr 层共用同一个 span 扩展，`span.record` 的字段会被追加两次
     let file = if format == "text" { file.fmt_fields(FileFields::default()).boxed() } else { file.json().with_current_span(true).with_span_list(true).boxed() };
-    tracing_subscriber::registry().with(stderr).with(file.with_filter(filter())).init();
+    tracing_subscriber::registry().with(IssuesLayer).with(stderr).with(file.with_filter(filter())).init();
     tracing::debug!(log_dir = %dir.display(), "file logging enabled");
     Ok(Some(guard))
+}
+
+/// WARN/ERROR from our crates only; webhook/reporter diagnostics must never loop.
+struct IssuesLayer;
+impl<S: tracing::Subscriber> Layer<S> for IssuesLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        let Some(reporter) = crate::issues::global() else {
+            return;
+        };
+        if let Some(issue) = issue_from_event(event) {
+            reporter.report(issue);
+        }
+    }
+}
+
+fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEvent> {
+    let meta = event.metadata();
+    let target = meta.target();
+    if !matches!(*meta.level(), tracing::Level::WARN | tracing::Level::ERROR)
+        || !(target.starts_with("agent_") || target.starts_with("agentd") || target.starts_with("sub_bot"))
+        || ["agentd::issues", "agentd::webhook", "sub_bot::issues", "sub_bot::webhook"].iter().any(|p| target.starts_with(p))
+    {
+        return None;
+    }
+    #[derive(Default)]
+    struct Fields {
+        message: String,
+        fields: Vec<String>,
+    }
+    impl tracing::field::Visit for Fields {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = format!("{value:?}");
+            } else if !crate::issues::sensitive_field(field.name()) {
+                self.fields.push(format!("{}={value:?}", field.name()));
+            }
+        }
+    }
+    let mut fields = Fields::default();
+    event.record(&mut fields);
+    if !fields.fields.is_empty() {
+        fields.message.push(' ');
+        fields.message.push_str(&fields.fields.join(" "));
+    }
+    let (severity, kind) = if *meta.level() == tracing::Level::ERROR { (crate::issues::Severity::Error, "log_error") } else { (crate::issues::Severity::Warn, "log_warn") };
+    Some(crate::issues::IssueEvent::new(severity, kind, target, fields.message))
 }
 
 /// 与 DefaultFields 输出相同，但类型不同，使每个 fmt 层拥有各自的 span 字段缓存。
@@ -58,6 +104,40 @@ impl<'w> fmt::FormatFields<'w> for FileFields {
 #[cfg(test)]
 mod tests {
     use super::build_filter;
+
+    #[test]
+    fn issues_layer_filters_sources_and_sensitive_fields() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::{layer::SubscriberExt, Layer};
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<crate::issues::IssueEvent>>>);
+        impl<S: tracing::Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+                if let Some(issue) = super::issue_from_event(event) {
+                    self.0.lock().unwrap().push(issue);
+                }
+            }
+        }
+        let capture = Capture::default();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+            tracing::warn!(target: "agent_core::run", attempts = 3, api_key = "private-key", token = "private-token", body = "private-body", prompt = "private-prompt", "run warning");
+            tracing::error!(target: "sub_bot::http", "request error");
+            tracing::warn!(target: "agentd::issues", "ignored");
+            tracing::error!(target: "agentd::webhook", "ignored");
+            tracing::warn!(target: "sub_bot::webhook", "ignored");
+            tracing::error!(target: "sub_bot::issues", "ignored");
+            tracing::warn!(target: "reqwest", "ignored");
+            tracing::info!(target: "agentd", "ignored");
+        });
+        let issues = capture.0.lock().unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].kind, "log_warn");
+        assert_eq!(issues[0].component, "agent_core::run");
+        assert!(issues[0].message.contains("run warning"));
+        assert!(issues[0].message.contains("attempts=3"));
+        assert!(!issues[0].message.contains("private"));
+        assert_eq!(issues[1].kind, "log_error");
+    }
 
     #[test]
     fn dependency_suppression_overrides_user_filters() {

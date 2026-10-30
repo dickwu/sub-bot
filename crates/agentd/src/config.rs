@@ -63,6 +63,118 @@ fn default_max_turns() -> usize {
     50
 }
 
+pub const MAX_TARGETS: usize = 10;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TargetSpec {
+    Url(String),
+    Full {
+        url: String,
+        #[serde(rename = "secretFile")]
+        secret_file: Option<PathBuf>,
+        events: Option<Vec<String>>,
+        #[serde(rename = "minSeverity")]
+        min_severity: Option<crate::issues::Severity>,
+    },
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+pub enum Targets {
+    #[default]
+    #[serde(skip)]
+    None,
+    One(TargetSpec),
+    Many(Vec<TargetSpec>),
+}
+impl Targets {
+    pub fn specs(&self) -> Vec<&TargetSpec> {
+        match self {
+            Self::None => vec![],
+            Self::One(t) => vec![t],
+            Self::Many(ts) => ts.iter().collect(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.specs().is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub target: crate::webhook::WebhookTarget,
+    pub events: Option<Vec<String>>,
+    pub min_severity: Option<crate::issues::Severity>,
+}
+impl ResolvedTarget {
+    pub fn wants(&self, event: &str) -> bool {
+        self.events.as_ref().map_or(event == "task.completed", |events| events.iter().any(|e| e == event))
+    }
+    pub fn wants_issue(&self, sev: crate::issues::Severity) -> bool {
+        self.wants("issues") && sev >= self.min_severity.unwrap_or(crate::issues::Severity::Warn)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct AlertsConfig {
+    pub webhook_url: Targets,
+    pub webhook_secret_file: Option<PathBuf>,
+    pub min_severity: crate::issues::Severity,
+    pub dedup_window_secs: u64,
+    pub queue_capacity: usize,
+    #[serde(skip)]
+    pub resolved: Vec<ResolvedTarget>,
+}
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self { webhook_url: Targets::None, webhook_secret_file: None, min_severity: crate::issues::Severity::Error, dedup_window_secs: 60, queue_capacity: 1000, resolved: vec![] }
+    }
+}
+impl AlertsConfig {
+    pub fn resolve(&mut self, dir: Option<&std::path::Path>) -> anyhow::Result<()> {
+        let secret = self.webhook_secret_file.as_deref().map(|p| read_secret(p, dir)).transpose()?;
+        self.resolved = resolve_targets(&self.webhook_url, secret.as_deref(), dir)?;
+        for target in &mut self.resolved {
+            target.min_severity = Some(target.min_severity.unwrap_or(self.min_severity));
+        }
+        Ok(())
+    }
+}
+fn read_secret(path: &std::path::Path, dir: Option<&std::path::Path>) -> anyhow::Result<String> {
+    let path = if path.is_relative() { dir.unwrap_or_else(|| std::path::Path::new(".")).join(path) } else { path.to_owned() };
+    let secret = std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read webhookSecretFile"))?;
+    anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
+    Ok(secret.trim().to_owned())
+}
+fn validate_targets(targets: &Targets) -> anyhow::Result<()> {
+    anyhow::ensure!(targets.specs().len() <= MAX_TARGETS, "webhookUrl exceeds MAX_TARGETS (10)");
+    for spec in targets.specs() {
+        let url = match spec {
+            TargetSpec::Url(url) | TargetSpec::Full { url, .. } => url,
+        };
+        anyhow::ensure!(webhook_url(url).is_some(), "webhookUrl must be an http/https URL");
+    }
+    Ok(())
+}
+fn resolve_targets(targets: &Targets, default_secret: Option<&str>, dir: Option<&std::path::Path>) -> anyhow::Result<Vec<ResolvedTarget>> {
+    validate_targets(targets)?;
+    targets
+        .specs()
+        .into_iter()
+        .map(|spec| {
+            let (url, secret, events, min_severity) = match spec {
+                TargetSpec::Url(url) => (url, default_secret.map(str::to_owned), None, None),
+                TargetSpec::Full { url, secret_file, events, min_severity } => {
+                    (url, secret_file.as_deref().map(|p| read_secret(p, dir)).transpose()?.or_else(|| default_secret.map(str::to_owned)), events.clone(), *min_severity)
+                }
+            };
+            Ok(ResolvedTarget { target: crate::webhook::WebhookTarget { url: url.clone(), secret }, events, min_severity })
+        })
+        .collect()
+}
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -70,7 +182,10 @@ pub struct Client {
     /// token 的 SHA-256（hex）。用 `sub-bot hash-token <token>` 生成，配置文件里不存明文。
     pub token_sha256: String,
     pub profiles: Vec<String>,
-    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Targets,
+    #[serde(skip)]
+    pub resolved_webhooks: Vec<ResolvedTarget>,
     pub webhook_secret_file: Option<PathBuf>,
     #[serde(default)]
     pub webhook_allowed_hosts: Vec<String>,
@@ -87,6 +202,8 @@ impl std::fmt::Debug for Client {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default)]
+    pub alerts: AlertsConfig,
     #[serde(default = "default_session_idle_ttl")]
     pub task_ttl_secs: u64,
     #[serde(default = "default_webhook_attempts")]
@@ -172,7 +289,17 @@ impl Config {
                 anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
                 client.webhook_secret = Some(secret.trim().to_string());
             }
+            client.resolved_webhooks = resolve_targets(&client.webhook_url, client.webhook_secret.as_deref(), path.parent())?;
+            for target in &client.resolved_webhooks {
+                if let Some(url) = webhook_url(&target.target.url) {
+                    let host = url.host_str().unwrap_or_default().to_owned();
+                    if !client.webhook_allowed_hosts.contains(&host) {
+                        client.webhook_allowed_hosts.push(host);
+                    }
+                }
+            }
         }
+        cfg.alerts.resolve(path.parent())?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -192,10 +319,9 @@ impl Config {
                 }
             }
         }
+        validate_targets(&self.alerts.webhook_url)?;
         for client in &self.clients {
-            if let Some(url) = &client.webhook_url {
-                anyhow::ensure!(webhook_url(url).is_some(), "webhookUrl must be an http/https URL");
-            }
+            validate_targets(&client.webhook_url)?;
             anyhow::ensure!(client.token_sha256.len() == 64 && client.token_sha256.bytes().all(|b| b.is_ascii_hexdigit()), "client '{}': tokenSha256 must be exactly 64 hex characters", client.name);
             for profile in &client.profiles {
                 anyhow::ensure!(self.profiles.contains_key(profile), "client '{}': unknown profile '{profile}'", client.name);
@@ -230,6 +356,7 @@ impl Config {
             },
         );
         Config {
+            alerts: AlertsConfig::default(),
             task_ttl_secs: default_session_idle_ttl(),
             webhook_max_attempts: default_webhook_attempts(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
@@ -261,6 +388,44 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_targets_defaults_caps_and_secrets() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-targets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("default-key"), "default-private-key").unwrap();
+        std::fs::write(dir.join("own-key"), "entry-private-key").unwrap();
+        let path = dir.join("config.json");
+        let mut value = serde_json::json!({"profiles":{}, "clients":[{"name":"bot", "tokenSha256":sha256_hex("token"), "profiles":[], "webhookSecretFile":"default-key",
+            "webhookUrl":["https://one.example/hook", {"url":"http://two.example:9000/hook", "secretFile":"own-key", "events":["task.progress","issues"], "minSeverity":"fatal"}]}],
+            "alerts":{"webhookUrl":["https://alerts.example/hook", {"url":"http://other.example", "minSeverity":"warn", "events":[]}], "webhookSecretFile":"own-key"}});
+        std::fs::write(&path, value.to_string()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let targets = &cfg.clients[0].resolved_webhooks;
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].target.secret.as_deref(), Some("default-private-key"));
+        assert_eq!(targets[1].target.secret.as_deref(), Some("entry-private-key"));
+        assert!(targets[0].wants("task.completed"));
+        assert!(!targets[0].wants_issue(crate::issues::Severity::Fatal));
+        assert!(targets[1].wants("task.progress"));
+        assert!(!targets[1].wants_issue(crate::issues::Severity::Error));
+        assert!(targets[1].wants_issue(crate::issues::Severity::Fatal));
+        assert_eq!(cfg.alerts.resolved[0].min_severity, Some(crate::issues::Severity::Error));
+        assert_eq!(cfg.alerts.resolved[1].min_severity, Some(crate::issues::Severity::Warn));
+        assert!(cfg.clients[0].webhook_allowed_hosts.contains(&"two.example".to_string()));
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("default-private-key"));
+        assert!(!debug.contains("entry-private-key"));
+        value["clients"][0]["webhookUrl"] = serde_json::json!(vec!["https://example.com"; MAX_TARGETS + 1]);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(Config::load(&path).is_err());
+        value["clients"][0]["webhookUrl"] = serde_json::json!(["ftp://example.com"]);
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(Config::load(&path).is_err());
+        assert!(serde_json::from_str::<Targets>("null").is_err());
+        assert!(Targets::default().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn webhook_config_secret_loading_validation_and_redaction() {

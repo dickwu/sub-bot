@@ -117,6 +117,8 @@ impl Deliverer {
                         }
                         if !code.is_success() {
                             let snippet = response_snippet(response).await?;
+                            let secrets = target.secret.iter().cloned().collect::<Vec<_>>();
+                            let snippet: String = crate::issues::redact(&snippet, &secrets).chars().take(200).collect();
                             status.last_error = Some(format!("HTTP {}: {snippet}", code.as_u16()));
                         }
                         Ok::<(), reqwest::Error>(())
@@ -187,7 +189,7 @@ async fn response_snippet(mut response: reqwest::Response) -> Result<String, req
         let Some(chunk) = response.chunk().await? else { break };
         bytes.extend_from_slice(&chunk[..chunk.len().min(4096 - bytes.len())]);
     }
-    Ok(String::from_utf8_lossy(&bytes).chars().take(200).collect())
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn signature_mac(secret: &[u8], timestamp: i64, body: &[u8]) -> Option<Hmac<Sha256>> {

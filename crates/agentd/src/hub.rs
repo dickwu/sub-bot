@@ -169,6 +169,7 @@ fn unix_ms() -> u64 {
 pub type WebhookQueue = tokio::sync::mpsc::UnboundedSender<(&'static str, serde_json::Value)>;
 
 pub struct Hub {
+    pub issues: std::sync::Arc<crate::issues::Reporter>,
     pub config: Config,
     provider: Arc<dyn Provider>,
     registry: ToolRegistry,
@@ -248,6 +249,7 @@ impl Hub {
         let webhook_http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
         let deliverer = Deliverer::new(webhook_http, RetryPolicy { max_attempts: config.webhook_max_attempts, ..Default::default() });
         Ok(Arc::new(Self {
+            issues: crate::issues::global().unwrap_or_else(crate::issues::Reporter::noop),
             tasks: Mutex::new(HashMap::new()),
             deliverer,
             config,

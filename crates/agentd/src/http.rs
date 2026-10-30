@@ -276,11 +276,11 @@ struct ChatBody {
 /// A host entry allows any port; host:port restricts it. The configured URL implicitly
 /// allows its host. No URL input is included in errors or logs.
 fn webhook_target(c: &Client, callback: Option<&str>) -> Result<Option<WebhookTarget>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(value) = callback.or(c.webhook_url.as_deref()) else { return Ok(None) };
+    let Some(value) = callback.or_else(|| c.resolved_webhooks.first().map(|t| t.target.url.as_str())) else { return Ok(None) };
     let url = crate::config::webhook_url(value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
     let host = url.host_str().unwrap_or_default();
     let authority = format!("{host}:{}", url.port_or_known_default().unwrap_or_default());
-    let implicit = c.webhook_url.as_deref().and_then(crate::config::webhook_url).is_some_and(|default| default.host_str() == Some(host));
+    let implicit = c.resolved_webhooks.iter().any(|t| crate::config::webhook_url(&t.target.url).is_some_and(|default| default.host_str() == Some(host)));
     if callback.is_some() && !implicit && !c.webhook_allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)) {
         return Err(bad_request("callback host not allowed"));
     }
@@ -530,7 +530,7 @@ mod tests {
         assert!(webhook_target(&c, Some("http://example.com/path")).is_err());
         assert!(webhook_target(&c, Some("http://example.com.evil:443/path")).is_err());
         assert!(webhook_target(&c, Some("http://localhost:1234/path")).is_ok());
-        c.webhook_url = Some("https://default.example/hook".into());
+        c.resolved_webhooks = vec![crate::config::ResolvedTarget { target: WebhookTarget { url: "https://default.example/hook".into(), secret: None }, events: None, min_severity: None }];
         assert!(webhook_target(&c, Some("https://default.example/override")).is_ok());
         assert!(webhook_target(&c, None).unwrap().is_some());
     }
@@ -561,7 +561,8 @@ mod tests {
             cfg.clients[0].webhook_secret = Some("integration-test-key".into());
             cfg.chat_timeout_secs = 1;
             if default_target {
-                cfg.clients[0].webhook_url = Some(url.clone());
+                cfg.clients[0].resolved_webhooks =
+                    vec![crate::config::ResolvedTarget { target: WebhookTarget { url: url.clone(), secret: cfg.clients[0].webhook_secret.clone() }, events: None, min_severity: None }];
             }
             let hub = Hub::new(cfg, "faux", None, None).unwrap();
             let app = router(AppState { hub });

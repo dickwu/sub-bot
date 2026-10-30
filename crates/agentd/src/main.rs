@@ -13,6 +13,7 @@ compile_error!("sub-bot only supports macOS and Linux");
 mod config;
 mod http;
 mod hub;
+pub mod issues;
 mod logging;
 mod prompt;
 mod rpc;
@@ -98,8 +99,68 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 问题上报诊断
+    Issues {
+        #[command(subcommand)]
+        command: IssuesCmd,
+    },
     /// 打印 token 的 SHA-256，用于填写配置文件 clients[].tokenSha256
     HashToken { token: String },
+}
+
+#[derive(Subcommand)]
+enum IssuesCmd {
+    Test {
+        #[arg(long, value_enum, default_value = "error")]
+        severity: issues::Severity,
+        #[arg(long, default_value = "sub-bot issues test")]
+        message: String,
+    },
+    Tail {
+        #[arg(short = 'n', default_value_t = 20)]
+        n: usize,
+    },
+}
+
+fn issue_log_dir(cli: &Cli) -> Option<PathBuf> {
+    match &cli.log_dir {
+        Some(p) if p == std::path::Path::new("-") => None,
+        Some(p) => Some(p.clone()),
+        None => logging::default_log_dir(),
+    }
+}
+
+fn install_reporter(cfg: &config::Config, cli: &Cli) {
+    let secrets = cfg.clients.iter().flat_map(|c| c.webhook_secret.iter().cloned().chain(c.resolved_webhooks.iter().filter_map(|t| t.target.secret.clone()))).collect();
+    issues::install(issues::Reporter::new(&cfg.alerts, issue_log_dir(cli), secrets));
+}
+
+async fn startup_failed(cli: &Cli) {
+    let reporter = match issues::global() {
+        Some(r) => r,
+        None => {
+            // Parse alerts independently: a bad profile/client must not hide startup failures.
+            let mut alerts = cli
+                .config
+                .as_ref()
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .and_then(|v| v.get("alerts").cloned())
+                .and_then(|v| serde_json::from_value::<config::AlertsConfig>(v).ok())
+                .unwrap_or_default();
+            if alerts.resolve(cli.config.as_deref().and_then(|p| p.parent())).is_err() {
+                alerts.resolved.clear();
+            }
+            issues::Reporter::new(&alerts, issue_log_dir(cli), vec![])
+        }
+    };
+    // Generic message intentionally excludes parser/provider errors (may contain credentials).
+    let event = issues::IssueEvent::new(issues::Severity::Fatal, "startup_failed", "config", "configuration or service initialization failed");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        reporter.test_alerts(event).await;
+        reporter.flush(std::time::Duration::from_secs(1)).await;
+    })
+    .await;
 }
 
 fn local_client(cfg: &config::Config) -> config::Client {
@@ -113,6 +174,15 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", config::sha256_hex(token));
         return Ok(());
     }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info.payload().downcast_ref::<String>().map(String::as_str).or_else(|| info.payload().downcast_ref::<&str>().copied()).unwrap_or("panic");
+        issues::report(
+            issues::IssueEvent::new(issues::Severity::Fatal, "panic", "runtime", message)
+                .details(serde_json::json!({"location": info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))})),
+        );
+        previous(info);
+    }));
     let _log_guard = logging::init(&cli.log_level, cli.log_dir.as_deref(), &cli.log_format)?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, arch = std::env::consts::ARCH, provider = %cli.provider, "sub-bot starting");
     let load = |fallback_token: &str| -> anyhow::Result<config::Config> {
@@ -121,12 +191,25 @@ async fn main() -> anyhow::Result<()> {
             None => Ok(config::Config::fallback(cli.model.clone().unwrap_or_else(|| "gpt-4.1-mini".into()), fallback_token, cli.workspace.clone())),
         }
     };
-    let session_req = |profile: Option<String>| hub::SessionRequest { profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
-    match cli.cmd {
-        Cmd::HashToken { .. } => unreachable!(),
-        Cmd::Serve { bind, ref token } => {
-            let token = token.clone().unwrap_or_else(http::random_token);
-            let mut cfg = load(&token)?;
+    let fallback_token = match &cli.cmd {
+        Cmd::Serve { token, .. } => token.clone().unwrap_or_else(http::random_token),
+        _ => String::new(),
+    };
+    let loaded = match load(&fallback_token) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            startup_failed(&cli).await;
+            anyhow::bail!("configuration load failed (check config and secret files)");
+        }
+    };
+    install_reporter(&loaded, &cli);
+    let new_hub = |cfg| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
+    // Construct before dispatch so initialization failures get the short synchronous alert path.
+    let prepared_hub = if matches!(cli.cmd, Cmd::Issues { .. }) {
+        None
+    } else {
+        let mut cfg = loaded.clone();
+        if matches!(cli.cmd, Cmd::Serve { .. }) {
             if let Some(m) = &cli.model {
                 cfg.default_model = m.clone();
             }
@@ -136,19 +219,56 @@ async fn main() -> anyhow::Result<()> {
             if let Some(api) = cli.api {
                 cfg.default_api = api;
             }
-            if cli.config.is_none() {
-                eprintln!("no --config: single client 'default', Authorization: Bearer {token}");
+        }
+        match new_hub(cfg) {
+            Ok(hub) => Some(hub),
+            Err(_) => {
+                startup_failed(&cli).await;
+                anyhow::bail!("service initialization failed (check provider and key configuration)");
             }
-            let hub = hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
+        }
+    };
+    let session_req = |profile: Option<String>| hub::SessionRequest { profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
+    match cli.cmd {
+        Cmd::Issues { ref command } => match command {
+            IssuesCmd::Test { severity, message } => {
+                let reporter = issues::global().expect("installed reporter");
+                let results = reporter.test_alerts(issues::IssueEvent::new(*severity, "test", "runtime", message.clone())).await;
+                let mut failed = false;
+                for (host, status) in results {
+                    println!("{host}: {:?}, attempts={}", status.state, status.attempts);
+                    failed |= status.state != webhook::DeliveryState::Delivered;
+                }
+                reporter.flush(std::time::Duration::from_secs(5)).await;
+                anyhow::ensure!(!failed, "one or more alert deliveries failed");
+            }
+            IssuesCmd::Tail { n } => {
+                let path = issue_log_dir(&cli).ok_or_else(|| anyhow::anyhow!("file logging disabled"))?.join("issues.log");
+                let text = std::fs::read_to_string(path)?;
+                let lines: Vec<_> = text.lines().collect();
+                for line in &lines[lines.len().saturating_sub(*n)..] {
+                    println!("{line}");
+                }
+            }
+        },
+        Cmd::HashToken { .. } => unreachable!(),
+        Cmd::Serve { bind, .. } => {
+            if cli.config.is_none() {
+                eprintln!("no --config: single client 'default', Authorization: Bearer {fallback_token}");
+            }
+            let hub = prepared_hub.clone().expect("prepared hub");
+            let reporter = hub.issues.clone();
             eprintln!("sub-bot listening on http://{bind}");
-            http::serve(hub, bind).await?;
+            let result = http::serve(hub, bind).await;
+            reporter.flush(std::time::Duration::from_secs(5)).await;
+            result?;
         }
         Cmd::Rpc { ref profile } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
+            let hub = prepared_hub.clone().expect("prepared hub");
             rpc::run(hub, session_req(profile.clone())).await?;
         }
         Cmd::Run { ref profile, json, ref prompt } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
+            let hub = prepared_hub.clone().expect("prepared hub");
             let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone()))?;
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
@@ -196,7 +316,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Models { all, ref profile, json } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
+            let hub = prepared_hub.clone().expect("prepared hub");
             let mut list = hub.list_models(all).await?;
             if let Some(name) = profile {
                 let p = hub.config.profiles.get(name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;

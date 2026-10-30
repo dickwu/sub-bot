@@ -17,12 +17,17 @@ pub struct LoopConfig {
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn AgentTool>>,
     pub reasoning: Option<ThinkingLevel>,
+    pub api: agent_ai::Api,
     /// 每轮结束后注入（对应 `getSteeringMessages`）。
     pub steering: Queue,
     /// agent 将要停止时注入（对应 `getFollowUpMessages`）。
     pub follow_up: Queue,
     /// 安全上限，防止工具死循环。
     pub max_turns: usize,
+    /// 每次模型调用的输出 token 上限（含推理 token）
+    pub max_tokens: Option<u32>,
+    /// 单次运行的总 token 预算：达到后再给模型一次“不带工具、直接给出最终答复”的机会，然后停止
+    pub token_budget: Option<u64>,
 }
 
 fn drain(q: &Queue) -> Vec<Message> {
@@ -39,6 +44,8 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
     pending.extend(drain(&cfg.steering));
     let mut turns = 0usize;
     let mut first = true;
+    let mut used_tokens = 0u64;
+    let mut budget_forced = false;
 
     'outer: loop {
         let mut more_tool_calls = true;
@@ -55,8 +62,24 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             }
 
             turns += 1;
-            let assistant =
-                if turns > cfg.max_turns { AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded") } else { stream_assistant(context, cfg, cancel.clone(), &emit).await };
+            let over_budget = cfg.token_budget.is_some_and(|b| used_tokens >= b);
+            let assistant = if turns > cfg.max_turns {
+                AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded")
+            } else if over_budget && budget_forced {
+                AssistantMessage::failed(&cfg.model, StopReason::Error, "token budget exceeded")
+            } else if over_budget {
+                budget_forced = true;
+                tracing::warn!(used_tokens, budget = cfg.token_budget, "token budget reached; asking for a final answer without tools");
+                let m = Message::user_text("[sub-bot] Token budget reached. Do not call any more tools; give your final answer now based on what you have.");
+                emit(AgentEvent::MessageStart { message: m.clone() });
+                emit(AgentEvent::MessageEnd { message: m.clone() });
+                context.push(m.clone());
+                new_messages.push(m);
+                stream_assistant(context, cfg, cancel.clone(), &emit, false).await
+            } else {
+                stream_assistant(context, cfg, cancel.clone(), &emit, true).await
+            };
+            used_tokens += assistant.usage.total_tokens;
             let am = Message::Assistant(assistant.clone());
             context.push(am.clone());
             new_messages.push(am.clone());
@@ -87,6 +110,9 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
                 results = msgs;
             }
             emit(AgentEvent::TurnEnd { message: am, tool_results: results });
+            if budget_forced {
+                break 'outer;
+            }
             if cancel.is_cancelled() {
                 break 'outer;
             }
@@ -102,14 +128,15 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
     new_messages
 }
 
-async fn stream_assistant(context: &[Message], cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit) -> AssistantMessage {
+async fn stream_assistant(context: &[Message], cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
     let req = Request {
         model: cfg.model.clone(),
         system_prompt: cfg.system_prompt.clone(),
         messages: context.to_vec(),
-        tools: cfg.tools.iter().map(|t| t.spec()).collect(),
+        tools: if with_tools { cfg.tools.iter().map(|t| t.spec()).collect() } else { vec![] },
         reasoning: cfg.reasoning,
-        max_tokens: None,
+        api: cfg.api,
+        max_tokens: cfg.max_tokens,
     };
     emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&cfg.model)) });
     let mut stream = cfg.provider.stream(req, cancel);
@@ -226,9 +253,12 @@ mod tests {
             system_prompt: None,
             tools: vec![Arc::new(Echo)],
             reasoning: None,
+            api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
             max_turns: 5,
+            max_tokens: None,
+            token_budget: None,
         };
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
@@ -240,5 +270,49 @@ mod tests {
         assert_eq!(ev.iter().filter(|t| *t == "turn_start").count(), 2);
         assert!(ev.contains(&"tool_execution_end".to_string()));
         assert_eq!(ev.last().unwrap(), "agent_end");
+    }
+
+    /// 只要给了工具就一直调用工具，每次消耗 100 token；没给工具时回答文本。
+    struct Greedy;
+    impl Provider for Greedy {
+        fn id(&self) -> &str {
+            "greedy"
+        }
+        fn stream(&self, req: Request, _c: CancellationToken) -> EventStream {
+            let mut m = AssistantMessage::empty(&req.model);
+            m.usage.total_tokens = 100;
+            if req.tools.is_empty() {
+                m.content.push(Content::Text { text: "final".into() });
+            } else {
+                m.content.push(Content::ToolCall(ToolCall { id: "c".into(), name: "echo".into(), arguments: serde_json::json!({}) }));
+                m.stop_reason = StopReason::ToolUse;
+            }
+            Box::pin(futures::stream::iter(vec![AssistantEvent::Done { message: m }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn token_budget_forces_final_answer() {
+        let cfg = LoopConfig {
+            provider: Arc::new(Greedy),
+            model: "m".into(),
+            system_prompt: None,
+            tools: vec![Arc::new(Echo)],
+            reasoning: None,
+            api: Default::default(),
+            steering: Default::default(),
+            follow_up: Default::default(),
+            max_turns: 50,
+            max_tokens: None,
+            token_budget: Some(250),
+        };
+        let emit: Emit = Arc::new(|_| {});
+        let mut ctx = vec![];
+        let new = run_loop(&mut ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), emit).await;
+        let assistants: Vec<&AssistantMessage> = new.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).collect();
+        // 3 次带工具（100+100+100 >= 250），然后 1 次不带工具的最终答复
+        assert_eq!(assistants.len(), 4);
+        assert_eq!(assistants.last().unwrap().text(), "final");
+        assert_eq!(assistants.last().unwrap().stop_reason, StopReason::Stop);
     }
 }

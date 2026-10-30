@@ -45,6 +45,23 @@ fn base(id: &str) -> &str {
     }
 }
 
+/// `api: auto` 时的选择（2026-10 实测）：gpt-5.4 及以后、gpt-6.x、o 系列在 Chat Completions 上
+/// 不能同时用函数工具和 reasoning_effort，所以走 Responses API；其余（含非 OpenAI 的兼容服务）走 Chat Completions。
+pub fn default_api(model: &str) -> crate::types::Api {
+    use crate::types::Api;
+    let m = base(model);
+    if m.starts_with("gpt-6") || (m.len() > 1 && m.starts_with('o') && m.as_bytes()[1].is_ascii_digit()) {
+        return Api::Responses;
+    }
+    if let Some(rest) = m.strip_prefix("gpt-5.") {
+        let minor: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if minor.parse::<u32>().is_ok_and(|n| n >= 4) {
+            return Api::Responses;
+        }
+    }
+    Api::Chat
+}
+
 /// 带日期的快照：`-YYYY-MM-DD` 或老式的 `-MMDD`（如 gpt-4-0613）。
 pub fn is_snapshot(id: &str) -> bool {
     let four = id.len() > 5 && id.as_bytes()[id.len() - 5] == b'-' && id[id.len() - 4..].chars().all(|c| c.is_ascii_digit());
@@ -139,6 +156,14 @@ mod tests {
         assert!(is_chat_model("gpt-5.4-mini") && is_chat_model("o3") && is_chat_model("gpt-4.1"));
         assert!(!is_chat_model("gpt-5.3-codex") && !is_chat_model("text-embedding-3-small") && !is_chat_model("gpt-5.5-pro") && !is_chat_model("gpt-realtime"));
         assert!(is_snapshot("gpt-4.1-2025-04-14") && !is_snapshot("gpt-4.1"));
+        use crate::types::Api;
+        assert_eq!(default_api("gpt-5.4-mini"), Api::Responses);
+        assert_eq!(default_api("gpt-6-astra"), Api::Responses);
+        assert_eq!(default_api("o3"), Api::Responses);
+        assert_eq!(default_api("gpt-5.2"), Api::Chat);
+        assert_eq!(default_api("gpt-5-mini"), Api::Chat);
+        assert_eq!(default_api("gpt-4.1"), Api::Chat);
+        assert_eq!(default_api("llama3"), Api::Chat);
         assert!(is_snapshot("gpt-4-0613") && !is_snapshot("gpt-3.5-turbo-16k") && !is_chat_model("o4-mini") && !is_chat_model("gpt-5.2-chat-latest") && is_chat_model("chat-latest"));
         assert!(model_matches("gpt-5*", "gpt-5.4-mini") && model_matches("*-mini", "gpt-4.1-mini") && !model_matches("gpt-5*", "gpt-4.1"));
         assert_eq!(Off.nearest_in(GPT5), Some(Minimal));

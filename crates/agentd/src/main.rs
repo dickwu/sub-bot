@@ -35,6 +35,9 @@ struct Cli {
     /// 推理强度 none|minimal|low|medium|high|xhigh。serve：全局默认；rpc/run：本会话。模型不支持时忽略并记 warn
     #[arg(long, global = true, env = "SUB_BOT_REASONING_EFFORT")]
     reasoning_effort: Option<ThinkingLevel>,
+    /// OpenAI API：auto（默认：gpt-5.4+/gpt-6.x/o 系列走 Responses，其余走 Chat Completions）| chat | responses。serve：全局默认；rpc/run：本会话
+    #[arg(long, global = true, env = "SUB_BOT_API")]
+    api: Option<agent_ai::Api>,
     /// openai | faux（faux 不联网，用于测试）
     #[arg(long, global = true, default_value = "openai", env = "SUB_BOT_PROVIDER")]
     provider: String,
@@ -74,7 +77,7 @@ enum Cmd {
     Run {
         #[arg(long)]
         profile: Option<String>,
-        /// 输出 JSON（text、model、reasoningEffort、usage、stopReason、error）
+        /// 输出 JSON（text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、usage（最后一次调用）、totalUsage（整次运行）、turns、toolCalls、stopReason、error）
         #[arg(long)]
         json: bool,
         prompt: String,
@@ -113,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
             None => Ok(config::Config::fallback(cli.model.clone().unwrap_or_else(|| "gpt-4.1-mini".into()), fallback_token, cli.workspace.clone())),
         }
     };
-    let session_req = |profile: Option<String>| hub::SessionRequest { profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, ..Default::default() };
+    let session_req = |profile: Option<String>| hub::SessionRequest { profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
     match cli.cmd {
         Cmd::HashToken { .. } => unreachable!(),
         Cmd::Serve { bind, ref token } => {
@@ -124,6 +127,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if cli.reasoning_effort.is_some() {
                 cfg.default_reasoning_effort = cli.reasoning_effort;
+            }
+            if let Some(api) = cli.api {
+                cfg.default_api = api;
             }
             if cli.config.is_none() {
                 eprintln!("no --config: single client 'default', Authorization: Bearer {token}");
@@ -142,19 +148,40 @@ async fn main() -> anyhow::Result<()> {
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
             let mut last = None;
+            let (mut total, mut turns, mut tool_calls) = (agent_ai::Usage::default(), 0usize, 0usize);
+            let mut used: Option<(agent_ai::Api, Option<ThinkingLevel>)> = None;
             loop {
                 match events.recv().await {
-                    Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => last = Some(a),
-                    Ok(AgentEvent::ToolExecutionStart { tool_name, .. }) if !json => eprintln!("[tool] {tool_name}"),
+                    Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => {
+                        turns += 1;
+                        tool_calls += a.tool_calls().len();
+                        total.input += a.usage.input;
+                        total.output += a.usage.output;
+                        total.cache_read += a.usage.cache_read;
+                        total.reasoning += a.usage.reasoning;
+                        total.total_tokens += a.usage.total_tokens;
+                        if let Some(api) = a.api {
+                            used = Some((api, a.reasoning_effort));
+                        }
+                        last = Some(a)
+                    }
+                    Ok(AgentEvent::ToolExecutionStart { tool_name, .. }) if !json => {
+                        eprintln!("[tool] {tool_name}")
+                    }
                     Ok(AgentEvent::AgentSettled { .. }) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
                 }
             }
             let last = last.ok_or_else(|| anyhow::anyhow!("no assistant reply"))?;
             if json {
+                // reasoningEffort / api 是实际发送给模型的值（运行时降级后），requestedReasoningEffort 是请求值
+                let (api, effort) = match used {
+                    Some((a, e)) => (a.as_str().to_string(), e),
+                    None => (hub.effective_api(&session.agent.config).to_string(), session.agent.config.reasoning),
+                };
                 println!(
                     "{}",
-                    serde_json::json!({"sessionId": session.id, "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "text": last.text(), "stopReason": last.stop_reason, "usage": last.usage, "error": last.error_message})
+                    serde_json::json!({"sessionId": session.id, "model": session.agent.config.model, "api": api, "reasoningEffort": effort, "requestedReasoningEffort": session.requested_effort, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message})
                 );
             } else {
                 println!("{}", last.text());

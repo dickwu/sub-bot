@@ -1,6 +1,7 @@
 {
   "defaultModel": "gpt-4.1",
   "defaultReasoningEffort": "low",
+  "defaultApi": "auto",
   "profiles": {
     "coder": {
       "model": "gpt-5.4-mini",
@@ -14,7 +15,8 @@
       ],
       "appendSystemPrompt": "Run the project's tests after making changes when possible.",
       "allowSystemPromptOverride": true,
-      "allowCallerTools": true
+      "allowCallerTools": true,
+      "api": "auto"
     },
     "reviewer": {
       "model": "gpt-4.1-mini",
@@ -24,7 +26,10 @@
       "workspaceRoots": [
         "./work"
       ],
-      "appendSystemPrompt": "You only review code. Never modify files."
+      "appendSystemPrompt": "You only review code. Never modify files.",
+      "maxTurns": 25,
+      "maxOutputTokens": 8000,
+      "tokenBudget": 300000
     },
     "docs-writer": {
       "tools": [

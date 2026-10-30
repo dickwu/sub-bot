@@ -1,6 +1,6 @@
-//! OpenAI Chat Completions 流式实现（对应 pi `packages/ai/src/api/openai-completions.ts`）。
-//! 后续可加 Responses API（对应 `api/openai-responses.ts`）以支持 reasoning 摘要等。
-use crate::{provider::*, types::*};
+//! OpenAI provider：Chat Completions（对应 pi `api/openai-completions.ts`）和 Responses API（`api/openai-responses.ts`，见 `responses.rs`）。
+//! 按 `Request.api` 选择；`auto` 时由 `models::default_api` 按模型决定。
+use crate::{models::default_api, provider::*, types::*};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -13,35 +13,52 @@ pub struct OpenAiProvider {
     api_key: String,
     base_url: String,
     http: reqwest::Client,
-    /// 运行时从 400 错误里学到的 reasoning_effort 能力：model -> None(不支持) / Some(可选值)
+    /// 运行时从 400 错误里学到的推理强度能力
     effort_cache: EffortCache,
+    /// auto 模式下运行时发现必须走 Responses 的模型
+    api_cache: Arc<Mutex<HashMap<String, Api>>>,
 }
 
-type EffortCache = Arc<Mutex<HashMap<String, Option<Vec<ThinkingLevel>>>>>;
+/// 缓存键：(模型, API, 是否带工具)。值：None = 不发送推理强度；Some(levels) = 只能用这些档位。
+/// 带上 API 和“是否带工具”，避免“函数工具 + 推理强度”之类的限制误伤不带工具的会话或另一个 API。
+type EffortKey = (String, Api, bool);
+type EffortCache = Arc<Mutex<HashMap<EffortKey, Option<Vec<ThinkingLevel>>>>>;
 
-/// 结合运行时缓存，算出这次真正要发送的 reasoning_effort。
-fn effective_effort(cache: &EffortCache, model: &str, requested: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
+/// 结合运行时缓存，算出这次真正要发送的推理强度。
+fn effective_effort(cache: &EffortCache, key: &EffortKey, requested: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
     let requested = requested?;
-    match cache.lock().unwrap().get(model) {
+    match cache.lock().unwrap().get(key) {
         Some(None) => None,
         Some(Some(levels)) => requested.nearest_in(levels),
         None => Some(requested),
     }
 }
 
-/// 解析 OpenAI 关于 reasoning_effort 的 400 错误。返回 Some(None)=模型不支持该参数，Some(Some(levels))=可选值。
-fn parse_effort_error(body: &str) -> Option<Option<Vec<ThinkingLevel>>> {
-    if !body.contains("reasoning_effort") {
+/// OpenAI 关于推理强度的 400 错误分类。
+#[derive(Debug, PartialEq)]
+enum EffortError {
+    /// 模型根本不认识这个参数
+    Unsupported,
+    /// 只支持这些档位
+    Levels(Vec<ThinkingLevel>),
+    /// Chat Completions 上不允许“函数工具 + reasoning_effort”（gpt-5.4+ / gpt-6.x），应改走 Responses
+    ToolsConflict,
+}
+
+fn parse_effort_error(body: &str) -> Option<EffortError> {
+    if !(body.contains("reasoning_effort") || body.contains("reasoning.effort")) {
         return None;
     }
-    // 有的模型（如 gpt-6.1-sol）在 Chat Completions 上不允许“函数工具 + reasoning_effort”，只能不发该参数
-    if body.contains("Unrecognized request argument") || body.contains("Function tools with reasoning_effort are not supported") {
-        return Some(None);
+    if body.contains("Function tools with reasoning_effort are not supported") {
+        return Some(EffortError::ToolsConflict);
+    }
+    if body.contains("Unrecognized request argument") || body.contains("Unsupported parameter") {
+        return Some(EffortError::Unsupported);
     }
     let tail = &body[body.find("Supported values are:")?..];
     let tail = &tail[..tail.find('.').unwrap_or(tail.len())];
     let levels: Vec<ThinkingLevel> = tail.split('\'').skip(1).step_by(2).filter_map(|w| w.parse().ok()).collect();
-    Some(if levels.is_empty() { None } else { Some(levels) })
+    Some(if levels.is_empty() { EffortError::Unsupported } else { EffortError::Levels(levels) })
 }
 
 impl OpenAiProvider {
@@ -52,6 +69,14 @@ impl OpenAiProvider {
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client"),
             effort_cache: Default::default(),
+            api_cache: Default::default(),
+        }
+    }
+
+    fn resolve_api(&self, req: &Request) -> Api {
+        match req.api {
+            Api::Auto => self.api_cache.lock().unwrap().get(&req.model).copied().unwrap_or_else(|| default_api(&req.model)),
+            a => a,
         }
     }
 }
@@ -131,30 +156,39 @@ impl Provider for OpenAiProvider {
 
     fn stream(&self, req: Request, cancel: CancellationToken) -> EventStream {
         let (tx, rx) = mpsc::channel(64);
-        let http = self.http.clone();
-        let url = format!("{}/chat/completions", self.base_url);
-        let key = self.api_key.clone();
-        let cache = self.effort_cache.clone();
-        let span = tracing::info_span!("llm", provider = "openai", model = %req.model, reasoning_effort = tracing::field::Empty);
+        let ctx = CallCtx { http: self.http.clone(), base_url: self.base_url.clone(), key: self.api_key.clone(), effort_cache: self.effort_cache.clone(), api_cache: self.api_cache.clone() };
+        let api = self.resolve_api(&req);
+        let span = tracing::info_span!("llm", provider = "openai", model = %req.model, api = tracing::field::Empty, reasoning_effort = tracing::field::Empty);
         tokio::spawn(tracing::Instrument::instrument(
             async move {
                 let model = req.model.clone();
                 let started = std::time::Instant::now();
-                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
-                let fut = run(http, url, key, req, cache, tx.clone());
-                let final_ev = tokio::select! {
-                    r = fut => match r {
-                        Ok(msg) => AssistantEvent::Done { message: msg },
-                        Err(e) => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Error, e) },
-                    },
-                    _ = cancel.cancelled() => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Aborted, "aborted") },
+                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), api = %api, "request sent");
+                let mut attempt = (api, req.reasoning);
+                let fut = run(ctx, req, api, tx.clone(), &mut attempt);
+                let r = tokio::select! {
+                    r = fut => Some(r),
+                    _ = cancel.cancelled() => None,
+                };
+                let final_ev = match r {
+                    Some(Ok(msg)) => AssistantEvent::Done { message: msg },
+                    Some(Err(e)) => {
+                        // 失败的消息也带上最后一次尝试的 API / 推理强度，便于上层如实报告
+                        let mut m = AssistantMessage::failed(&model, StopReason::Error, e);
+                        m.api = Some(attempt.0);
+                        m.reasoning_effort = attempt.1;
+                        AssistantEvent::Error { message: m }
+                    }
+                    None => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Aborted, "aborted") },
                 };
                 let latency_ms = started.elapsed().as_millis() as u64;
                 match &final_ev {
                     AssistantEvent::Done { message: m } => {
-                        tracing::info!(latency_ms, stop_reason = ?m.stop_reason, input_tokens = m.usage.input, output_tokens = m.usage.output, cached_tokens = m.usage.cache_read, tool_calls = m.tool_calls().len(), "llm call finished")
+                        tracing::info!(latency_ms, stop_reason = ?m.stop_reason, input_tokens = m.usage.input, output_tokens = m.usage.output, reasoning_tokens = m.usage.reasoning, cached_tokens = m.usage.cache_read, tool_calls = m.tool_calls().len(), "llm call finished")
                     }
-                    AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => tracing::info!(latency_ms, "llm call aborted"),
+                    AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => {
+                        tracing::info!(latency_ms, "llm call aborted")
+                    }
                     AssistantEvent::Error { message: m } => tracing::error!(latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
                     _ => {}
                 }
@@ -173,33 +207,109 @@ struct PartialCall {
     args: String,
 }
 
-async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, cache: EffortCache, tx: mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
+struct CallCtx {
+    http: reqwest::Client,
+    base_url: String,
+    key: String,
+    effort_cache: EffortCache,
+    api_cache: Arc<Mutex<HashMap<String, Api>>>,
+}
+
+/// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。
+async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
     let requested = req.reasoning;
-    let mut attempt = 0;
+    let auto = req.api == Api::Auto;
+    let mut retries = 0;
+    let mut tried: Vec<(Api, Option<ThinkingLevel>)> = vec![];
     let resp = loop {
-        attempt += 1;
-        req.reasoning = effective_effort(&cache, &req.model, requested);
-        let resp = http.post(&url).bearer_auth(&key).json(&build_body(&req)).send().await.map_err(|e| e.to_string())?;
+        let key = (req.model.clone(), api, !req.tools.is_empty());
+        req.reasoning = effective_effort(&ctx.effort_cache, &key, requested);
+        tried.push((api, req.reasoning));
+        *attempt = (api, req.reasoning);
+        let (url, body) = match api {
+            Api::Responses => (format!("{}/responses", ctx.base_url), crate::responses::build_body(&req)),
+            _ => (format!("{}/chat/completions", ctx.base_url), build_body(&req)),
+        };
+        let record = |api: Api, effort: Option<ThinkingLevel>| {
+            let span = tracing::Span::current();
+            span.record("api", api.as_str());
+            span.record("reasoning_effort", effort.map(|l| l.as_str()).unwrap_or("-"));
+        };
+        let resp = ctx.http.post(&url).bearer_auth(&ctx.key).json(&body).send().await.map_err(|e| redact(&e.to_string()))?;
         if resp.status().is_success() {
-            tracing::Span::current().record("reasoning_effort", req.reasoning.map(|l| l.as_str()).unwrap_or("-"));
+            record(api, req.reasoning);
             break resp;
         }
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        // 模型不支持所选 reasoning_effort：从错误里学到能力，缓存后降级重试一次（此时还没有发出任何流事件）
-        if status == reqwest::StatusCode::BAD_REQUEST && attempt <= 2 && req.reasoning.is_some() {
-            if let Some(learned) = parse_effort_error(&body) {
-                cache.lock().unwrap().insert(req.model.clone(), learned.clone());
-                let next = effective_effort(&cache, &req.model, requested);
-                tracing::warn!(model = %req.model, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("(omitted)"), supported = ?learned, "model does not support requested reasoning_effort; adjusting and retrying");
-                continue;
+        let text = resp.text().await.unwrap_or_default();
+        let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {text}", api.as_str()));
+        if status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
+            record(api, req.reasoning);
+            return Err(err_msg);
+        }
+        let Some(kind) = parse_effort_error(&text) else {
+            record(api, req.reasoning);
+            return Err(err_msg);
+        };
+        retries += 1;
+        match kind {
+            // auto：直接换 Responses（不再在 Chat 上试 none / 省略，避免白白浪费请求）
+            EffortError::ToolsConflict if auto && api == Api::Chat => {
+                ctx.api_cache.lock().unwrap().insert(req.model.clone(), Api::Responses);
+                tracing::warn!(model = %req.model, "chat completions rejects tools + reasoning_effort for this model; switching to responses API");
+                api = Api::Responses;
+            }
+            // 已经没发推理强度了还报这个错（gpt-6.x）：再在 Chat 上重试没有意义
+            EffortError::ToolsConflict if req.reasoning.is_none() => {
+                record(api, req.reasoning);
+                return Err(format!("{err_msg} (hint: this model needs api=responses for function tools)"));
+            }
+            EffortError::ToolsConflict => {
+                ctx.effort_cache.lock().unwrap().insert(key, None);
+                tracing::warn!(model = %req.model, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "chat completions rejects tools + reasoning_effort; retrying without it (use api=responses to keep reasoning effort)");
+            }
+            EffortError::Unsupported => {
+                ctx.effort_cache.lock().unwrap().insert(key, None);
+                tracing::warn!(model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "model does not accept reasoning effort; retrying without it");
+            }
+            EffortError::Levels(levels) => {
+                let next = requested.and_then(|r| r.nearest_in(&levels));
+                tracing::warn!(model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("-"), supported = ?levels, "reasoning effort not supported by model; using nearest");
+                ctx.effort_cache.lock().unwrap().insert(key, Some(levels));
             }
         }
-        tracing::Span::current().record("reasoning_effort", req.reasoning.map(|l| l.as_str()).unwrap_or("-"));
-        return Err(redact(&format!("OpenAI HTTP {status}: {body}")));
+        // 下一次请求和已经失败过的一样：不重发，直接报错
+        let next_key = (req.model.clone(), api, !req.tools.is_empty());
+        if tried.contains(&(api, effective_effort(&ctx.effort_cache, &next_key, requested))) {
+            record(api, req.reasoning);
+            return Err(err_msg);
+        }
     };
+    let mut msg = match api {
+        Api::Responses => crate::responses::parse_stream(resp, &req.model, &tx).await?,
+        _ => parse_chat(resp, &req.model, &tx).await?,
+    };
+    msg.api = Some(api);
+    msg.reasoning_effort = req.reasoning;
+    Ok(msg)
+}
+
+/// 按行切 SSE，只取 `data: ` 行。按字节切分 LF，避免多字节 UTF-8 字符跨 chunk 被截断。
+pub(crate) fn drain_sse_lines(buf: &mut Vec<u8>) -> Vec<String> {
+    let mut out = vec![];
+    while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
+        let line = String::from_utf8_lossy(&buf[..pos]).trim_end_matches('\r').to_string();
+        buf.drain(..=pos);
+        if let Some(d) = line.strip_prefix("data:") {
+            out.push(d.trim_start().to_string());
+        }
+    }
+    out
+}
+
+async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, String> {
     let _ = tx.send(AssistantEvent::Start).await;
-    let mut msg = AssistantMessage::empty(&req.model);
+    let mut msg = AssistantMessage::empty(model);
     let mut text = String::new();
     let mut calls: BTreeMap<u64, PartialCall> = BTreeMap::new();
     let mut finish: Option<String> = None;
@@ -211,11 +321,15 @@ async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, 
         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
             let line = String::from_utf8_lossy(&buf[..pos]).trim_end_matches('\r').to_string();
             buf.drain(..=pos);
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             if data == "[DONE]" {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+            let Ok(v) = serde_json::from_str::<Value>(data) else {
+                continue;
+            };
             if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
                 return Err(redact(&format!("OpenAI stream error: {e}")));
             }
@@ -224,8 +338,11 @@ async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, 
                 msg.usage.input = u["prompt_tokens"].as_u64().unwrap_or(0);
                 msg.usage.output = u["completion_tokens"].as_u64().unwrap_or(0);
                 msg.usage.total_tokens = u["total_tokens"].as_u64().unwrap_or(0);
+                msg.usage.reasoning = u["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
             }
-            let Some(choice) = v["choices"].get(0) else { continue };
+            let Some(choice) = v["choices"].get(0) else {
+                continue;
+            };
             if let Some(f) = choice["finish_reason"].as_str() {
                 finish = Some(f.to_string());
             }
@@ -280,7 +397,7 @@ async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, 
 }
 
 /// 去掉错误信息里任何形似 API key 的片段（OpenAI 401 会回显部分 key）。
-fn redact(s: &str) -> String {
+pub(crate) fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
         .map(|w| {
             if w.trim_start_matches(|c: char| !c.is_alphanumeric()).starts_with("sk-") {
@@ -297,15 +414,34 @@ mod tests {
     use super::*;
     #[test]
     fn parses_effort_errors() {
+        use EffortError::*;
         let e = r#"{"error":{"message":"Unsupported value: 'reasoning_effort' does not support 'minimal' with this model. Supported values are: 'none', 'low', 'medium', 'high', and 'xhigh'."}}"#;
-        assert_eq!(parse_effort_error(e), Some(Some(vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Xhigh])));
-        assert_eq!(parse_effort_error("Unrecognized request argument supplied: reasoning_effort"), Some(None));
-        assert_eq!(parse_effort_error("Function tools with reasoning_effort are not supported for x in /v1/chat/completions"), Some(None));
+        assert_eq!(parse_effort_error(e), Some(Levels(vec![ThinkingLevel::Off, ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Xhigh])));
+        let r = r#"{"error":{"message":"Unsupported value: 'reasoning.effort' does not support 'none' with this model. Supported values are: 'low', 'medium', 'high', and 'xhigh'.","param":"reasoning.effort"}}"#;
+        assert_eq!(parse_effort_error(r), Some(Levels(vec![ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Xhigh])));
+        assert_eq!(parse_effort_error("Unrecognized request argument supplied: reasoning_effort"), Some(Unsupported));
+        assert_eq!(parse_effort_error("Unsupported parameter: 'reasoning.effort' is not supported with this model."), Some(Unsupported));
+        assert_eq!(
+            parse_effort_error("Function tools with reasoning_effort are not supported for gpt-6-astra in /v1/chat/completions. Please use /v1/responses or set reasoning_effort to 'none'"),
+            Some(ToolsConflict)
+        );
         assert_eq!(parse_effort_error("model not found"), None);
+    }
+
+    #[test]
+    fn effort_cache_is_keyed_by_api_and_tools() {
         let cache: EffortCache = Default::default();
-        cache.lock().unwrap().insert("m".into(), Some(vec![ThinkingLevel::Off, ThinkingLevel::Low]));
-        assert_eq!(effective_effort(&cache, "m", Some(ThinkingLevel::Minimal)), Some(ThinkingLevel::Low));
-        assert_eq!(effective_effort(&cache, "x", Some(ThinkingLevel::Minimal)), Some(ThinkingLevel::Minimal));
+        let with_tools = ("m".to_string(), Api::Chat, true);
+        let no_tools = ("m".to_string(), Api::Chat, false);
+        let responses = ("m".to_string(), Api::Responses, true);
+        cache.lock().unwrap().insert(with_tools.clone(), None);
+        assert_eq!(effective_effort(&cache, &with_tools, Some(ThinkingLevel::High)), None);
+        // 学到的“带工具不能发推理强度”不能影响不带工具的会话和 Responses
+        assert_eq!(effective_effort(&cache, &no_tools, Some(ThinkingLevel::High)), Some(ThinkingLevel::High));
+        assert_eq!(effective_effort(&cache, &responses, Some(ThinkingLevel::High)), Some(ThinkingLevel::High));
+        cache.lock().unwrap().insert(no_tools.clone(), Some(vec![ThinkingLevel::Off, ThinkingLevel::Low]));
+        assert_eq!(effective_effort(&cache, &no_tools, Some(ThinkingLevel::Minimal)), Some(ThinkingLevel::Low));
+        assert_eq!(effective_effort(&cache, &no_tools, None), None);
     }
 
     #[test]

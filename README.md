@@ -7,7 +7,7 @@
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.2。目前接入了 OpenAI Chat Completions。Claude（Anthropic）、Responses API、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.3。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## 安装
 
@@ -41,6 +41,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 {
   "defaultModel": "gpt-4.1-mini",
   "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
+  "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
   "profiles": {
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
@@ -48,6 +49,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "model": "gpt-5.4-mini",                 // profile 默认模型
       "allowedModels": ["gpt-5*", "gpt-4.1*"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制
       "reasoningEffort": "medium",             // 可选：none|minimal|low|medium|high|xhigh
+      "api": "auto",                           // 可选：auto|chat|responses，覆盖 defaultApi
+      "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
+      "tokenBudget": 300000,                   // 可选：整次运行的 token 预算，用完后禁止再调工具、要求直接给结论
       "systemPrompt": null,                    // 替换默认编码前言
       "appendSystemPrompt": "...",             // 追加内容
       "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
@@ -68,6 +72,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--provider openai|faux`
   - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
   - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh`
+  - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
   - `--log-level`、`--log-dir`、`--log-format`
 
@@ -88,8 +93,15 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 - 推理强度：请求/命令行的 `reasoningEffort` > profile 的 `reasoningEffort` > `defaultReasoningEffort`；都没有就不发送
 - 模型不支持推理强度时，参数会被忽略，并记一条 warn 日志；模型不支持所选档位时（比如 gpt-5 没有 `none`、gpt-5.1 没有 `minimal`），换成最接近的档位并记 warn
 - 内置能力表之外的新模型：先原样发送；如果 OpenAI 返回 400 说明不支持，会从错误信息里学到可选档位，缓存下来并自动重试（最多两次）
-- 已知限制（2026-10 实测）：目前走的是 Chat Completions，**gpt-5.4 及以后的模型不允许“函数工具 + reasoning_effort”**，所以这些模型会自动不发送 reasoning_effort（记 warn）；gpt-6.x 在 Chat Completions 上无法和工具一起用，需要等 Responses API（M1）。gpt-5 / gpt-5.1 / gpt-5.2 / o3 的推理强度可正常生效
-- 日志里 `llm` span 的 `reasoning_effort` 是实际发送的值（`-` 表示未发送）
+- 不支持的档位会被缓存，缓存按（模型, API, 是否带工具）区分，所以带工具会话里的降级不会影响不带工具的会话
+
+### 用哪个 API（`api`）
+
+- `auto`（默认）：gpt-5.4 及以后、gpt-6.x、o 系列走 **Responses API**（`POST /v1/responses`，流式 SSE，`function_call` / `function_call_output`，`reasoning.effort`，usage 含 reasoning tokens），其它模型走 Chat Completions
+- 优先级：请求/命令行的 `api` > profile 的 `api` > `defaultApi`
+- 2026-10 实测：gpt-5.4 及以后在 Chat Completions 上不允许“函数工具 + reasoning_effort”，gpt-6.x 在 Chat Completions 上带工具完全不可用。`auto` 下遇到这种错误会自动切到 Responses 并记住；显式 `api: "chat"` 时只会去掉 reasoning_effort 重试一次（记 warn），仍然失败就直接报错并提示改用 `responses`
+- `run --json` 输出 `api`、`reasoningEffort`（**实际生效**的值）、`requestedReasoningEffort`（请求的值）、`usage`（最后一次调用）和 `totalUsage`（整次运行累计，含 `reasoning`）
+- 日志里 `llm` span 的 `api` / `reasoning_effort` 是实际发送的值（`-` 表示未发送）
 
 ## 日志
 
@@ -112,7 +124,7 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 | `GET /v1/health` | 健康检查（无需鉴权） |
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`） |
 | `GET /v1/models?profile=&all=` | 实时模型列表（缓存 10 分钟），每项带 `reasoning` / `reasoningEfforts`；`profile` 只返回该 profile 允许的 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, cwd, model, reasoningEffort, tools}` |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, cwd, model, api, reasoningEffort, requestedReasoningEffort, tools}` |
 | `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up"}`，返回 202 |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |

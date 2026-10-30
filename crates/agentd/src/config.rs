@@ -18,6 +18,15 @@ pub struct Profile {
     /// 默认推理强度：none | minimal | low | medium | high | xhigh；不填则不发送
     #[serde(default)]
     pub reasoning_effort: Option<agent_ai::ThinkingLevel>,
+    /// OpenAI API：auto | chat | responses；不填用全局 defaultApi
+    #[serde(default)]
+    pub api: Option<agent_ai::Api>,
+    /// 单次模型调用的输出 token 上限（含推理 token）
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    /// 单次运行（一个 prompt）的总 token 预算；达到后让模型不带工具给出最终答复
+    #[serde(default)]
+    pub token_budget: Option<u64>,
     /// 工具白名单：工具名或 `preset:<name>`；默认是 pi 的编码工具集
     #[serde(default = "default_tools")]
     pub tools: Vec<String>,
@@ -65,6 +74,9 @@ pub struct Config {
     /// 所有 profile 的默认推理强度（profile 自己的 reasoningEffort 优先）
     #[serde(default)]
     pub default_reasoning_effort: Option<agent_ai::ThinkingLevel>,
+    /// 默认 OpenAI API：auto（默认，gpt-5.4+/gpt-6.x/o 系列走 Responses）| chat | responses
+    #[serde(default)]
+    pub default_api: agent_ai::Api,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -94,6 +106,9 @@ impl Config {
                 model: None,
                 allowed_models: None,
                 reasoning_effort: None,
+                api: None,
+                max_output_tokens: None,
+                token_budget: None,
                 tools: default_tools(),
                 workspace_roots: vec![workspace],
                 load_context_files: true,
@@ -103,7 +118,13 @@ impl Config {
                 max_turns: 30,
             },
         );
-        Config { default_model: model, default_reasoning_effort: None, profiles, clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }] }
+        Config {
+            default_model: model,
+            default_reasoning_effort: None,
+            default_api: Default::default(),
+            profiles,
+            clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }],
+        }
     }
 
     /// profile 是否允许使用该模型。

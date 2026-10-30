@@ -17,6 +17,10 @@ pub struct SessionHandle {
     pub profile: String,
     pub cwd: PathBuf,
     pub agent: Arc<Agent>,
+    /// 调用方/配置请求的推理强度（解析前）
+    pub requested_effort: Option<ThinkingLevel>,
+    /// 最近一次成功调用实际使用的 (API, 推理强度)
+    last_call: Mutex<Option<(agent_ai::Api, Option<ThinkingLevel>)>>,
     store: Mutex<Option<Session>>,
 }
 
@@ -58,13 +62,17 @@ impl SessionHandle {
             let started = std::time::Instant::now();
             tracing::info!(prompt_chars = msg_len, "run started");
             if let Some(new) = this.agent.prompt(msg).await {
-                let (mut input, mut output, mut tools) = (0u64, 0u64, 0usize);
+                let (mut input, mut output, mut reasoning_tokens, mut tools) = (0u64, 0u64, 0u64, 0usize);
                 let mut stop = None;
                 for m in &new {
                     match m {
                         Message::Assistant(a) => {
                             input += a.usage.input;
                             output += a.usage.output;
+                            reasoning_tokens += a.usage.reasoning;
+                            if let Some(api) = a.api {
+                                *this.last_call.lock().unwrap() = Some((api, a.reasoning_effort));
+                            }
                             stop = Some(a.stop_reason);
                             if let Some(e) = &a.error_message {
                                 tracing::warn!(error = %e, "assistant message ended with error");
@@ -74,7 +82,7 @@ impl SessionHandle {
                         _ => {}
                     }
                 }
-                tracing::info!(latency_ms = started.elapsed().as_millis() as u64, messages = new.len(), tool_calls = tools, input_tokens = input, output_tokens = output, stop_reason = ?stop, "run finished");
+                tracing::info!(latency_ms = started.elapsed().as_millis() as u64, messages = new.len(), tool_calls = tools, input_tokens = input, output_tokens = output, reasoning_tokens, stop_reason = ?stop, "run finished");
                 if let Some(store) = this.store.lock().unwrap().as_mut() {
                     for m in new {
                         if let Err(e) = store.append_message(m) {
@@ -86,6 +94,19 @@ impl SessionHandle {
         }, span)
         .pipe_spawn();
         Disposition::Started
+    }
+
+    /// 实际生效的推理强度：有调用记录时取最近一次真正发送的值，否则取会话解析后的值。
+    pub fn effective_effort(&self) -> Option<ThinkingLevel> {
+        match *self.last_call.lock().unwrap() {
+            Some((_, e)) => e,
+            None => self.agent.config.reasoning,
+        }
+    }
+
+    /// 最近一次调用实际使用的 API（还没调用过时为 None）。
+    pub fn effective_api(&self) -> Option<agent_ai::Api> {
+        self.last_call.lock().unwrap().map(|(a, _)| a)
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
@@ -106,6 +127,8 @@ pub struct SessionRequest {
     pub model: Option<String>,
     /// 推理强度 none|minimal|low|medium|high|xhigh；模型不支持时忽略并记 warn 日志
     pub reasoning_effort: Option<ThinkingLevel>,
+    /// OpenAI API：auto | chat | responses（覆盖 profile.api）
+    pub api: Option<agent_ai::Api>,
     /// 只能从 profile 已启用的工具里再收窄
     pub tools: Option<Vec<String>>,
     #[serde(default)]
@@ -230,14 +253,17 @@ impl Hub {
         }
 
         let model = match req.model {
-            Some(m) if !Config::model_allowed(p, &m) => bail!("model '{m}' is not allowed in profile '{profile_name}' (allowedModels)"),
+            Some(m) if !Config::model_allowed(p, &m) => {
+                bail!("model '{m}' is not allowed in profile '{profile_name}' (allowedModels)")
+            }
             Some(m) => m,
             None => p.model.clone().unwrap_or_else(|| self.config.default_model.clone()),
         };
         if !Config::model_allowed(p, &model) {
             bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
         }
-        let reasoning = resolve_effort(&model, req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort));
+        let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
+        let reasoning = resolve_effort(&model, requested_effort);
         let config = LoopConfig {
             provider: self.provider.clone(),
             model,
@@ -251,12 +277,24 @@ impl Hub {
             })),
             tools,
             reasoning,
+            api: req.api.or(p.api).unwrap_or(self.config.default_api),
             steering: Default::default(),
             follow_up: Default::default(),
             max_turns: p.max_turns,
+            max_tokens: p.max_output_tokens,
+            token_budget: p.token_budget,
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
-        let h = Arc::new(SessionHandle { id: id.clone(), owner: client.name.clone(), profile: profile_name, cwd, agent: Agent::new(config, vec![]), store: Mutex::new(store) });
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        let h = Arc::new(SessionHandle {
+            id: id.clone(),
+            owner: client.name.clone(),
+            profile: profile_name,
+            cwd,
+            agent: Agent::new(config, vec![]),
+            requested_effort,
+            last_call: Mutex::new(None),
+            store: Mutex::new(store),
+        });
         self.sessions.lock().unwrap().insert(id, h.clone());
         Ok(h)
     }
@@ -279,6 +317,17 @@ impl Hub {
             }
         };
         Ok(if all || self.provider.id() != "openai" { models } else { models.into_iter().filter(|m| agent_ai::models::is_chat_model(&m.id) && !agent_ai::models::is_snapshot(&m.id)).collect() })
+    }
+
+    /// 会话预计使用的 API（auto 按模型解析；非 OpenAI provider 返回 "n/a"）。运行时若被迫切换，以消息里的 `api` 为准。
+    pub fn effective_api(&self, cfg: &LoopConfig) -> &'static str {
+        if self.provider.id() != "openai" {
+            return "n/a";
+        }
+        match cfg.api {
+            agent_ai::Api::Auto => agent_ai::default_api(&cfg.model).as_str(),
+            a => a.as_str(),
+        }
     }
 
     pub fn provider_id(&self) -> &str {

@@ -78,7 +78,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `ai/src/types.ts` | `agent-ai/src/types.rs`：`Message`、`Content`、`AssistantMessage`、`StopReason`、`AssistantEvent`，serde 字段名与 pi 的 JSON 一致 | ✅ |
 | `ai/src/models.ts` + `api/*` | `agent-ai/src/provider.rs`：`Provider` trait（`stream(req, cancel) -> EventStream`，**不返回错误**）和 `ProviderRegistry` | ✅ |
 | `api/openai-completions.ts` | `agent-ai/src/openai.rs`：Chat Completions 流式调用（按字节缓冲 SSE，累积 tool call 增量，读取 usage 和 cached_tokens，处理流中途的 error，流没有 finish_reason 就提前结束时判为错误，错误信息里的 key 会被打码，支持取消） | ✅ 已用 gpt-4.1-mini 实测 |
-| `api/openai-responses.ts` | `agent-ai/src/openai_responses.rs` | M1 |
+| `api/openai-responses.ts` | `agent-ai/src/responses.rs`：Responses API 流式调用（`POST /v1/responses`，`store:false`；输入项 message / `function_call` / `function_call_output`；处理 `output_text.delta`、`function_call_arguments.delta/done`、`output_item.added/done`、`response.completed/incomplete/failed`、`error`；usage 读取 cached_tokens 和 reasoning_tokens）。`openai.rs` 按 `api: auto\|chat\|responses` 分派 | ✅ v0.3，已用 gpt-5.4、gpt-6-astra 实测 |
 | `api/anthropic-messages.ts` | `agent-ai/src/anthropic.rs`：Claude（Anthropic Messages API 流式：`message_start`、`content_block_start/delta/stop`、`message_delta`、`message_stop`，其中 `input_json_delta` 用来累积工具参数，`thinking` 块对应 Thinking），实现同一个 `Provider` trait。每个 profile 用 `"provider": "openai" \| "anthropic"` 加 `model` 选择；key 只从 `ANTHROPIC_API_KEY` 环境变量读取。目前没有 Anthropic key，只做 faux 和单测（离线校验请求体构建与 SSE 解析） | 计划（M1.5） |
 | `providers/faux.ts` | `agent-ai/src/faux.rs`：离线回显；输入 `/tool <name> <json>` 会触发一次工具调用 | ✅ |
 | `agent/src/agent-loop.ts` | `agent-core/src/agent_loop.rs`：`run_loop` 双层循环、steering 和 follow-up 队列、串行或并行执行工具、`length` 截断处理 | ✅（已有单测） |
@@ -202,7 +202,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - **Span 层级**（JSON 日志的每一行都带完整的 span 列表）：
   - `http{request_id, method, path, bot}`：request_id 沿用调用方的 `X-Request-Id`，否则自动生成，并回写到响应头；
   - 其下是 `session_run{session_id, bot, profile, model, reasoning_effort}`；
-  - 再往下是 `llm{provider, model, reasoning_effort}`（实际发送的值）和 `tool{tool, tool_call_id}`。
+  - 再往下是 `llm{provider, model, api, reasoning_effort}`（实际发送的值）和 `tool{tool, tool_call_id}`。
 - **关键事件**：
   - 请求结束（status、latency_ms，4xx 记为 warn，5xx 记为 error）；
   - `session created`（cwd、model、tools）；
@@ -224,7 +224,9 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - `ThinkingLevel`：`none`（别名 `off`）/ `minimal` / `low` / `medium` / `high` / `xhigh`，对应 OpenAI 的 `reasoning_effort`。
 - 优先级：会话请求（HTTP `model`/`reasoningEffort`、CLI `--model`/`--reasoning-effort`）> profile > 全局默认；`allowedModels` 支持 `*` 通配。
 - `agent-ai/src/models.rs` 有一张静态能力表（2026-10 实测）：gpt-4.x/gpt-4o 不支持；gpt-5/-mini/-nano 为 minimal..high；gpt-5.1 为 none/low/medium/high；gpt-5.2 及以后加 xhigh；o3 为 low..xhigh；chat-latest 只有 medium。建会话时按表处理：不支持就忽略并 warn，档位不支持就取最接近的并 warn。
-- 实测：gpt-5.4 及以后在 Chat Completions 上拒绝“函数工具 + reasoning_effort”（只能 none），gpt-6.x 带工具时完全不可用（要求 /v1/responses）。前者自动降级为不发送；后者等 M1 的 Responses API。
+- 实测：gpt-5.4 及以后在 Chat Completions 上拒绝“函数工具 + reasoning_effort”（只能 none），gpt-6.x 带工具时完全不可用（要求 /v1/responses）。v0.3 起 `api: auto` 让这些模型默认走 Responses API；`auto` 下遇到该错误也会切换并缓存。推理强度降级缓存的键是（模型, API, 是否带工具），每次调用最多重试 2 次，且不会重复尝试同一组 (API, 强度)。
+- 实际生效的 API 和推理强度写在每条 `AssistantMessage` 的 `api` / `reasoningEffort` 上，`run --json`、会话响应和 RPC `get_state` 都报告实际值。
+- 预算：profile 的 `maxOutputTokens` 限制单次输出；`tokenBudget` 限制整次运行，超出后注入一条提示并做最后一次不带工具的调用，让模型直接给出结论。
 - 表外模型（如 gpt-6.x）先原样发送；OpenAI 返回 400 时 `openai.rs` 解析错误（`Unrecognized request argument` → 不支持；`Supported values are: ...` → 可选档位），按模型缓存，warn 后自动重试一次。
 
 ## (e) MVP 里程碑
@@ -232,7 +234,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0（已完成，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；会话 cwd 与 workspaceRoots 校验；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件，越权 cwd 和工具被拒，401/404 隔离） |
-| **M1：编码能力补齐** | OpenAI Responses API（reasoning 和 cache）；`grep`、`find`（遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
+| **M1：编码能力补齐** | ✅ OpenAI Responses API（v0.3）；`grep`、`find`（遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
 | **M1.5：Claude** | `agent-ai/src/anthropic.rs` 接入 Anthropic Messages API；profile 增加 `provider` 字段；Hub 持有多个 provider，按 profile 分派 | 先用离线单测覆盖 SSE 解析和请求体，有 key 后再做端到端测试 |
 | **M2：会话** | 恢复会话（`sessionId` 重开后加载 JSONL）；fork 和分支切换；`compaction`（自动压缩和 `compact` 命令）；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
 | **M3：安全与治理** | `beforeToolCall` 审批钩子（profile 可设 bash 需要调用方确认，确认通过 SSE/RPC 往返）；bash 命令允许和拒绝规则；每个 bot 的限流和并发上限；审计日志；内建 TLS；keyring | 只读 profile 无法写文件，也无法执行命令；审批流程可用 |

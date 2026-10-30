@@ -29,8 +29,19 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
     let appender = rolling::Builder::new().rotation(rolling::Rotation::DAILY).filename_prefix("sub-bot").filename_suffix("log").max_log_files(14).build(&dir)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
     let file = fmt::layer().with_writer(writer).with_ansi(false);
-    let file = if format == "text" { file.boxed() } else { file.json().with_current_span(true).with_span_list(true).boxed() };
+    // text 文件层用独立的字段格式化类型：否则它和 stderr 层共用同一个 span 扩展，`span.record` 的字段会被追加两次
+    let file = if format == "text" { file.fmt_fields(FileFields::default()).boxed() } else { file.json().with_current_span(true).with_span_list(true).boxed() };
     tracing_subscriber::registry().with(stderr).with(file.with_filter(filter())).init();
     tracing::debug!(log_dir = %dir.display(), "file logging enabled");
     Ok(Some(guard))
+}
+
+/// 与 DefaultFields 输出相同，但类型不同，使每个 fmt 层拥有各自的 span 字段缓存。
+#[derive(Default)]
+struct FileFields(fmt::format::DefaultFields);
+
+impl<'w> fmt::FormatFields<'w> for FileFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(&self, writer: fmt::format::Writer<'w>, fields: R) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
 }

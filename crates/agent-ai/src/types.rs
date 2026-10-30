@@ -40,6 +40,9 @@ pub struct Usage {
     pub output: u64,
     pub cache_read: u64,
     pub total_tokens: u64,
+    /// 推理 token（包含在 output 里）
+    #[serde(default)]
+    pub reasoning: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -52,11 +55,17 @@ pub struct AssistantMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub timestamp: i64,
+    /// 实际使用的 API（chat / responses）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<Api>,
+    /// 实际发送给模型的推理强度（None = 未发送）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ThinkingLevel>,
 }
 
 impl AssistantMessage {
     pub fn empty(model: &str) -> Self {
-        Self { content: vec![], model: model.into(), stop_reason: StopReason::Stop, usage: Usage::default(), error_message: None, timestamp: now_ms() }
+        Self { content: vec![], model: model.into(), stop_reason: StopReason::Stop, usage: Usage::default(), error_message: None, timestamp: now_ms(), api: None, reasoning_effort: None }
     }
     pub fn failed(model: &str, reason: StopReason, msg: impl Into<String>) -> Self {
         Self { stop_reason: reason, error_message: Some(msg.into()), ..Self::empty(model) }
@@ -100,6 +109,44 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+}
+
+/// OpenAI 的 API 选择：`auto` 按模型决定（gpt-5.4+、gpt-6.x、o 系列用 Responses，其余用 Chat Completions）。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    #[default]
+    Auto,
+    Chat,
+    Responses,
+}
+
+impl Api {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+impl std::fmt::Display for Api {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Api {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "chat" | "chat-completions" | "completions" => Ok(Self::Chat),
+            "responses" => Ok(Self::Responses),
+            o => Err(format!("unknown api '{o}' (auto|chat|responses)")),
+        }
+    }
 }
 
 /// 推理强度（OpenAI `reasoning_effort`）。`Off` 序列化为 `"none"`（也接受 `"off"`）。

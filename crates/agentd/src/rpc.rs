@@ -70,16 +70,24 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
         let cmd_name = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let resp = match serde_json::from_value::<Command>(parsed) {
             Err(e) => json!({"success": false, "error": e.to_string()}),
-            Ok(Command::Prompt { message }) => json!({"success": true, "data": {"disposition": session.submit(message, None)}}),
-            Ok(Command::Steer { message }) => json!({"success": true, "data": {"disposition": session.submit(message, Some("steer"))}}),
-            Ok(Command::FollowUp { message }) => json!({"success": true, "data": {"disposition": session.submit(message, Some("follow_up"))}}),
+            Ok(Command::Prompt { message }) => {
+                json!({"success": true, "data": {"disposition": session.submit(message, None)}})
+            }
+            Ok(Command::Steer { message }) => {
+                json!({"success": true, "data": {"disposition": session.submit(message, Some("steer"))}})
+            }
+            Ok(Command::FollowUp { message }) => {
+                json!({"success": true, "data": {"disposition": session.submit(message, Some("follow_up"))}})
+            }
             Ok(Command::Abort) => {
                 session.agent.abort();
                 json!({"success": true})
             }
-            Ok(Command::GetMessages) => json!({"success": true, "data": {"messages": session.agent.messages().await}}),
+            Ok(Command::GetMessages) => {
+                json!({"success": true, "data": {"messages": session.agent.messages().await}})
+            }
             Ok(Command::GetState) => {
-                json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "profile": session.profile}})
+                json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.effective_effort(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile}})
             }
             Ok(Command::GetAvailableModels) => match hub.list_models(false).await {
                 Ok(models) => json!({"success": true, "data": {"models": models}}),

@@ -13,6 +13,8 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub reasoning: Option<ThinkingLevel>,
+    /// 走哪个 OpenAI API（其它 provider 忽略）
+    pub api: Api,
     pub max_tokens: Option<u32>,
 }
 

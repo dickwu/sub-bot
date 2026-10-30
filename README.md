@@ -7,7 +7,7 @@
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.5.0。支持问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.6.0。支持 Unix socket、本地身份认证和 `ask` 客户端，以及问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Install
 
@@ -41,6 +41,53 @@ scripts/update-tap.sh 0.4.0 /path/to/homebrew-tap
 解压后进入顶层目录，把 `sub-bot` 放到 PATH 里，并保留 `sub-bot.example.json` 作为配置模板。macOS 首次运行如果被拦截，执行 `xattr -d com.apple.quarantine sub-bot`。
 
 从源码构建：`cargo build --release -p agentd`
+
+## Local bots without tokens
+
+本机 bot 可以通过 Unix domain socket 调用同一套 HTTP/SSE API，不必传 API token。Linux/macOS 的内核 peer credentials 提供 uid/gid/pid；`localClients` 将 uid 或用户名映射到已有 client，继续使用该 client 的 profile 权限和会话隔离。
+
+将这些字段合并到现有配置（`dev-bot` 必须已在 `clients` 中定义；原有 `profiles` / `tokenSha256` 配置不变）：
+
+```json
+{
+  "dataDir": "/home/peilin/.local/share/sub-bot",
+  "unixSocket": "/home/peilin/.local/share/sub-bot/sub-bot.sock",
+  "unixSocketMode": "0600",
+  "localClients": [
+    {"uid": 501, "client": "dev-bot"},
+    {"username": "peilin", "client": "dev-bot"}
+  ]
+}
+```
+
+- `serve --unix-socket [<path>]` 开启 UDS；省略路径时用 `<dataDir>/sub-bot.sock`。`--data-dir` 覆盖配置 `dataDir`；没有覆盖时使用系统数据目录下的 `sub-bot`。路径不展开 `~`（CLI 可以用 shell 展开的 `~/...`），相对路径相对于进程工作目录。
+- Linux 默认：`~/.local/share/sub-bot/sub-bot.sock`（遵循 XDG 数据目录）。macOS 默认：`~/Library/Application Support/sub-bot/sub-bot.sock`。
+- TCP 默认仍是 `127.0.0.1:7878`，与 UDS 共用 router；`--bind none` 只启用 UDS。
+- Socket 默认权限 `0600`；可设 `"unixSocketMode": "0660"` 供有权限的组使用（还要允许访问父目录，并管理好 socket 的组）。新建父目录默认 `0700`。启动只清理残留 socket，拒绝覆盖普通文件、符号链接或活动 listener；正常关闭时移除 socket。
+- 每个 `localClients` 条目只能选择 `uid`、`username`、`"any": true` 之一，按配置顺序首个匹配生效。`{"any": true, "client": "dev-bot"}` 信任所有能访问 socket 的本地 uid。没有匹配时仍需 Bearer token。
+- 可选 `"trustLoopback": {"client": "dev-bot"}`（默认关闭）允许 TCP loopback 无 token 请求，包括 `127.0.0.1`、`::1` 和 IPv4-mapped loopback。启用时启动日志会 WARN。**不信任 `X-Forwarded-For`**；代理连接按代理本身的 socket 地址判断，不能把不可信代理放在受信的 loopback 前面。
+- **Authorization header 始终优先**：有效 Bearer token 覆盖本地身份；错误 token 或其他认证格式返回 401，不回退到本地信任。引用不存在的 client 会导致启动失败。
+
+**安全取舍：任何以映射 uid 运行的进程，都能充当该 client；启用 `trustLoopback` 后，任何本地进程都能充当指定 client。** 这不是同一 uid 下不同 bot 的安全隔离。请保持 socket 和父目录权限严格，只映射可信用户；`any`/组共享会扩大信任范围。远程请求仍需要 token；不要把 loopback 信任当成反向代理后的远程认证。
+
+```bash
+# 使用配置中的身份映射；同时监听 TCP 和默认 UDS
+sub-bot --config sub-bot.json serve --unix-socket
+# 或仅监听 UDS
+sub-bot --config sub-bot.json serve --unix-socket --bind none
+
+curl --unix-socket ~/.local/share/sub-bot/sub-bot.sock http://localhost/v1/chat \
+  -H 'Content-Type: application/json' -d '{"message":"请检查当前项目","session":{"profile":"coder"}}'
+# macOS curl: --unix-socket "$HOME/Library/Application Support/sub-bot/sub-bot.sock"
+
+sub-bot ask "请检查当前项目"
+sub-bot ask --profile coder --async --json "运行测试并总结"
+printf '继续上次的任务' | sub-bot ask --session SESSION_ID -
+sub-bot ask --socket /path/to/sub-bot.sock "hello"
+sub-bot ask --url http://127.0.0.1:7878 --token-file /path/to/token "hello"
+```
+
+`ask` 不启动模型/provider，也不读取 OpenAI key。默认优先使用数据目录中的默认 socket（若存在），否则连接 `http://127.0.0.1:7878`；自定义 socket 路径或 TCP 端口需显式传 `--socket` / `--url`（二者互斥）。`--config` 中的 `dataDir` 和 `--data-dir` 同样影响默认 socket 查找。Token 可来自 `--token-file`，否则读取 `SUB_BOT_TOKEN`，不会打印。默认打印最终文本；`--async` 使用异步任务 API 并轮询到最终结果，`--json` 打印完整响应（异步时为最终 task 对象）。HTTP/模型失败或 abort 返回非零退出码。`--timeout <secs>`（默认 3600）限制从发出请求到取得最终结果的总等待时间，包括异步轮询和网络等待；超时返回明确错误和非零退出码，但不会自动取消服务端任务。
 
 ## 问题上报 (issues)
 
@@ -117,7 +164,7 @@ cp sub-bot.example.json sub-bot.json   # 编辑 profiles / clients
 sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 ```
 
-不带 `--config` 时会使用单 client、单 `default` profile 的模式，以 `--workspace`（默认当前目录）为根。启动时会在控制台打印一次随机生成的 token，仅适合本机调试。
+不带 `--config` 时会使用单 client、单 `default` profile 的模式，以 `--workspace`（默认当前目录）为根，并自动将服务进程的有效 uid 映射到 client `default`。运行 `sub-bot serve --unix-socket` 后，同一用户即可用 `sub-bot ask "hello"` 零 token 调用；同一 uid 下的所有进程都获得该身份。TCP 仍需通过 `SUB_BOT_TOKEN` 或 `serve --token` 指定调用凭据；省略时生成的随机 token 不会打印。显式配置文件不会自动添加 uid 映射，需要自行配置 `localClients` 或 `trustLoopback`。
 
 离线试用（不调用 OpenAI）：加上 `--provider faux`。
 
@@ -225,7 +272,7 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 
 ### HTTP + SSE
 
-所有 `/v1/*` 接口（除 `/v1/health` 外）都需要 `Authorization: Bearer <bot token>`。
+所有 `/v1/*` 接口（除 `/v1/health` 外）都需要认证：默认是 `Authorization: Bearer <bot token>`，也可以显式配置上面的 UDS uid 映射或 loopback 信任。
 
 | 方法和路径 | 说明 |
 |---|---|

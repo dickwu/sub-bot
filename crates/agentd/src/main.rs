@@ -10,19 +10,24 @@
 #[cfg(not(unix))]
 compile_error!("sub-bot only supports macOS and Linux");
 
+mod ask;
 mod config;
 mod http;
 mod hub;
 pub mod issues;
+mod local;
+#[cfg(test)]
+mod local_tests;
 mod logging;
 mod prompt;
 mod rpc;
+mod server;
 pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
 use clap::{Parser, Subcommand};
-use std::{net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "sub-bot", version, about = "General-purpose local coding-agent service for other bots")]
@@ -56,6 +61,9 @@ struct Cli {
     /// 无配置文件时 default profile 的 workspaceRoot
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
+    /// 数据目录；默认系统数据目录/sub-bot
+    #[arg(long, global = true)]
+    data_dir: Option<PathBuf>,
     /// 会话 JSONL 存放目录（按 client 分子目录）；不填则不持久化
     #[arg(long, global = true, env = "SUB_BOT_SESSION_DIR")]
     session_dir: Option<PathBuf>,
@@ -69,11 +77,17 @@ enum Cmd {
     /// 启动 HTTP 服务
     Serve {
         #[arg(long, default_value = "127.0.0.1:7878")]
-        bind: SocketAddr,
-        /// 仅在没有配置文件时使用：单一 client 的 token；不填则随机生成并打印到 stderr
+        bind: String,
+        /// 同时监听 Unix socket；不带路径时使用 <dataDir>/sub-bot.sock
+        #[cfg(unix)]
+        #[arg(long, num_args = 0..=1)]
+        unix_socket: Option<Option<PathBuf>>,
+        /// 仅在没有配置文件时使用：单一 client 的 token；不填则随机生成（不打印）
         #[arg(long, env = "SUB_BOT_TOKEN", hide_env_values = true)]
         token: Option<String>,
     },
+    /// 向已运行的服务提问（默认优先使用本地 Unix socket）
+    Ask(ask::Ask),
     /// stdio JSONL RPC 模式（父进程即调用方，无需 token）
     Rpc {
         #[arg(long)]
@@ -174,6 +188,27 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", config::sha256_hex(token));
         return Ok(());
     }
+    if let Cmd::Ask(ref args) = cli.cmd {
+        // Read only dataDir: ask must not load provider/webhook secret files or initialize a Hub.
+        let configured_dir = if cli.data_dir.is_none() {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct Location {
+                data_dir: Option<PathBuf>,
+            }
+            cli.config
+                .as_ref()
+                .map(|p| -> anyhow::Result<Option<PathBuf>> {
+                    let text = std::fs::read_to_string(p).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
+                    Ok(serde_json::from_str::<Location>(&text).map_err(|_| anyhow::anyhow!("invalid configuration"))?.data_dir)
+                })
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
+        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir)).await;
+    }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let message = info.payload().downcast_ref::<String>().map(String::as_str).or_else(|| info.payload().downcast_ref::<&str>().copied()).unwrap_or("panic");
@@ -195,13 +230,20 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Serve { token, .. } => token.clone().unwrap_or_else(http::random_token),
         _ => String::new(),
     };
-    let loaded = match load(&fallback_token) {
+    let mut loaded = match load(&fallback_token) {
         Ok(cfg) => cfg,
         Err(_) => {
             startup_failed(&cli).await;
             anyhow::bail!("configuration load failed (check config and secret files)");
         }
     };
+    if let Some(dir) = &cli.data_dir {
+        loaded.data_dir = Some(dir.clone());
+    }
+    #[cfg(unix)]
+    if let Cmd::Serve { unix_socket: Some(path), .. } = &cli.cmd {
+        loaded.unix_socket = Some(path.clone().unwrap_or_else(|| loaded.data_dir().join("sub-bot.sock")));
+    }
     install_reporter(&loaded, &cli);
     let new_hub = |cfg| hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref());
     // Construct before dispatch so initialization failures get the short synchronous alert path.
@@ -251,14 +293,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) => unreachable!(),
         Cmd::Serve { bind, .. } => {
+            let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
-                eprintln!("no --config: single client 'default', Authorization: Bearer {fallback_token}");
+                eprintln!("no --config: single client 'default'; same-user Unix socket access enabled (use --unix-socket); TCP requires a token");
             }
             let hub = prepared_hub.clone().expect("prepared hub");
             let reporter = hub.issues.clone();
-            eprintln!("sub-bot listening on http://{bind}");
             let result = http::serve(hub, bind).await;
             reporter.flush(std::time::Duration::from_secs(5)).await;
             result?;

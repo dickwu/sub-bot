@@ -33,7 +33,12 @@ pub fn random_token() -> String {
 /// Bearer token -> Client（每个 bot 一个 token），写入请求扩展供 handler 使用。
 async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     let span = tracing::Span::current();
-    let client = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).and_then(|t| st.hub.config.client_for_token(t)).cloned();
+    let client = if req.headers().contains_key("authorization") {
+        req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).and_then(|t| st.hub.config.client_for_token(t))
+    } else {
+        req.extensions().get::<axum::extract::ConnectInfo<crate::local::Peer>>().and_then(|peer| peer.0.client(&st.hub.config))
+    }
+    .cloned();
     match client {
         Some(c) => {
             span.record("bot", c.name.as_str());
@@ -96,33 +101,12 @@ fn router(st: AppState) -> Router {
     Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st)
 }
 
-pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let listener = tokio::net::TcpListener::bind(bind).await?;
-    let mut tasks = tokio::task::JoinSet::new();
-    if let Some(period) = hub.sweep_interval() {
-        let hub = hub.clone();
-        tasks.spawn(async move {
-            let mut interval = tokio::time::interval(period);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                hub.evict_idle(std::time::Instant::now());
-            }
-        });
-    }
-    // JoinSet 在退出（包括错误/取消）时终止后台清理任务。
-    axum::serve(listener, router(AppState { hub: hub.clone() }))
-        .with_graceful_shutdown(async move {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
-            }
-            tracing::info!("shutting down; aborting sessions");
-            hub.abort_all().await;
-        })
-        .await?;
-    Ok(())
+pub fn app(hub: Arc<Hub>) -> Router {
+    router(AppState { hub })
+}
+
+pub async fn serve(hub: Arc<Hub>, bind: Option<SocketAddr>) -> anyhow::Result<()> {
+    crate::server::serve(hub, bind).await
 }
 
 type ApiResult = Result<Response, (StatusCode, Json<serde_json::Value>)>;

@@ -200,8 +200,30 @@ impl std::fmt::Debug for Client {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LocalClient {
+    pub uid: Option<u32>,
+    pub username: Option<String>,
+    #[serde(default)]
+    pub any: bool,
+    pub client: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustLoopback {
+    pub client: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    pub data_dir: Option<PathBuf>,
+    pub unix_socket: Option<PathBuf>,
+    pub unix_socket_mode: Option<String>,
+    #[serde(default)]
+    pub local_clients: Vec<LocalClient>,
+    pub trust_loopback: Option<TrustLoopback>,
     #[serde(default)]
     pub alerts: AlertsConfig,
     #[serde(default = "default_session_idle_ttl")]
@@ -273,6 +295,22 @@ pub fn sha256_hex(s: &str) -> String {
 }
 
 impl Config {
+    pub fn default_data_dir() -> PathBuf {
+        directories::BaseDirs::new().expect("system data directory unavailable").data_local_dir().join("sub-bot")
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
+    }
+
+    pub fn socket_mode(&self) -> anyhow::Result<u32> {
+        let value = self.unix_socket_mode.as_deref().unwrap_or("0600");
+        anyhow::ensure!(!value.is_empty() && value.bytes().all(|b| matches!(b, b'0'..=b'7')), "unixSocketMode must be an octal permission string");
+        let mode = u32::from_str_radix(value, 8)?;
+        anyhow::ensure!(mode <= 0o777, "unixSocketMode must be <= 0777");
+        Ok(mode)
+    }
+
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
         let mut cfg: Self = serde_json::from_str(&std::fs::read_to_string(path)?)?;
         if let (Some(f), Some(dir)) = (&cfg.api_key_file, path.parent()) {
@@ -306,6 +344,17 @@ impl Config {
 
     /// 只做结构/注册表校验，不访问工作目录或网络。
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.socket_mode()?;
+        for mapping in &self.local_clients {
+            anyhow::ensure!(
+                usize::from(mapping.uid.is_some()) + usize::from(mapping.username.is_some()) + usize::from(mapping.any) == 1,
+                "localClients entry must select exactly one of uid, username, any:true"
+            );
+            anyhow::ensure!(self.clients.iter().any(|c| c.name == mapping.client), "localClients: unknown client '{}'", mapping.client);
+        }
+        if let Some(trust) = &self.trust_loopback {
+            anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
+        }
         let registry = agent_tools::ToolRegistry::with_builtins();
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
@@ -356,6 +405,20 @@ impl Config {
             },
         );
         Config {
+            data_dir: None,
+            unix_socket: None,
+            unix_socket_mode: None,
+            #[cfg(unix)]
+            local_clients: vec![LocalClient {
+                // SAFETY: geteuid has no arguments or memory preconditions.
+                uid: Some(unsafe { libc::geteuid() }),
+                username: None,
+                any: false,
+                client: "default".into(),
+            }],
+            #[cfg(not(unix))]
+            local_clients: vec![],
+            trust_loopback: None,
             alerts: AlertsConfig::default(),
             task_ttl_secs: default_session_idle_ttl(),
             webhook_max_attempts: default_webhook_attempts(),
@@ -464,6 +527,29 @@ mod tests {
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
         let cfg: Config = serde_json::from_str(r#"{"profiles":{},"sessionIdleTtlSecs":0,"chatSessionTtlSecs":5,"maxSessionsPerClient":0}"#).unwrap();
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (0, 5, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_trusts_only_own_effective_uid_over_unix() {
+        use crate::local::Peer;
+        let cfg = Config::fallback("faux".into(), "test-token", PathBuf::from("."));
+        // SAFETY: geteuid has no arguments or memory preconditions.
+        let uid = unsafe { libc::geteuid() };
+        assert_eq!(cfg.local_clients.len(), 1);
+        assert_eq!(cfg.local_clients[0].uid, Some(uid));
+        assert!(!cfg.local_clients[0].any);
+        assert!(cfg.local_clients[0].username.is_none());
+        assert_eq!(Peer::Unix { uid, gid: 0, pid: None }.client(&cfg).unwrap().name, "default");
+        assert!(Peer::Unix { uid: uid.wrapping_add(1), gid: 0, pid: None }.client(&cfg).is_none());
+        assert!(Peer::Tcp("127.0.0.1:1234".parse().unwrap()).client(&cfg).is_none());
+        cfg.validate().unwrap();
+        // Explicit configs remain opt-in, even with the same client definition.
+        let explicit: Config = serde_json::from_value(serde_json::json!({
+            "profiles": {}, "clients": [{"name": "default", "profiles": [], "tokenSha256": sha256_hex("test-token")}]
+        }))
+        .unwrap();
+        assert!(explicit.local_clients.is_empty());
     }
 
     #[test]

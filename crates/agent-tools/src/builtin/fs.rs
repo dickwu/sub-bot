@@ -3,10 +3,56 @@
 use agent_core::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
 
 const MAX_OUTPUT: usize = 50_000;
+const MAX_CAPTURE_BYTES: usize = 512 * 1024;
+const MAX_READ_BYTES: usize = 2 * 1024 * 1024;
+const MAX_LS_ENTRIES: usize = 1000;
+const MAX_TIMEOUT_SECS: u64 = 1800;
+
+/// 即使 execute future 被直接丢弃，也清理整个进程组；Child 的 kill_on_drop 负责回收直接子进程。
+struct ProcessGroup(u32);
+
+impl ProcessGroup {
+    fn kill(&self) {
+        // SAFETY: spawn 返回的 PID 是正数，且 process_group(0) 已将它设为 PGID。
+        unsafe { libc::killpg(self.0 as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[derive(Default)]
+struct CapturedOutput {
+    bytes: Vec<u8>,
+    dropped: u64,
+}
+
+impl CapturedOutput {
+    async fn drain(&mut self, mut pipe: impl AsyncRead + Unpin) -> std::io::Result<()> {
+        let mut buf = [0; 8192];
+        loop {
+            let n = pipe.read(&mut buf).await?;
+            if n == 0 {
+                return Ok(());
+            }
+            // 每个流保留一半预算，即使另一个流持续输出也不会饿死。
+            let keep = n.min(MAX_CAPTURE_BYTES / 2 - self.bytes.len());
+            self.bytes.extend_from_slice(&buf[..keep]);
+            self.dropped += (n - keep) as u64;
+        }
+    }
+}
 
 fn truncate(mut s: String) -> String {
     if s.len() > MAX_OUTPUT {
@@ -61,7 +107,18 @@ impl AgentTool for ReadTool {
     }
     async fn execute(&self, _id: &str, args: Value, _c: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let path = resolve_in_root(&self.root, arg_str(&args, "path")?)?;
-        Ok(ToolResult::text(truncate(tokio::fs::read_to_string(&path).await?)))
+        let file = tokio::fs::File::open(&path).await?;
+        let size = file.metadata().await?.len();
+        let mut bytes = Vec::new();
+        // 多读一个字节判断截断，也能应对 metadata 不准确或读取期间增长的文件。
+        file.take((MAX_READ_BYTES + 1) as u64).read_to_end(&mut bytes).await?;
+        let truncated = size > MAX_READ_BYTES as u64 || bytes.len() > MAX_READ_BYTES;
+        bytes.truncate(MAX_READ_BYTES);
+        let mut text = truncate(String::from_utf8_lossy(&bytes).into_owned());
+        if truncated {
+            text.push_str(&format!("\n[truncated: read at most {MAX_READ_BYTES} bytes]"));
+        }
+        Ok(ToolResult::text(text))
     }
 }
 
@@ -107,11 +164,19 @@ impl AgentTool for LsTool {
         let dir = resolve_in_root(&self.root, p)?;
         let mut rd = tokio::fs::read_dir(&dir).await?;
         let mut names = vec![];
+        let mut omitted = 0u64;
         while let Some(e) = rd.next_entry().await? {
+            if names.len() == MAX_LS_ENTRIES {
+                omitted += 1;
+                continue;
+            }
             let suffix = if e.file_type().await?.is_dir() { "/" } else { "" };
             names.push(format!("{}{}", e.file_name().to_string_lossy(), suffix));
         }
         names.sort();
+        if omitted > 0 {
+            names.push(format!("[truncated: {omitted} more entries]"));
+        }
         Ok(ToolResult::text(names.join("\n")))
     }
 }
@@ -132,22 +197,55 @@ impl AgentTool for BashTool {
     }
     async fn execute(&self, _id: &str, args: Value, cancel: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let cmd = arg_str(&args, "command")?;
-        let secs = args.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(120);
+        let secs = args.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(120).min(MAX_TIMEOUT_SECS);
         let mut c = tokio::process::Command::new("sh");
         c.args(["-c", cmd]);
-        c.current_dir(&self.root).kill_on_drop(true);
+        c.current_dir(&self.root).kill_on_drop(true).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        c.as_std_mut().process_group(0);
         // 不把 provider key / 服务 token 等密钥传给子进程
         self.env.apply(&mut c);
-        let out = tokio::select! {
-            r = tokio::time::timeout(std::time::Duration::from_secs(secs), c.output()) => r.context("command timed out")??,
-            _ = cancel.cancelled() => bail!("aborted"),
+        let mut child = c.spawn()?;
+        let group = ProcessGroup(child.id().context("missing child pid")?);
+        let stdout = child.stdout.take().context("missing stdout")?;
+        let stderr = child.stderr.take().context("missing stderr")?;
+        let mut out = CapturedOutput::default();
+        let mut err = CapturedOutput::default();
+        // 等待管道 EOF 也受 deadline 约束（shell 退出后后台进程可能仍持有管道）。
+        let completion = {
+            let collect = async { tokio::try_join!(child.wait(), out.drain(stdout), err.drain(stderr)) };
+            tokio::select! {
+                r = collect => Some(r),
+                _ = tokio::time::sleep(Duration::from_secs(secs)) => None,
+                _ = cancel.cancelled() => None,
+            }
         };
-        let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&out.stderr));
-        let code = out.status.code().unwrap_or(-1);
-        let mut r = ToolResult::text(truncate(format!("{text}\n[exit code {code}]")));
-        r.is_error = !out.status.success();
-        r.details = json!({"exitCode": code});
+        let (status, stopped) = match completion {
+            Some(Ok((status, (), ()))) => (status, None),
+            other => {
+                group.kill();
+                let status = child.wait().await?;
+                if let Some(Err(e)) = other {
+                    return Err(e.into());
+                }
+                let reason = if cancel.is_cancelled() { "[aborted]".to_string() } else { format!("[timed out after {secs}s]") };
+                (status, Some(reason))
+            }
+        };
+        let mut text = String::from_utf8_lossy(&out.bytes).into_owned();
+        text.push_str(&String::from_utf8_lossy(&err.bytes));
+        let code = status.code().unwrap_or(-1);
+        let mut text = truncate(format!("{text}\n[exit code {code}]"));
+        let dropped = out.dropped + err.dropped;
+        if dropped > 0 {
+            text.push_str(&format!("\n[dropped {dropped} bytes of output]"));
+        }
+        if let Some(reason) = &stopped {
+            text.push('\n');
+            text.push_str(reason);
+        }
+        let mut r = ToolResult::text(text);
+        r.is_error = stopped.is_some() || !status.success();
+        r.details = json!({"exitCode": code, "droppedBytes": dropped});
         Ok(r)
     }
 }
@@ -216,6 +314,109 @@ mod tests {
 
     fn out_text(r: &ToolResult) -> String {
         r.content.iter().filter_map(|c| if let agent_ai::Content::Text { text } = c { Some(text.as_str()) } else { None }).collect()
+    }
+
+    async fn assert_dead(pid: i32) {
+        for _ in 0..50 {
+            // SAFETY: signal 0 only probes this test's child PID.
+            if unsafe { libc::kill(pid, 0) } == -1 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("grandchild {pid} survived process-group cleanup");
+    }
+
+    async fn bash_interrupted(abort: bool) {
+        let root = tempfile::tempdir().unwrap();
+        let tool = BashTool { root: root.path().to_owned(), env: Default::default() };
+        let cancel = CancellationToken::new();
+        let stop = cancel.clone();
+        let pidfile = root.path().join("pid");
+        let cancel_task = tokio::spawn(async move {
+            if abort {
+                while !pidfile.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                stop.cancel();
+            }
+        });
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), tool.execute("1", json!({"command": "sleep 30 & echo $! > pid; echo started; sleep 30", "timeoutSecs": 1}), cancel, Arc::new(|_| {})))
+                .await
+                .expect("bash did not return promptly")
+                .unwrap();
+        cancel_task.await.unwrap();
+        assert!(result.is_error);
+        let text = out_text(&result);
+        assert!(text.contains("started"));
+        assert!(text.contains(if abort { "[aborted]" } else { "[timed out after 1s]" }));
+        let pid = std::fs::read_to_string(root.path().join("pid")).unwrap().trim().parse().unwrap();
+        assert_dead(pid).await;
+    }
+
+    #[tokio::test]
+    async fn bash_timeout_kills_grandchild() {
+        bash_interrupted(false).await;
+    }
+
+    #[tokio::test]
+    async fn bash_abort_kills_grandchild() {
+        bash_interrupted(true).await;
+    }
+
+    #[tokio::test]
+    async fn bash_dropped_future_kills_group() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = BashTool { root: root.path().to_owned(), env: Default::default() };
+        let task = tokio::spawn(async move { tool.execute("1", json!({"command": "sleep 30 & echo $! > pid; wait"}), CancellationToken::new(), Arc::new(|_| {})).await });
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(text) = tokio::fs::read_to_string(root.path().join("pid")).await {
+                    if let Ok(pid) = text.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_dead(pid).await;
+    }
+
+    #[tokio::test]
+    async fn bash_output_is_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        let tool = BashTool { root: root.path().to_owned(), env: Default::default() };
+        let result = tool.execute("1", json!({"command": "yes | head -c 5000000; yes | head -c 5000000 >&2"}), CancellationToken::new(), Arc::new(|_| {})).await.unwrap();
+        let text = out_text(&result);
+        assert!(!result.is_error);
+        assert!(text.len() < MAX_CAPTURE_BYTES);
+        assert!(text.contains("dropped"));
+        assert_eq!(result.details["droppedBytes"], 10_000_000 - MAX_CAPTURE_BYTES);
+    }
+
+    #[tokio::test]
+    async fn read_and_ls_are_bounded() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("big"), vec![b'x'; 3 * 1024 * 1024]).unwrap();
+        let read = ReadTool { root: root.path().to_owned() };
+        let result = read.execute("1", json!({"path": "big"}), CancellationToken::new(), Arc::new(|_| {})).await.unwrap();
+        let text = out_text(&result);
+        assert!(text.len() < MAX_READ_BYTES);
+        assert!(text.contains("truncated: read at most"));
+        for i in 0..1005 {
+            std::fs::write(root.path().join(format!("entry-{i}")), "").unwrap();
+        }
+        let ls = LsTool { root: root.path().to_owned() };
+        let result = ls.execute("1", json!({}), CancellationToken::new(), Arc::new(|_| {})).await.unwrap();
+        let text = out_text(&result);
+        assert_eq!(text.lines().count(), MAX_LS_ENTRIES + 1);
+        assert!(text.contains("[truncated: 6 more entries]"));
     }
 
     /// bash 子进程看不到 provider key 等密钥变量。断言信息里不打印 env 输出，避免泄露测试机上的其它变量。

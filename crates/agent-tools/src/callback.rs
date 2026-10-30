@@ -23,6 +23,9 @@ pub struct CallbackTool {
     pub http: reqwest::Client,
 }
 
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const CALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CallbackReply {
@@ -49,13 +52,54 @@ impl AgentTool for CallbackTool {
         if let Some(t) = &self.spec.callback_token {
             req = req.bearer_auth(t);
         }
-        let resp = tokio::select! {
-            r = tokio::time::timeout(std::time::Duration::from_secs(120), req.send()) => r.context("callback timed out")??,
+        let request = async {
+            let resp = req.send().await?.error_for_status()?;
+            let (body, truncated) = crate::response::read_body(resp, MAX_RESPONSE_BYTES).await?;
+            anyhow::ensure!(!truncated, "callback response exceeds {MAX_RESPONSE_BYTES} bytes");
+            Ok::<CallbackReply, anyhow::Error>(serde_json::from_slice(&body)?)
+        };
+        let reply = tokio::select! {
+            r = tokio::time::timeout(CALLBACK_TIMEOUT, request) => r.context("callback timed out")??,
             _ = cancel.cancelled() => anyhow::bail!("aborted"),
         };
-        let reply: CallbackReply = resp.error_for_status()?.json().await?;
         let mut r = ToolResult::text(reply.content);
         r.is_error = reply.is_error;
         Ok(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::response::tests::server;
+    use std::sync::Arc;
+
+    fn tool(url: String) -> CallbackTool {
+        CallbackTool {
+            spec: CallerToolSpec { name: "test".into(), description: String::new(), parameters: json!({}), callback_url: url, callback_token: None },
+            session_id: "test".into(),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn callback_caps_body() {
+        let (url, _, server) = server(Some(vec![b'x'; MAX_RESPONSE_BYTES + 1])).await;
+        let error = tool(url).execute("1", json!({}), CancellationToken::new(), Arc::new(|_| {})).await.unwrap_err();
+        assert!(error.to_string().contains("callback response exceeds"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn callback_timeout_includes_body() {
+        let (url, headers, server) = server(None).await;
+        let call = tokio::spawn(async move { tool(url).execute("1", json!({}), CancellationToken::new(), Arc::new(|_| {})).await });
+        headers.await.unwrap();
+        // 先完成真实网络握手，再快进时钟，避免测试等待 120 秒。
+        tokio::time::pause();
+        tokio::time::advance(CALLBACK_TIMEOUT + std::time::Duration::from_secs(1)).await;
+        let error = call.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("callback timed out"));
+        server.abort();
     }
 }

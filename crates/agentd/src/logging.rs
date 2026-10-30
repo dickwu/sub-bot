@@ -11,9 +11,18 @@ pub fn default_log_dir() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "sub-bot").map(|d| d.data_local_dir().join("logs"))
 }
 
+fn build_filter(rust_log: Option<&str>, level: &str) -> EnvFilter {
+    let mut filter = rust_log.and_then(|value| EnvFilter::try_new(value).ok()).unwrap_or_else(|| EnvFilter::new(level));
+    // 始终最后添加，覆盖用户的同名指令，避免请求头（包括 Authorization）进入日志。
+    for directive in ["hyper=warn", "hyper_util=warn", "reqwest=warn", "h2=warn", "rustls=warn", "tower=warn"] {
+        filter = filter.add_directive(directive.parse().expect("valid suppression directive"));
+    }
+    filter
+}
+
 pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<WorkerGuard>> {
-    // 依赖库（hyper/reqwest/h2/rustls）在 trace 级可能输出请求头，默认压到 warn，防止 Authorization 头进日志
-    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(format!("{level},hyper=warn,hyper_util=warn,reqwest=warn,h2=warn,rustls=warn,tower=warn")));
+    let rust_log = std::env::var("RUST_LOG").ok();
+    let filter = || build_filter(rust_log.as_deref(), level);
     // stderr：人类可读（stdout 留给 RPC 协议，绝不写日志）
     let stderr = fmt::layer().with_writer(std::io::stderr).with_target(false).with_filter(filter());
     let dir = match dir {
@@ -43,5 +52,27 @@ struct FileFields(fmt::format::DefaultFields);
 impl<'w> fmt::FormatFields<'w> for FileFields {
     fn format_fields<R: tracing_subscriber::field::RecordFields>(&self, writer: fmt::format::Writer<'w>, fields: R) -> std::fmt::Result {
         self.0.format_fields(writer, fields)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_filter;
+
+    #[test]
+    fn dependency_suppression_overrides_user_filters() {
+        for rust_log in [Some("trace"), Some("hyper=trace"), Some("hyper=trace,hyper_util=trace,reqwest=trace,h2=trace,rustls=trace,tower=trace"), None] {
+            let filter = build_filter(rust_log, "trace").to_string();
+            let directives: Vec<_> = filter.split(',').collect();
+            for target in ["hyper", "hyper_util", "reqwest", "h2", "rustls", "tower"] {
+                assert!(directives.contains(&format!("{target}=warn").as_str()), "{filter}");
+                assert!(!directives.contains(&format!("{target}=trace").as_str()), "{filter}");
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_rust_log_falls_back_to_level_with_suppression() {
+        assert_eq!(build_filter(Some("hyper=invalid"), "debug").to_string(), build_filter(None, "debug").to_string());
     }
 }

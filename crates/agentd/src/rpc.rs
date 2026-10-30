@@ -2,8 +2,8 @@
 //! stdin 每行一个命令 `{"id":"1","type":"prompt","message":"..."}`；
 //! stdout 输出 `{"id":"1","type":"response","command":"prompt","success":true,"data":{...}}` 和事件行。
 //! 严格按 LF 分帧；日志一律走 stderr。
-use crate::hub::{Hub, SessionRequest};
 use crate::config::Client;
+use crate::hub::{Hub, SessionRequest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -34,7 +34,9 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
         while let Some(v) = out_rx.recv().await {
             let mut line = serde_json::to_vec(&v).unwrap_or_default();
             line.push(b'\n');
-            if stdout.write_all(&line).await.is_err() { break; }
+            if stdout.write_all(&line).await.is_err() {
+                break;
+            }
             let _ = stdout.flush().await;
         }
     });
@@ -44,7 +46,9 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     let ev_tx = out_tx.clone();
     let forwarder = tokio::spawn(async move {
         while let Ok(ev) = events.recv().await {
-            if let Ok(v) = serde_json::to_value(&ev) { let _ = ev_tx.send(v); }
+            if let Ok(v) = serde_json::to_value(&ev) {
+                let _ = ev_tx.send(v);
+            }
         }
     });
 
@@ -52,10 +56,15 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     while let Some(raw) = lines.next_segment().await? {
         let text = String::from_utf8_lossy(&raw);
         let text = text.trim_end_matches('\r');
-        if text.trim().is_empty() { continue; }
+        if text.trim().is_empty() {
+            continue;
+        }
         let parsed: Value = match serde_json::from_str(text) {
             Ok(v) => v,
-            Err(e) => { let _ = out_tx.send(json!({"type":"response","command":"parse","success":false,"error":e.to_string()})); continue; }
+            Err(e) => {
+                let _ = out_tx.send(json!({"type":"response","command":"parse","success":false,"error":e.to_string()}));
+                continue;
+            }
         };
         let id = parsed.get("id").cloned();
         let cmd_name = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
@@ -64,16 +73,23 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
             Ok(Command::Prompt { message }) => json!({"success": true, "data": {"disposition": session.submit(message, None)}}),
             Ok(Command::Steer { message }) => json!({"success": true, "data": {"disposition": session.submit(message, Some("steer"))}}),
             Ok(Command::FollowUp { message }) => json!({"success": true, "data": {"disposition": session.submit(message, Some("follow_up"))}}),
-            Ok(Command::Abort) => { session.agent.abort(); json!({"success": true}) }
+            Ok(Command::Abort) => {
+                session.agent.abort();
+                json!({"success": true})
+            }
             Ok(Command::GetMessages) => json!({"success": true, "data": {"messages": session.agent.messages().await}}),
-            Ok(Command::GetState) => json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "profile": session.profile}}),
+            Ok(Command::GetState) => {
+                json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "profile": session.profile}})
+            }
             Ok(Command::GetAvailableModels) => match hub.list_models(false).await {
                 Ok(models) => json!({"success": true, "data": {"models": models}}),
                 Err(e) => json!({"success": false, "error": e.to_string()}),
             },
         };
         let mut r = json!({"type": "response", "command": cmd_name});
-        if let Some(id) = id { r["id"] = id; }
+        if let Some(id) = id {
+            r["id"] = id;
+        }
         r.as_object_mut().unwrap().extend(resp.as_object().unwrap().clone());
         let _ = out_tx.send(r);
     }

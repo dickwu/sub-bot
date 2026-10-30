@@ -1,4 +1,7 @@
-use crate::{config::{Client, Config}, hub::{Hub, SessionRequest}};
+use crate::{
+    config::{Client, Config},
+    hub::{Hub, SessionRequest},
+};
 use agent_ai::Message;
 use agent_core::AgentEvent;
 use axum::{
@@ -28,13 +31,7 @@ pub fn random_token() -> String {
 /// Bearer token -> Client（每个 bot 一个 token），写入请求扩展供 handler 使用。
 async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Response {
     let span = tracing::Span::current();
-    let client = req
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(|t| st.hub.config.client_for_token(t))
-        .cloned();
+    let client = req.headers().get("authorization").and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")).and_then(|t| st.hub.config.client_for_token(t)).cloned();
     match client {
         Some(c) => {
             span.record("bot", c.name.as_str());
@@ -91,7 +88,11 @@ pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     let app = Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st);
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, app).with_graceful_shutdown(async { let _ = tokio::signal::ctrl_c().await; }).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
     Ok(())
 }
 
@@ -224,7 +225,10 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
     loop {
         match rx.recv().await {
             Ok(AgentEvent::AgentEnd { messages }) => new_messages.extend(messages),
-            Ok(AgentEvent::AgentSettled { aborted: a }) => { aborted = a; break; }
+            Ok(AgentEvent::AgentSettled { aborted: a }) => {
+                aborted = a;
+                break;
+            }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
             Err(_) => break,

@@ -11,9 +11,15 @@ pub struct HttpFetchTool {
 
 #[async_trait::async_trait]
 impl AgentTool for HttpFetchTool {
-    fn name(&self) -> &str { "http_fetch" }
-    fn description(&self) -> &str { "HTTP GET a URL on an allow-listed host and return the body as text." }
-    fn parameters(&self) -> Value { json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]}) }
+    fn name(&self) -> &str {
+        "http_fetch"
+    }
+    fn description(&self) -> &str {
+        "HTTP GET a URL on an allow-listed host and return the body as text."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"url":{"type":"string"}},"required":["url"]})
+    }
     async fn execute(&self, _id: &str, args: Value, cancel: CancellationToken, _u: UpdateSink) -> anyhow::Result<ToolResult> {
         let url = reqwest::Url::parse(args["url"].as_str().context("missing url")?)?;
         let host = url.host_str().unwrap_or_default().to_string();
@@ -28,7 +34,9 @@ impl AgentTool for HttpFetchTool {
         let mut body = resp.text().await?;
         if body.len() > 50_000 {
             let mut cut = 50_000;
-            while !body.is_char_boundary(cut) { cut -= 1; }
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
             body.truncate(cut);
             body.push_str("\n[truncated]");
         }

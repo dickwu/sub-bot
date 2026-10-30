@@ -38,7 +38,7 @@ fn parse_effort_error(body: &str) -> Option<Option<Vec<ThinkingLevel>>> {
     if body.contains("Unrecognized request argument") || body.contains("Function tools with reasoning_effort are not supported") {
         return Some(None);
     }
-    let tail = &body[body.find("Supported values are:")? ..];
+    let tail = &body[body.find("Supported values are:")?..];
     let tail = &tail[..tail.find('.').unwrap_or(tail.len())];
     let levels: Vec<ThinkingLevel> = tail.split('\'').skip(1).step_by(2).filter_map(|w| w.parse().ok()).collect();
     Some(if levels.is_empty() { None } else { Some(levels) })
@@ -47,7 +47,12 @@ fn parse_effort_error(body: &str) -> Option<Option<Vec<ThinkingLevel>>> {
 impl OpenAiProvider {
     /// key 只在进程内存中，从不通过对外接口返回。
     pub fn new(api_key: String, base_url: Option<String>) -> Self {
-        Self { api_key, base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()), http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client"), effort_cache: Default::default() }
+        Self {
+            api_key,
+            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(20)).build().expect("http client"),
+            effort_cache: Default::default(),
+        }
     }
 }
 
@@ -131,27 +136,32 @@ impl Provider for OpenAiProvider {
         let key = self.api_key.clone();
         let cache = self.effort_cache.clone();
         let span = tracing::info_span!("llm", provider = "openai", model = %req.model, reasoning_effort = tracing::field::Empty);
-        tokio::spawn(tracing::Instrument::instrument(async move {
-            let model = req.model.clone();
-            let started = std::time::Instant::now();
-            tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
-            let fut = run(http, url, key, req, cache, tx.clone());
-            let final_ev = tokio::select! {
-                r = fut => match r {
-                    Ok(msg) => AssistantEvent::Done { message: msg },
-                    Err(e) => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Error, e) },
-                },
-                _ = cancel.cancelled() => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Aborted, "aborted") },
-            };
-            let latency_ms = started.elapsed().as_millis() as u64;
-            match &final_ev {
-                AssistantEvent::Done { message: m } => tracing::info!(latency_ms, stop_reason = ?m.stop_reason, input_tokens = m.usage.input, output_tokens = m.usage.output, cached_tokens = m.usage.cache_read, tool_calls = m.tool_calls().len(), "llm call finished"),
-                AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => tracing::info!(latency_ms, "llm call aborted"),
-                AssistantEvent::Error { message: m } => tracing::error!(latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
-                _ => {}
-            }
-            let _ = tx.send(final_ev).await;
-        }, span));
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                let model = req.model.clone();
+                let started = std::time::Instant::now();
+                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
+                let fut = run(http, url, key, req, cache, tx.clone());
+                let final_ev = tokio::select! {
+                    r = fut => match r {
+                        Ok(msg) => AssistantEvent::Done { message: msg },
+                        Err(e) => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Error, e) },
+                    },
+                    _ = cancel.cancelled() => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Aborted, "aborted") },
+                };
+                let latency_ms = started.elapsed().as_millis() as u64;
+                match &final_ev {
+                    AssistantEvent::Done { message: m } => {
+                        tracing::info!(latency_ms, stop_reason = ?m.stop_reason, input_tokens = m.usage.input, output_tokens = m.usage.output, cached_tokens = m.usage.cache_read, tool_calls = m.tool_calls().len(), "llm call finished")
+                    }
+                    AssistantEvent::Error { message: m } if m.stop_reason == StopReason::Aborted => tracing::info!(latency_ms, "llm call aborted"),
+                    AssistantEvent::Error { message: m } => tracing::error!(latency_ms, error = m.error_message.as_deref().unwrap_or(""), "llm call failed"),
+                    _ => {}
+                }
+                let _ = tx.send(final_ev).await;
+            },
+            span,
+        ));
         Box::pin(ReceiverStream::new(rx))
     }
 }
@@ -272,7 +282,13 @@ async fn run(http: reqwest::Client, url: String, key: String, mut req: Request, 
 /// 去掉错误信息里任何形似 API key 的片段（OpenAI 401 会回显部分 key）。
 fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
-        .map(|w| if w.trim_start_matches(|c: char| !c.is_alphanumeric()).starts_with("sk-") { "[redacted]".to_string() + &w[w.trim_end_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',').len()..] } else { w.to_string() })
+        .map(|w| {
+            if w.trim_start_matches(|c: char| !c.is_alphanumeric()).starts_with("sk-") {
+                "[redacted]".to_string() + &w[w.trim_end_matches(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',').len()..]
+            } else {
+                w.to_string()
+            }
+        })
         .collect()
 }
 

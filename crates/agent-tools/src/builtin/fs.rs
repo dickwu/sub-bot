@@ -33,16 +33,30 @@ fn arg_str<'a>(args: &'a Value, k: &str) -> Result<&'a str> {
     args.get(k).and_then(|v| v.as_str()).with_context(|| format!("missing string argument '{k}'"))
 }
 
-pub struct ReadTool { pub root: PathBuf }
-pub struct WriteTool { pub root: PathBuf }
-pub struct LsTool { pub root: PathBuf }
-pub struct BashTool { pub root: PathBuf }
+pub struct ReadTool {
+    pub root: PathBuf,
+}
+pub struct WriteTool {
+    pub root: PathBuf,
+}
+pub struct LsTool {
+    pub root: PathBuf,
+}
+pub struct BashTool {
+    pub root: PathBuf,
+}
 
 #[async_trait::async_trait]
 impl AgentTool for ReadTool {
-    fn name(&self) -> &str { "read" }
-    fn description(&self) -> &str { "Read a UTF-8 text file relative to the workspace root." }
-    fn parameters(&self) -> Value { json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}) }
+    fn name(&self) -> &str {
+        "read"
+    }
+    fn description(&self) -> &str {
+        "Read a UTF-8 text file relative to the workspace root."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
+    }
     async fn execute(&self, _id: &str, args: Value, _c: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let path = resolve_in_root(&self.root, arg_str(&args, "path")?)?;
         Ok(ToolResult::text(truncate(tokio::fs::read_to_string(&path).await?)))
@@ -51,15 +65,25 @@ impl AgentTool for ReadTool {
 
 #[async_trait::async_trait]
 impl AgentTool for WriteTool {
-    fn name(&self) -> &str { "write" }
-    fn description(&self) -> &str { "Write (overwrite) a text file relative to the workspace root." }
-    fn parameters(&self) -> Value { json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}) }
+    fn name(&self) -> &str {
+        "write"
+    }
+    fn description(&self) -> &str {
+        "Write (overwrite) a text file relative to the workspace root."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
+    }
     // 写文件串行执行，避免并发写同一文件（pi 用 file-mutation-queue.ts 做得更细）
-    fn execution_mode(&self) -> ExecutionMode { ExecutionMode::Sequential }
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
     async fn execute(&self, _id: &str, args: Value, _c: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let path = resolve_in_root(&self.root, arg_str(&args, "path")?)?;
         let content = arg_str(&args, "content")?;
-        if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await?; }
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         tokio::fs::write(&path, content).await?;
         Ok(ToolResult::text(format!("wrote {} bytes", content.len())))
     }
@@ -67,9 +91,15 @@ impl AgentTool for WriteTool {
 
 #[async_trait::async_trait]
 impl AgentTool for LsTool {
-    fn name(&self) -> &str { "ls" }
-    fn description(&self) -> &str { "List a directory relative to the workspace root." }
-    fn parameters(&self) -> Value { json!({"type":"object","properties":{"path":{"type":"string","default":"."}}}) }
+    fn name(&self) -> &str {
+        "ls"
+    }
+    fn description(&self) -> &str {
+        "List a directory relative to the workspace root."
+    }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string","default":"."}}})
+    }
     async fn execute(&self, _id: &str, args: Value, _c: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let p = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
         let dir = resolve_in_root(&self.root, p)?;
@@ -86,12 +116,18 @@ impl AgentTool for LsTool {
 
 #[async_trait::async_trait]
 impl AgentTool for BashTool {
-    fn name(&self) -> &str { "bash" }
+    fn name(&self) -> &str {
+        "bash"
+    }
     fn description(&self) -> &str {
         "Run a shell command (sh -c) in the workspace root."
     }
-    fn parameters(&self) -> Value { json!({"type":"object","properties":{"command":{"type":"string"},"timeoutSecs":{"type":"integer"}},"required":["command"]}) }
-    fn execution_mode(&self) -> ExecutionMode { ExecutionMode::Sequential }
+    fn parameters(&self) -> Value {
+        json!({"type":"object","properties":{"command":{"type":"string"},"timeoutSecs":{"type":"integer"}},"required":["command"]})
+    }
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
     async fn execute(&self, _id: &str, args: Value, cancel: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let cmd = arg_str(&args, "command")?;
         let secs = args.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(120);
@@ -112,21 +148,28 @@ impl AgentTool for BashTool {
     }
 }
 
-
-pub struct EditTool { pub root: PathBuf }
+pub struct EditTool {
+    pub root: PathBuf,
+}
 
 /// 精确文本替换（对应 pi `tools/edit.ts`：`edits[]` 里每个 `oldText` 必须在文件中唯一出现）。
 #[async_trait::async_trait]
 impl AgentTool for EditTool {
-    fn name(&self) -> &str { "edit" }
-    fn description(&self) -> &str { "Edit a file by exact text replacement. Each oldText must match exactly once in the current file." }
+    fn name(&self) -> &str {
+        "edit"
+    }
+    fn description(&self) -> &str {
+        "Edit a file by exact text replacement. Each oldText must match exactly once in the current file."
+    }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{
             "path":{"type":"string"},
             "edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]}}
         },"required":["path","edits"]})
     }
-    fn execution_mode(&self) -> ExecutionMode { ExecutionMode::Sequential }
+    fn execution_mode(&self) -> ExecutionMode {
+        ExecutionMode::Sequential
+    }
     async fn execute(&self, _id: &str, args: Value, _c: CancellationToken, _u: UpdateSink) -> Result<ToolResult> {
         let path = resolve_in_root(&self.root, arg_str(&args, "path")?)?;
         let mut text = tokio::fs::read_to_string(&path).await?;

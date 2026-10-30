@@ -2,7 +2,6 @@ use crate::builtin::{clock::ClockTool, fs::*, http::HttpFetchTool};
 use agent_core::AgentTool;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
-
 /// 风险等级，用于权限审查与文档（profile 显式列出才会启用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

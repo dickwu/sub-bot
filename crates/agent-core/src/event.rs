@@ -8,15 +8,41 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AgentEvent {
     AgentStart,
-    AgentEnd { messages: Vec<Message> },
+    AgentEnd {
+        messages: Vec<Message>,
+    },
     /// 会话级：不会再自动继续（对应 RPC 的 `agent_settled`）。
-    AgentSettled { aborted: bool },
+    AgentSettled {
+        aborted: bool,
+    },
     TurnStart,
-    TurnEnd { message: Message, tool_results: Vec<ToolResultMessage> },
-    MessageStart { message: Message },
-    MessageUpdate { assistant_message_event: AssistantEvent },
-    MessageEnd { message: Message },
-    ToolExecutionStart { tool_call_id: String, tool_name: String, args: Value },
-    ToolExecutionUpdate { tool_call_id: String, tool_name: String, partial_result: ToolResult },
-    ToolExecutionEnd { tool_call_id: String, tool_name: String, result: ToolResult, is_error: bool },
+    TurnEnd {
+        message: Message,
+        tool_results: Vec<ToolResultMessage>,
+    },
+    MessageStart {
+        message: Message,
+    },
+    MessageUpdate {
+        assistant_message_event: AssistantEvent,
+    },
+    MessageEnd {
+        message: Message,
+    },
+    ToolExecutionStart {
+        tool_call_id: String,
+        tool_name: String,
+        args: Value,
+    },
+    ToolExecutionUpdate {
+        tool_call_id: String,
+        tool_name: String,
+        partial_result: ToolResult,
+    },
+    ToolExecutionEnd {
+        tool_call_id: String,
+        tool_name: String,
+        result: ToolResult,
+        is_error: bool,
+    },
 }

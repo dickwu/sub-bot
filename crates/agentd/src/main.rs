@@ -152,7 +152,10 @@ async fn main() -> anyhow::Result<()> {
             }
             let last = last.ok_or_else(|| anyhow::anyhow!("no assistant reply"))?;
             if json {
-                println!("{}", serde_json::json!({"sessionId": session.id, "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "text": last.text(), "stopReason": last.stop_reason, "usage": last.usage, "error": last.error_message}));
+                println!(
+                    "{}",
+                    serde_json::json!({"sessionId": session.id, "model": session.agent.config.model, "reasoningEffort": session.agent.config.reasoning, "text": last.text(), "stopReason": last.stop_reason, "usage": last.usage, "error": last.error_message})
+                );
             } else {
                 println!("{}", last.text());
             }

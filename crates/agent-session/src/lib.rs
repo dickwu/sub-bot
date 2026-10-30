@@ -15,11 +15,33 @@ pub const SESSION_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum Entry {
-    Session { version: u32, id: String, profile: String, timestamp: String },
-    Message { id: String, parent_id: Option<String>, timestamp: String, message: Message },
-    ModelChange { id: String, parent_id: Option<String>, timestamp: String, provider: String, model_id: String },
+    Session {
+        version: u32,
+        id: String,
+        profile: String,
+        timestamp: String,
+    },
+    Message {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: String,
+        message: Message,
+    },
+    ModelChange {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: String,
+        provider: String,
+        model_id: String,
+    },
     /// 压缩摘要：替换 first_kept_entry_id 之前的上下文（对应 compaction entry）
-    Compaction { id: String, parent_id: Option<String>, timestamp: String, summary: String, first_kept_entry_id: String },
+    Compaction {
+        id: String,
+        parent_id: Option<String>,
+        timestamp: String,
+        summary: String,
+        first_kept_entry_id: String,
+    },
 }
 
 impl Entry {

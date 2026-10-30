@@ -33,9 +33,15 @@ struct CallbackReply {
 
 #[async_trait::async_trait]
 impl AgentTool for CallbackTool {
-    fn name(&self) -> &str { &self.spec.name }
-    fn description(&self) -> &str { &self.spec.description }
-    fn parameters(&self) -> Value { self.spec.parameters.clone() }
+    fn name(&self) -> &str {
+        &self.spec.name
+    }
+    fn description(&self) -> &str {
+        &self.spec.description
+    }
+    fn parameters(&self) -> Value {
+        self.spec.parameters.clone()
+    }
     async fn execute(&self, call_id: &str, args: Value, cancel: CancellationToken, _u: UpdateSink) -> anyhow::Result<ToolResult> {
         let mut req = self.http.post(&self.spec.callback_url).json(&json!({
             "sessionId": self.session_id, "toolCallId": call_id, "toolName": self.spec.name, "arguments": args,

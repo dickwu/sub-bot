@@ -86,7 +86,24 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
 pub fn is_chat_model(id: &str) -> bool {
     let chat_prefix = id.starts_with("gpt-") || id.starts_with("chatgpt-") || id == "chat-latest" || (id.len() > 1 && id.starts_with('o') && id.as_bytes()[1].is_ascii_digit());
     const EXCLUDE: &[&str] = &[
-        "embedding", "tts", "whisper", "transcribe", "audio", "realtime", "image", "search", "moderation", "instruct", "codex", "-pro", "deep-research", "computer-use", "live", "translate", "dall-e", "sora",
+        "embedding",
+        "tts",
+        "whisper",
+        "transcribe",
+        "audio",
+        "realtime",
+        "image",
+        "search",
+        "moderation",
+        "instruct",
+        "codex",
+        "-pro",
+        "deep-research",
+        "computer-use",
+        "live",
+        "translate",
+        "dall-e",
+        "sora",
     ];
     chat_prefix && !EXCLUDE.iter().any(|x| id.contains(x)) && !is_deprecated(id)
 }

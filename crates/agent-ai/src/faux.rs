@@ -38,7 +38,10 @@ impl Provider for FauxProvider {
                 msg.stop_reason = StopReason::ToolUse;
             }
             other => {
-                let last = match other { Some(Message::User { content, .. }) => first_text(content), _ => String::new() };
+                let last = match other {
+                    Some(Message::User { content, .. }) => first_text(content),
+                    _ => String::new(),
+                };
                 let text = format!("echo: {last}");
                 events.push(AssistantEvent::TextDelta { content_index: 0, delta: text.clone() });
                 msg.content.push(Content::Text { text });

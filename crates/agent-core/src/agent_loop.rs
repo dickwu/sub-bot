@@ -55,11 +55,8 @@ pub async fn run_loop(context: &mut Vec<Message>, prompts: Vec<Message>, cfg: &L
             }
 
             turns += 1;
-            let assistant = if turns > cfg.max_turns {
-                AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded")
-            } else {
-                stream_assistant(context, cfg, cancel.clone(), &emit).await
-            };
+            let assistant =
+                if turns > cfg.max_turns { AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded") } else { stream_assistant(context, cfg, cancel.clone(), &emit).await };
             let am = Message::Assistant(assistant.clone());
             context.push(am.clone());
             new_messages.push(am.clone());
@@ -189,7 +186,9 @@ mod tests {
     /// 第一次返回一个工具调用，第二次返回文本。
     struct Scripted(AtomicUsize);
     impl Provider for Scripted {
-        fn id(&self) -> &str { "scripted" }
+        fn id(&self) -> &str {
+            "scripted"
+        }
         fn stream(&self, req: Request, _c: CancellationToken) -> EventStream {
             let mut m = AssistantMessage::empty(&req.model);
             if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
@@ -205,9 +204,15 @@ mod tests {
     struct Echo;
     #[async_trait::async_trait]
     impl AgentTool for Echo {
-        fn name(&self) -> &str { "echo" }
-        fn description(&self) -> &str { "echo" }
-        fn parameters(&self) -> serde_json::Value { serde_json::json!({"type": "object"}) }
+        fn name(&self) -> &str {
+            "echo"
+        }
+        fn description(&self) -> &str {
+            "echo"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
         async fn execute(&self, _: &str, a: serde_json::Value, _: CancellationToken, _: UpdateSink) -> anyhow::Result<ToolResult> {
             Ok(ToolResult::text(a.to_string()))
         }

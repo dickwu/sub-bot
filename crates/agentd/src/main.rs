@@ -13,6 +13,7 @@ compile_error!("sub-bot only supports macOS and Linux");
 mod config;
 mod http;
 mod hub;
+pub mod issues;
 mod logging;
 mod prompt;
 mod rpc;

@@ -1,6 +1,7 @@
 use crate::{
-    config::{Client, Config},
+    config::{Client, Config, ResolvedTarget, TargetSpec, MAX_TARGETS},
     hub::{Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
+    issues::Severity,
     webhook::WebhookTarget,
 };
 use agent_ai::Message;
@@ -13,7 +14,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
 use std::{convert::Infallible, net::SocketAddr, sync::Arc};
@@ -48,11 +49,14 @@ async fn auth(State(st): State<AppState>, mut req: Request, next: Next) -> Respo
 }
 
 type Caller = Extension<Arc<Client>>;
+#[derive(Clone)]
+struct RequestId(String);
 
 /// 每个 HTTP 请求一个 span：request_id（沿用 X-Request-Id 或新生成）、method、path、bot；结束时记录状态码和耗时。
-async fn trace_request(req: Request, next: Next) -> Response {
+async fn trace_request(mut req: Request, next: Next) -> Response {
     use tracing::Instrument;
     let request_id = req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).filter(|v| v.len() <= 64).map(str::to_string).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    req.extensions_mut().insert(RequestId(request_id.clone()));
     let span = tracing::info_span!("http", request_id = %request_id, method = %req.method(), path = %req.uri().path(), bot = tracing::field::Empty);
     let start = std::time::Instant::now();
     async move {
@@ -83,6 +87,7 @@ fn router(st: AppState) -> Router {
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
         .route("/v1/sessions/{id}/messages", get(messages))
+        .route("/v1/issues", get(issues))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
         .route("/v1/profiles", get(profiles))
@@ -194,14 +199,17 @@ struct PromptBody {
     mode: Option<String>,
 }
 
-async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, Json(b): Json<PromptBody>) -> ApiResult {
+async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, request_id: Option<Extension<RequestId>>, Json(b): Json<PromptBody>) -> ApiResult {
+    if let Some(Extension(id_value)) = request_id {
+        st.hub.get(&c, &id).ok_or_else(not_found)?.set_request_id(id_value.0);
+    }
     let d = st.hub.submit(&c, &id, b.message, b.mode.as_deref()).ok_or_else(not_found)?;
     Ok((StatusCode::ACCEPTED, Json(json!({"disposition": d}))).into_response())
 }
 
-fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled: bool) -> impl Stream<Item = Result<Event, Infallible>> {
+fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled: bool, h: Arc<SessionHandle>) -> impl Stream<Item = Result<Event, Infallible>> {
     // 用 unfold 在发出 agent_settled 后立即结束流（take_while 要等到下一个事件才会结束，导致 /v1/chat 流挂起）
-    futures::stream::unfold((rx, false), move |(mut rx, done)| async move {
+    futures::stream::unfold((rx, false, h), move |(mut rx, done, h)| async move {
         if done {
             return None;
         }
@@ -209,9 +217,10 @@ fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled:
             match rx.recv().await {
                 Ok(ev) => {
                     let settled = stop_on_settled && matches!(ev, AgentEvent::AgentSettled { .. });
-                    return Some((ev, (rx, settled)));
+                    return Some((ev, (rx, settled, h)));
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    h.report_lag(n);
                     tracing::warn!(skipped = n, "SSE subscriber lagged; events dropped")
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
@@ -228,7 +237,7 @@ fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled:
 
 async fn events(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
     let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
-    Ok(Sse::new(sse_stream(h.subscribe(), false)).keep_alive(Default::default()).into_response())
+    Ok(Sse::new(sse_stream(h.subscribe(), false, h)).keep_alive(Default::default()).into_response())
 }
 
 async fn abort(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
@@ -246,12 +255,49 @@ async fn get_task(State(st): State<AppState>, Extension(c): Caller, Path(id): Pa
     Ok(Json(task).into_response())
 }
 
-#[derive(Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Deserialize, Default)]
+struct IssuesQuery {
+    #[serde(default)]
+    since: u64,
+    limit: Option<usize>,
+}
+async fn issues(State(st): State<AppState>, Extension(c): Caller, Query(q): Query<IssuesQuery>) -> ApiResult {
+    let limit = q.limit.unwrap_or(100);
+    if limit > 500 {
+        return Err(bad_request("limit must be <= 500"));
+    }
+    Ok(Json(json!({"issues": st.hub.issues.recent(Some(&c.name), q.since, limit)})).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
 enum WebhookEvents {
-    #[default]
-    Final,
-    All,
+    One(String),
+    Many(Vec<String>),
+}
+impl Default for WebhookEvents {
+    fn default() -> Self {
+        Self::One("final".into())
+    }
+}
+impl WebhookEvents {
+    fn resolve(&self) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+        let values = match self {
+            Self::One(v) => std::slice::from_ref(v),
+            Self::Many(v) => v.as_slice(),
+        };
+        let mut events = vec![];
+        for v in values {
+            match v.as_str() {
+                "final" => events.push("task.completed".into()),
+                "progress" => events.push("task.progress".into()),
+                "all" => events.extend(["task.completed".into(), "task.progress".into()]),
+                "issues" => events.push("issues".into()),
+                _ => return Err(bad_request("invalid webhookEvents")),
+            }
+        }
+        Ok(events)
+    }
 }
 
 #[derive(Deserialize)]
@@ -266,7 +312,7 @@ struct ChatBody {
     stream: bool,
     #[serde(default, rename = "async")]
     asynchronous: bool,
-    callback_url: Option<String>,
+    callback_url: Option<serde_json::Value>,
     #[serde(default)]
     webhook_events: WebhookEvents,
     /// 非流式等待上限；不填使用全局 chatTimeoutSecs。
@@ -275,32 +321,76 @@ struct ChatBody {
 
 /// A host entry allows any port; host:port restricts it. The configured URL implicitly
 /// allows its host. No URL input is included in errors or logs.
-fn webhook_target(c: &Client, callback: Option<&str>) -> Result<Option<WebhookTarget>, (StatusCode, Json<serde_json::Value>)> {
-    let Some(value) = callback.or(c.webhook_url.as_deref()) else { return Ok(None) };
-    let url = crate::config::webhook_url(value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
-    let host = url.host_str().unwrap_or_default();
-    let authority = format!("{host}:{}", url.port_or_known_default().unwrap_or_default());
-    let implicit = c.webhook_url.as_deref().and_then(crate::config::webhook_url).is_some_and(|default| default.host_str() == Some(host));
-    if callback.is_some() && !implicit && !c.webhook_allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)) {
-        return Err(bad_request("callback host not allowed"));
+fn webhook_targets(c: &Client, callback: Option<&serde_json::Value>, events: &WebhookEvents) -> Result<Vec<ResolvedTarget>, (StatusCode, Json<serde_json::Value>)> {
+    let defaults = events.resolve()?;
+    let mut targets = if let Some(value) = callback {
+        let entries = match value {
+            serde_json::Value::Array(v) => v.as_slice(),
+            _ => std::slice::from_ref(value),
+        };
+        if entries.len() > MAX_TARGETS {
+            return Err(bad_request("too many callback targets"));
+        }
+        let mut targets = vec![];
+        for entry in entries {
+            if entry.as_object().is_some_and(|v| v.contains_key("secretFile")) {
+                return Err(bad_request("secretFile is not allowed in requests"));
+            }
+            // Objects are allowed only inside the array.
+            if !value.is_array() && !entry.is_string() {
+                return Err(bad_request("callbackUrl must be a string or array"));
+            }
+            let spec: TargetSpec = serde_json::from_value(entry.clone()).map_err(|_| bad_request("invalid callback target"))?;
+            let (value, events, min_severity) = match spec {
+                TargetSpec::Url(url) => (url, None, None),
+                TargetSpec::Full { url, events, min_severity, .. } => (url, events, min_severity),
+            };
+            if events.as_ref().is_some_and(|es| es.iter().any(|e| !matches!(e.as_str(), "task.completed" | "task.progress" | "issues"))) {
+                return Err(bad_request("invalid target events"));
+            }
+            let url = crate::config::webhook_url(&value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
+            let host = url.host_str().unwrap_or_default();
+            let authority = format!("{host}:{}", url.port_or_known_default().unwrap_or_default());
+            let implicit = c.webhook_url.specs().iter().any(|spec| {
+                let value = match spec {
+                    TargetSpec::Url(url) | TargetSpec::Full { url, .. } => url,
+                };
+                crate::config::webhook_url(value).is_some_and(|default| default.host_str() == Some(host))
+            });
+            if !implicit && !c.webhook_allowed_hosts.iter().any(|allowed| allowed.eq_ignore_ascii_case(host) || allowed.eq_ignore_ascii_case(&authority)) {
+                return Err(bad_request("callback host not allowed"));
+            }
+            targets.push(ResolvedTarget { target: WebhookTarget { url: url.into(), secret: c.webhook_secret.clone() }, events, min_severity });
+        }
+        targets
+    } else {
+        c.resolved_webhooks.clone()
+    };
+    for target in &mut targets {
+        if target.events.is_none() {
+            target.events = Some(defaults.clone());
+        }
     }
-    Ok(Some(WebhookTarget { url: url.into(), secret: c.webhook_secret.clone() }))
+    Ok(targets)
 }
 
 /// 一步到位接口：给只想“发一句话拿回答”的 bot 用。
-async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<ChatBody>) -> ApiResult {
+async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Option<Extension<RequestId>>, Json(b): Json<ChatBody>) -> ApiResult {
     if st.hub.is_shutting_down() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"}))));
     }
     if b.asynchronous && b.stream {
         return Err(bad_request("async and stream cannot be combined"));
     }
-    let target = webhook_target(&c, b.callback_url.as_deref())?;
+    let targets = webhook_targets(&c, b.callback_url.as_ref(), &b.webhook_events)?;
     let timeout_secs = b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs);
     let h = match b.session_id {
         Some(id) => st.hub.get(&c, &id).ok_or_else(not_found)?,
         None => st.hub.create_chat_session(&c, b.session).map_err(create_error)?,
     };
+    if let Some(Extension(id)) = request_id {
+        h.set_request_id(id.0);
+    }
     let rx = h.subscribe(); // 先订阅再提交，避免漏事件
     let submit_error = || {
         if st.hub.is_shutting_down() {
@@ -310,9 +400,15 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
         }
     };
     if b.asynchronous {
-        let task = st.hub.submit_task(&c, &h.id, b.message).ok_or_else(submit_error)?;
+        let task = st.hub.submit_task(&c, &h.id, b.message, &targets).ok_or_else(submit_error)?;
         let status_url = format!("/v1/tasks/{}", task.task_id);
-        let queue = target.map(|target| st.hub.webhook_queue(task.task_id.clone(), target));
+        let queues: Vec<_> = targets
+            .into_iter()
+            .map(|target| {
+                let queue = st.hub.webhook_queue(task.task_id.clone(), target.target.clone());
+                (target, queue)
+            })
+            .collect();
         let response = (
             StatusCode::ACCEPTED,
             [("location", status_url.clone())],
@@ -323,19 +419,29 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, Json(b): Json<Ch
             .into_response();
         // Detached from the request future: disconnecting cannot cancel the run or its result.
         tokio::spawn(async move {
-            let progress = if b.webhook_events == WebhookEvents::All { queue.as_ref().map(|q| (task.task_id.as_str(), q)) } else { None };
-            let outcome = collect_chat(&h, rx, timeout_secs, progress).await;
+            let progress: Vec<_> = queues.iter().filter(|(t, _)| t.wants("task.progress")).map(|(_, q)| q.clone()).collect();
+            let outcome = std::panic::AssertUnwindSafe(collect_chat(&h, rx, timeout_secs, Some((&task.task_id, &progress)))).catch_unwind().await;
+            let outcome = outcome.unwrap_or_else(|_| {
+                h.agent.abort();
+                h.report_issue(Severity::Fatal, "task_panic", "runtime", "Internal panic", json!({}));
+                ChatOutcome { status: TaskStatus::Failed, body: json!({"sessionId": h.id, "error": "internal panic"}) }
+            });
             if let Some(task) = st.hub.finish_task(&task.task_id, outcome.status, outcome.body) {
-                if let Some(queue) = queue {
-                    let _ = queue.send(("task.completed", json!(task)));
+                for (target, queue) in queues {
+                    if target.wants("task.completed") {
+                        let _ = queue.send(("task.completed", json!(task)));
+                    }
                 }
             }
+            // Allow the independent source observer to flush finishing events before removing routes.
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            st.hub.unsubscribe_task(&task.task_id, &h);
         });
         return Ok(response);
     }
     st.hub.submit(&c, &h.id, b.message, None).ok_or_else(submit_error)?;
     if b.stream {
-        let mut response = Sse::new(sse_stream(rx, true)).into_response();
+        let mut response = Sse::new(sse_stream(rx, true, h.clone())).into_response();
         response.headers_mut().insert("x-session-id", h.id.parse().expect("UUID header"));
         return Ok(response);
     }
@@ -350,12 +456,13 @@ struct ChatOutcome {
 }
 
 /// Shared sync/async event collection, including partial text and the abort grace period.
-async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receiver<AgentEvent>, timeout_secs: u64, progress: Option<(&str, &WebhookQueue)>) -> ChatOutcome {
+async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receiver<AgentEvent>, timeout_secs: u64, progress: Option<(&str, &[WebhookQueue])>) -> ChatOutcome {
     let mut new_messages: Vec<Message> = vec![];
     let mut segment_start = 0;
     let mut partial_text = String::new();
     let mut aborted = false;
     let mut timed_out = false;
+    let mut panicked = false;
     let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let event = tokio::select! {
@@ -365,6 +472,7 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
                     break;
                 }
                 timed_out = true;
+                h.report_issue(Severity::Warn, "run_timeout", "http", "Chat timed out", json!({}));
                 tracing::warn!(session_id = %h.id, "chat timed out");
                 h.agent.abort();
                 deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -377,13 +485,17 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
             Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
             Ok(AgentEvent::MessageEnd { message }) => {
                 if let (Some((id, queue)), Message::Assistant(a)) = (progress, &message) {
-                    let _ = queue.send(("task.progress", json!({"taskId": id, "text": a.text()})));
+                    for queue in queue {
+                        let _ = queue.send(("task.progress", json!({"taskId": id, "text": a.text()})));
+                    }
                 }
                 new_messages.push(message);
             }
             Ok(AgentEvent::ToolExecutionEnd { tool_name, tool_call_id, is_error, .. }) => {
                 if let Some((id, queue)) = progress {
-                    let _ = queue.send(("task.progress", json!({"taskId": id, "toolName": tool_name, "toolCallId": tool_call_id, "isError": is_error})));
+                    for queue in queue {
+                        let _ = queue.send(("task.progress", json!({"taskId": id, "toolName": tool_name, "toolCallId": tool_call_id, "isError": is_error})));
+                    }
                 }
             }
             Ok(AgentEvent::AgentEnd { messages }) => {
@@ -395,10 +507,14 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
                 aborted = a;
                 break;
             }
+            Ok(AgentEvent::RunOutcome { kind }) if kind == "task_panic" => panicked = true,
             Ok(_) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => h.report_lag(n),
             Err(_) => break,
         }
+    }
+    if panicked {
+        return ChatOutcome { status: TaskStatus::Failed, body: json!({"sessionId": h.id, "error": "internal panic"}) };
     }
     if timed_out {
         if partial_text.is_empty() {
@@ -431,6 +547,7 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::issues::ScopeKey;
     use axum::body::{to_bytes, Body};
     use serde_json::Value;
     use tower::ServiceExt;
@@ -483,6 +600,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn callback_arrays_validate_before_admission() {
+        let (app, _) = app(1);
+        for callback in [json!([{"url":"http://localhost", "secretFile":null}]), json!(vec!["http://localhost"; 11]), json!(["http://evil.example", {"url":"http://localhost"}])] {
+            let (status, _) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"hello", "async":true, "callbackUrl":callback})).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        }
+        let c = Client { webhook_allowed_hosts: vec!["localhost".into()], ..Default::default() };
+        let targets = webhook_targets(
+            &c,
+            Some(&json!(["http://localhost/a", {"url":"http://localhost/b", "events":["issues"], "minSeverity":"error"}])),
+            &WebhookEvents::Many(vec!["all".into(), "issues".into()]),
+        )
+        .unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets[0].wants("task.progress"));
+        assert!(targets[0].wants("task.completed"));
+        assert!(!targets[1].wants("task.completed"));
+        assert!(!targets[1].wants_issue(Severity::Warn));
+        assert!(targets[1].wants_issue(Severity::Error));
+    }
+
+    #[tokio::test]
+    async fn multi_target_failure_is_independent_and_issues_are_client_scoped() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let receiver = Router::new().route(
+            "/{name}",
+            post(move |Path(name): Path<String>, Json(body): Json<Value>| {
+                let tx = tx.clone();
+                async move {
+                    tx.send((name.clone(), body)).unwrap();
+                    if name == "bad" {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, receiver).await.unwrap() });
+        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.webhook_max_attempts = 2;
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        cfg.clients[0].webhook_allowed_hosts = vec![address.to_string()];
+        cfg.clients.push(Client { name: "other".into(), token_sha256: crate::config::sha256_hex("other-token"), profiles: vec!["default".into()], ..Default::default() });
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let app = router(AppState { hub: hub.clone() });
+        let other = hub.create_session(&hub.config.clients[1], SessionRequest::default()).unwrap();
+        hub.issues.subscribe(
+            ScopeKey::Session(other.id.clone()),
+            "other".into(),
+            vec![ResolvedTarget { target: WebhookTarget { url: format!("http://{address}/other"), secret: None }, events: Some(vec!["issues".into()]), min_severity: None }],
+        );
+        let started = start_async(
+            &app,
+            json!({"message":"/tool bash {\"command\":\"printf PRIVATE_OUTPUT; exit 7\"}", "async":true,
+            "webhookEvents":["final", "issues"], "callbackUrl":[
+                {"url":format!("http://{address}/bad"), "events":["task.completed"]},
+                format!("http://{address}/good")]}),
+        )
+        .await;
+        let mut received = vec![];
+        let task = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                while let Ok(event) = rx.try_recv() {
+                    received.push(event);
+                }
+                let (_, task) = request(&app, "GET", started["statusUrl"].as_str().unwrap(), Some("test-token"), json!({})).await;
+                if task["deliveries"][0]["state"] == "failed" && task["deliveries"][1]["state"] == "delivered" {
+                    break task;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(task["deliveries"][0]["attempts"], 2);
+        assert_eq!(task["delivery"]["state"], "failed");
+        assert_eq!(task["deliveries"][1]["host"], "127.0.0.1");
+        assert_eq!(received.iter().filter(|(name, e)| name == "good" && e["event"] == "task.completed").count(), 1);
+        let first_good = received.iter().position(|(name, e)| name == "good" && e["event"] == "task.completed").unwrap();
+        let last_bad = received.iter().rposition(|(name, _)| name == "bad").unwrap();
+        assert!(first_good < last_bad, "healthy delivery must not wait for the failing receiver's retries");
+        assert_eq!(received.iter().filter(|(name, _)| name == "bad").count(), 2);
+        assert!(!received.iter().any(|(name, _)| name == "other"));
+        let issue = received.iter().find(|(name, e)| name == "good" && e["event"] == "issue").unwrap();
+        assert_eq!(issue.1["data"]["kind"], "tool_error");
+        assert_eq!(issue.1["data"]["taskId"], started["taskId"]);
+        assert!(!issue.1.to_string().contains("PRIVATE_OUTPUT"));
+        let (_, body) = request(&app, "GET", "/v1/issues?since=0&limit=500", Some("test-token"), json!({})).await;
+        assert!(body["issues"].as_array().unwrap().iter().any(|e| e["kind"] == "webhook_delivery_failed"));
+        assert!(body["issues"].as_array().unwrap().iter().all(|e| e["client"] == "default"));
+        let (_, body) = request(&app, "GET", "/v1/issues", Some("other-token"), json!({})).await;
+        assert_eq!(body["issues"], json!([]));
+        assert_eq!(request(&app, "GET", "/v1/issues?limit=501", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);
+        hub.abort_all().await;
+    }
+
+    struct PanicProvider;
+    impl agent_ai::Provider for PanicProvider {
+        fn id(&self) -> &str {
+            "panic-test"
+        }
+        fn stream(&self, _: agent_ai::Request, _: tokio_util::sync::CancellationToken) -> agent_ai::EventStream {
+            panic!("test provider panic")
+        }
+    }
+    #[tokio::test]
+    async fn provider_panic_fails_task_and_shutdown_completes() {
+        let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        Arc::get_mut(&mut hub).unwrap().provider = Arc::new(PanicProvider);
+        let app = router(AppState { hub: hub.clone() });
+        let started = start_async(&app, json!({"message":"hello", "async":true})).await;
+        let task = wait_task(&app, &started, false).await;
+        assert_eq!(task["status"], "failed");
+        assert_eq!(task["error"], "internal panic");
+        tokio::time::timeout(std::time::Duration::from_secs(2), hub.abort_all()).await.unwrap();
+        assert!(hub.issues.recent(Some("default"), 0, 100).iter().any(|e| e.kind == "task_panic" && e.severity == Severity::Fatal));
+    }
+
+    #[tokio::test]
     async fn async_poll_only_owner_ttl_and_shutdown() {
         let (app, hub) = app(64);
         let started = start_async(&app, json!({"message": "/tool bash {\"command\":\"sleep 0.2; printf done\"}", "async": true})).await;
@@ -526,13 +768,13 @@ mod tests {
     #[test]
     fn callback_host_matching() {
         let mut c = Client { webhook_allowed_hosts: vec!["example.com:443".into(), "localhost".into()], ..Default::default() };
-        assert!(webhook_target(&c, Some("https://example.com/path")).is_ok());
-        assert!(webhook_target(&c, Some("http://example.com/path")).is_err());
-        assert!(webhook_target(&c, Some("http://example.com.evil:443/path")).is_err());
-        assert!(webhook_target(&c, Some("http://localhost:1234/path")).is_ok());
-        c.webhook_url = Some("https://default.example/hook".into());
-        assert!(webhook_target(&c, Some("https://default.example/override")).is_ok());
-        assert!(webhook_target(&c, None).unwrap().is_some());
+        let check = |c: &Client, url: &str| webhook_targets(c, Some(&json!(url)), &WebhookEvents::default());
+        assert!(check(&c, "https://example.com/path").is_ok());
+        assert!(check(&c, "http://example.com/path").is_err());
+        assert!(check(&c, "http://example.com.evil:443/path").is_err());
+        assert!(check(&c, "http://localhost:1234/path").is_ok());
+        c.webhook_url = crate::config::Targets::One(TargetSpec::Url("https://default.example/hook".into()));
+        assert!(check(&c, "https://default.example/override").is_ok());
     }
 
     #[tokio::test]
@@ -561,7 +803,8 @@ mod tests {
             cfg.clients[0].webhook_secret = Some("integration-test-key".into());
             cfg.chat_timeout_secs = 1;
             if default_target {
-                cfg.clients[0].webhook_url = Some(url.clone());
+                cfg.clients[0].webhook_url = crate::config::Targets::One(TargetSpec::Url(url.clone()));
+                cfg.clients[0].resolved_webhooks = vec![ResolvedTarget { target: WebhookTarget { url: url.clone(), secret: cfg.clients[0].webhook_secret.clone() }, events: None, min_severity: None }];
             }
             let hub = Hub::new(cfg, "faux", None, None).unwrap();
             let app = router(AppState { hub });
@@ -843,6 +1086,7 @@ mod tests {
                 chat(
                     State(AppState { hub: hub.clone() }),
                     Extension(client.clone()),
+                    None,
                     Json(ChatBody {
                         message: r#"/tool bash {"command":"sleep 10"}"#.into(),
                         session_id: None,
@@ -851,7 +1095,7 @@ mod tests {
                         timeout_secs,
                         asynchronous: false,
                         callback_url: None,
-                        webhook_events: WebhookEvents::Final,
+                        webhook_events: WebhookEvents::default(),
                     }),
                 ),
             )

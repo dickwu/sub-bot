@@ -63,6 +63,58 @@ fn default_max_turns() -> usize {
     50
 }
 
+// TEMPORARY shared-interface types; replaced by I1 at merge.
+#[allow(dead_code)] // Temporary interface: I1 resolves per-target secret files.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum TargetSpec {
+    Url(String),
+    Full {
+        url: String,
+        #[serde(rename = "secretFile")]
+        secret_file: Option<PathBuf>,
+        events: Option<Vec<String>>,
+        #[serde(rename = "minSeverity")]
+        min_severity: Option<crate::issues::Severity>,
+    },
+}
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(untagged)]
+pub enum Targets {
+    #[default]
+    None,
+    One(TargetSpec),
+    Many(Vec<TargetSpec>),
+}
+impl Targets {
+    pub fn specs(&self) -> Vec<&TargetSpec> {
+        match self {
+            Self::None => vec![],
+            Self::One(t) => vec![t],
+            Self::Many(t) => t.iter().collect(),
+        }
+    }
+    #[allow(dead_code)] // Shared interface used by I1.
+    pub fn is_empty(&self) -> bool {
+        self.specs().is_empty()
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ResolvedTarget {
+    pub target: crate::webhook::WebhookTarget,
+    pub events: Option<Vec<String>>,
+    pub min_severity: Option<crate::issues::Severity>,
+}
+impl ResolvedTarget {
+    pub fn wants(&self, event: &str) -> bool {
+        self.events.as_ref().map_or(event == "task.completed", |events| events.iter().any(|e| e == event))
+    }
+    pub fn wants_issue(&self, severity: crate::issues::Severity) -> bool {
+        self.wants("issues") && severity >= self.min_severity.unwrap_or(crate::issues::Severity::Warn)
+    }
+}
+pub const MAX_TARGETS: usize = 10;
+
 #[derive(Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Client {
@@ -70,7 +122,10 @@ pub struct Client {
     /// token 的 SHA-256（hex）。用 `sub-bot hash-token <token>` 生成，配置文件里不存明文。
     pub token_sha256: String,
     pub profiles: Vec<String>,
-    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub webhook_url: Targets,
+    #[serde(skip)]
+    pub resolved_webhooks: Vec<ResolvedTarget>,
     pub webhook_secret_file: Option<PathBuf>,
     #[serde(default)]
     pub webhook_allowed_hosts: Vec<String>,
@@ -172,6 +227,18 @@ impl Config {
                 anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
                 client.webhook_secret = Some(secret.trim().to_string());
             }
+            client.resolved_webhooks = client
+                .webhook_url
+                .specs()
+                .iter()
+                .map(|spec| {
+                    let (url, events, min_severity) = match spec {
+                        TargetSpec::Url(url) => (url, None, None),
+                        TargetSpec::Full { url, events, min_severity, .. } => (url, events.clone(), *min_severity),
+                    };
+                    ResolvedTarget { target: crate::webhook::WebhookTarget { url: url.clone(), secret: client.webhook_secret.clone() }, events, min_severity }
+                })
+                .collect();
         }
         cfg.validate()?;
         Ok(cfg)
@@ -193,7 +260,11 @@ impl Config {
             }
         }
         for client in &self.clients {
-            if let Some(url) = &client.webhook_url {
+            anyhow::ensure!(client.webhook_url.specs().len() <= MAX_TARGETS, "too many webhook targets");
+            for spec in client.webhook_url.specs() {
+                let url = match spec {
+                    TargetSpec::Url(url) | TargetSpec::Full { url, .. } => url,
+                };
                 anyhow::ensure!(webhook_url(url).is_some(), "webhookUrl must be an http/https URL");
             }
             anyhow::ensure!(client.token_sha256.len() == 64 && client.token_sha256.bytes().all(|b| b.is_ascii_hexdigit()), "client '{}': tokenSha256 must be exactly 64 hex characters", client.name);

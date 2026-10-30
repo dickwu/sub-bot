@@ -53,10 +53,18 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     // 事件转发
     let mut events = session.subscribe();
     let ev_tx = out_tx.clone();
+    // Hub uses the installed Reporter or noop in RPC mode; no receiver subscriptions.
+    let issue_session = session.clone();
     let forwarder = tokio::spawn(async move {
-        while let Ok(ev) = events.recv().await {
-            if let Ok(v) = serde_json::to_value(&ev) {
-                let _ = ev_tx.send(v);
+        loop {
+            match events.recv().await {
+                Ok(ev) => {
+                    if let Ok(v) = serde_json::to_value(&ev) {
+                        let _ = ev_tx.send(v);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => issue_session.report_lag(n),
+                Err(_) => break,
             }
         }
     });

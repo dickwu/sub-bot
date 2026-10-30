@@ -1,6 +1,7 @@
 use crate::{
-    config::{Client, Config, Profile},
-    webhook::{Deliverer, DeliveryStatus, RetryPolicy, WebhookTarget},
+    config::{Client, Config, Profile, ResolvedTarget},
+    issues::{IssueEvent, IssueScope, Reporter, Severity},
+    webhook::{Deliverer, DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
 use agent_ai::{faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
@@ -24,6 +25,10 @@ pub struct SessionHandle {
     pub profile: String,
     pub cwd: PathBuf,
     pub agent: Arc<Agent>,
+    pub issues: Arc<Reporter>,
+    issue_scope: Mutex<IssueScope>,
+    caller_tools: Vec<String>,
+    observing: AtomicBool,
     /// 调用方/配置请求的推理强度（解析前）
     pub requested_effort: Option<ThinkingLevel>,
     /// 最近一次成功调用实际使用的 (API, 推理强度)
@@ -39,6 +44,21 @@ pub use agent_core::Disposition;
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
+        if !self.observing.swap(true, Ordering::Relaxed) {
+            let mut rx = self.subscribe();
+            let weak = Arc::downgrade(self);
+            tokio::spawn(async move {
+                loop {
+                    let event = rx.recv().await;
+                    let Some(h) = weak.upgrade() else { break };
+                    match event {
+                        Ok(event) => h.report_event(&event),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => h.report_lag(n),
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
         let mut activity = self.last_activity.lock().unwrap();
         *activity = Instant::now();
         let msg_len = text.chars().count();
@@ -75,6 +95,7 @@ impl SessionHandle {
                 for m in new {
                     if let Err(e) = store.append_message(m) {
                         tracing::error!(error = %e, "persist failed");
+                        this.report_issue(Severity::Error, "session_persist_failed", "session", "Session persistence failed", serde_json::json!({}));
                     }
                 }
             }
@@ -97,6 +118,56 @@ impl SessionHandle {
     /// 最近一次调用实际使用的 API（还没调用过时为 None）。
     pub fn effective_api(&self) -> Option<agent_ai::Api> {
         self.last_call.lock().unwrap().map(|(a, _)| a)
+    }
+
+    pub fn set_request_id(&self, request_id: String) {
+        self.issue_scope.lock().unwrap().request_id = Some(request_id);
+    }
+
+    pub fn scope(&self) -> IssueScope {
+        self.issue_scope.lock().unwrap().clone()
+    }
+
+    pub fn report_issue(&self, severity: Severity, kind: &str, component: &str, message: &str, details: serde_json::Value) {
+        self.issues.report(IssueEvent::new(severity, kind, component, message).scope(self.scope()).details(details));
+    }
+
+    pub fn report_lag(&self, skipped: u64) {
+        self.report_issue(Severity::Warn, "events_lagged", "session", "Subscriber dropped events", serde_json::json!({"skipped": skipped}));
+    }
+
+    fn report_event(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::MessageEnd { message: Message::Assistant(a) }
+                if a.stop_reason == agent_ai::StopReason::Error || (a.error_message.is_some() && a.stop_reason != agent_ai::StopReason::Aborted) =>
+            {
+                let (kind, status) = classify_llm_error(a.error_message.as_deref().unwrap_or(""));
+                // Only fixed summaries escape this boundary, never provider bodies or echoed input.
+                self.report_issue(Severity::Error, kind, "llm", kind, serde_json::json!({"status": status, "stopReason": a.stop_reason}));
+            }
+            AgentEvent::ToolExecutionEnd { tool_name, tool_call_id, result, is_error: true } => {
+                let text = result.content.iter().filter_map(|c| if let agent_ai::Content::Text { text } = c { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join(" ").to_lowercase();
+                let kind = if text.contains("timed out") {
+                    "tool_timeout"
+                } else if text.contains("[aborted]") || text.contains("aborted before execution") {
+                    "tool_aborted"
+                } else if self.caller_tools.contains(tool_name) {
+                    "callback_failed"
+                } else {
+                    "tool_error"
+                };
+                let exit_code = text.split("exit code ").nth(1).and_then(|s| s.split(|c: char| !c.is_ascii_digit() && c != '-').next()).and_then(|s| s.parse::<i32>().ok());
+                self.issues.report(
+                    IssueEvent::new(Severity::Warn, kind, "tool", "Tool execution failed")
+                        .scope(self.scope())
+                        .tool(tool_name)
+                        .details(serde_json::json!({"toolCallId": tool_call_id, "exitCode": exit_code})),
+                );
+            }
+            AgentEvent::RunOutcome { kind } => self.report_issue(if kind == "task_panic" { Severity::Fatal } else { Severity::Warn }, kind, "runtime", kind, serde_json::json!({})),
+            AgentEvent::AgentSettled { aborted: true } => self.report_issue(Severity::Warn, "run_aborted", "runtime", "Run aborted", serde_json::json!({})),
+            _ => {}
+        }
     }
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<AgentEvent> {
@@ -146,6 +217,30 @@ pub enum TaskStatus {
     Aborted,
 }
 
+pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
+    let text = message.to_lowercase();
+    let status = [401, 403, 429].into_iter().find(|code| text.contains(&code.to_string()));
+    let kind = if matches!(status, Some(401 | 403)) || text.contains("invalid api key") {
+        "llm_auth"
+    } else if status == Some(429) {
+        "llm_rate_limit"
+    } else if text.contains("context length") || text.contains("context_length") {
+        "llm_context_overflow"
+    } else if text.contains("idle timeout") || text.contains("idle timed out") {
+        "llm_stream_timeout"
+    } else {
+        "llm_error"
+    };
+    (kind, status)
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct TargetDelivery {
+    pub host: String,
+    #[serde(flatten)]
+    pub status: DeliveryStatus,
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -158,6 +253,7 @@ pub struct Task {
     pub result: Option<serde_json::Value>,
     pub error: Option<String>,
     pub delivery: Option<DeliveryStatus>,
+    pub deliveries: Vec<TargetDelivery>,
     #[serde(skip)]
     finished: Option<Instant>,
 }
@@ -170,7 +266,8 @@ pub type WebhookQueue = tokio::sync::mpsc::UnboundedSender<(&'static str, serde_
 
 pub struct Hub {
     pub config: Config,
-    provider: Arc<dyn Provider>,
+    pub issues: Arc<Reporter>,
+    pub(crate) provider: Arc<dyn Provider>,
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
@@ -248,6 +345,7 @@ impl Hub {
         let webhook_http = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build()?;
         let deliverer = Deliverer::new(webhook_http, RetryPolicy { max_attempts: config.webhook_max_attempts, ..Default::default() });
         Ok(Arc::new(Self {
+            issues: crate::issues::global().unwrap_or_else(Reporter::noop),
             tasks: Mutex::new(HashMap::new()),
             deliverer,
             config,
@@ -268,7 +366,7 @@ impl Hub {
     }
 
     /// Admission and task registration share the session lock with shutdown/removal.
-    pub fn submit_task(&self, client: &Client, session_id: &str, text: String) -> Option<Task> {
+    pub fn submit_task(&self, client: &Client, session_id: &str, text: String, targets: &[ResolvedTarget]) -> Option<Task> {
         let sessions = self.sessions.lock().unwrap();
         if self.is_shutting_down() {
             return None;
@@ -284,11 +382,28 @@ impl Hub {
             result: None,
             error: None,
             delivery: None,
+            deliveries: vec![],
             finished: None,
         };
+        h.issue_scope.lock().unwrap().task_id = Some(task.task_id.clone());
         self.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
+        let issue_targets: Vec<_> = targets.iter().filter(|t| t.wants("issues")).cloned().collect();
+        if !issue_targets.is_empty() {
+            self.issues.subscribe(crate::issues::ScopeKey::Task(task.task_id.clone()), client.name.clone(), issue_targets.clone());
+            self.issues.subscribe(crate::issues::ScopeKey::Session(session_id.into()), client.name.clone(), issue_targets);
+        }
         h.submit(text, None);
         Some(task)
+    }
+
+    pub fn unsubscribe_task(&self, task_id: &str, session: &SessionHandle) {
+        self.issues.unsubscribe(&crate::issues::ScopeKey::Task(task_id.into()));
+        let mut scope = session.issue_scope.lock().unwrap();
+        // A newer task may already have replaced the session subscription during the grace period.
+        if scope.task_id.as_deref() == Some(task_id) {
+            self.issues.unsubscribe(&crate::issues::ScopeKey::Session(session.id.clone()));
+            scope.task_id = None;
+        }
     }
 
     pub fn get_task(&self, client: &Client, id: &str) -> Option<Task> {
@@ -306,20 +421,37 @@ impl Hub {
         Some(task.clone())
     }
 
-    /// One sequential worker per task: progress attempts finish before the final event starts.
-    /// Unbounded enqueue keeps slow receivers from delaying chat timeout/abort processing.
+    /// One sequential worker per receiver, so retries never block other targets.
     pub fn webhook_queue(self: &Arc<Self>, id: String, target: WebhookTarget) -> WebhookQueue {
+        let host = reqwest::Url::parse(&target.url).ok().and_then(|u| u.host_str().map(str::to_owned)).unwrap_or_default();
+        let index = {
+            let mut tasks = self.tasks.lock().unwrap();
+            let task = tasks.get_mut(&id).expect("registered task");
+            let index = task.deliveries.len();
+            task.deliveries.push(TargetDelivery {
+                host: host.clone(),
+                status: DeliveryStatus { delivery_id: String::new(), event: String::new(), state: DeliveryState::Pending, attempts: 0, last_status: None, last_error: None },
+            });
+            index
+        };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(&'static str, serde_json::Value)>();
         let hub = self.clone();
         tokio::spawn(async move {
             while let Some((event, payload)) = rx.recv().await {
                 let update = |status: &DeliveryStatus| {
                     if let Some(task) = hub.tasks.lock().unwrap().get_mut(&id) {
-                        task.delivery = Some(status.clone());
+                        task.deliveries[index].status = status.clone();
+                        if index == 0 && event == "task.completed" && status.state != DeliveryState::Pending {
+                            task.delivery = Some(status.clone());
+                        }
                     }
                 };
                 let final_status = hub.deliverer.deliver(&target, event, &payload, &update).await;
                 update(&final_status);
+                if final_status.state == DeliveryState::Failed {
+                    let client = hub.tasks.lock().unwrap().get(&id).map(|t| t.owner.clone());
+                    hub.issues.on_delivery_failed(&final_status, &host, client.as_deref());
+                }
             }
         });
         tx
@@ -341,6 +473,8 @@ impl Hub {
         if cap != 0 && sessions.values().filter(|h| h.owner == client.name).count() >= cap {
             Self::evict_idle_from(&mut sessions, Instant::now(), Some(&client.name));
             if sessions.values().filter(|h| h.owner == client.name).count() >= cap {
+                self.issues
+                    .report(IssueEvent::new(Severity::Warn, "session_limit", "session", "Client session limit reached").scope(IssueScope { client: Some(client.name.clone()), ..Default::default() }));
                 return Err(TooManySessions.into());
             }
         }
@@ -376,6 +510,7 @@ impl Hub {
         let (cwd, root) = resolve_cwd(p, req.cwd.as_deref())?;
         let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone(), shell_env: p.shell_env.clone() };
         let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&selected, &ctx)?;
+        let caller_tools = req.caller_tools.iter().map(|t| t.name.clone()).collect();
         for spec in req.caller_tools {
             if tools.iter().any(|t| t.name() == spec.name) {
                 bail!("caller tool '{}' collides with a built-in tool", spec.name);
@@ -421,6 +556,16 @@ impl Hub {
         };
         tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {
+            issues: self.issues.clone(),
+            issue_scope: Mutex::new(IssueScope {
+                client: Some(client.name.clone()),
+                session_id: Some(id.clone()),
+                profile: Some(profile_name.clone()),
+                model: Some(config.model.clone()),
+                ..Default::default()
+            }),
+            caller_tools,
+            observing: AtomicBool::new(false),
             id: id.clone(),
             owner: client.name.clone(),
             profile: profile_name,
@@ -470,6 +615,11 @@ impl Hub {
             self.shutting_down.store(true, Ordering::Relaxed);
             sessions.drain().map(|(_, h)| h).collect()
         };
+        let n = sessions.iter().filter(|h| h.agent.is_running()).count();
+        let m = self.tasks.lock().unwrap().values().filter(|t| t.status == TaskStatus::Running).count();
+        if n > 0 || m > 0 {
+            self.issues.report(IssueEvent::new(Severity::Warn, "shutdown_inflight", "runtime", "Shutdown with in-flight work").details(serde_json::json!({"sessions": n, "tasks": m})));
+        }
         for h in &sessions {
             h.agent.abort();
         }
@@ -548,6 +698,62 @@ mod tests {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         cfg
+    }
+
+    #[test]
+    fn llm_classification_and_safe_tool_issues() {
+        for (text, expected) in [
+            ("HTTP 401 secret", "llm_auth"),
+            ("403", "llm_auth"),
+            ("invalid API key", "llm_auth"),
+            ("429", "llm_rate_limit"),
+            ("context length exceeded", "llm_context_overflow"),
+            ("stream idle timeout", "llm_stream_timeout"),
+            ("unknown", "llm_error"),
+        ] {
+            assert_eq!(classify_llm_error(text).0, expected);
+        }
+        let hub = Hub::new(config(), "faux", None, None).unwrap();
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        for (text, kind) in [("[timed out] PRIVATE_OUTPUT", "tool_timeout"), ("[aborted] PRIVATE_OUTPUT", "tool_aborted"), ("PRIVATE_OUTPUT [exit code 7]", "tool_error")] {
+            h.report_event(&AgentEvent::ToolExecutionEnd { tool_call_id: "call".into(), tool_name: "bash".into(), result: agent_core::ToolResult::error(text), is_error: true });
+            let events = hub.issues.recent(Some("default"), 0, 1);
+            assert_eq!(events[0].kind, kind);
+            assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_OUTPUT"));
+        }
+        h.report_lag(42);
+        let events = hub.issues.recent(Some("default"), 0, 1);
+        assert_eq!(events[0].kind, "events_lagged");
+        assert_eq!(events[0].details["skipped"], 42);
+    }
+
+    #[tokio::test]
+    async fn run_limits_emit_scoped_issues() {
+        for kind in ["max_turns", "token_budget_exceeded", "run_timeout"] {
+            let mut cfg = config();
+            let profile = cfg.profiles.get_mut("default").unwrap();
+            match kind {
+                "max_turns" => profile.max_turns = 0,
+                "token_budget_exceeded" => profile.token_budget = Some(0),
+                _ => profile.run_timeout_secs = Some(0),
+            }
+            let hub = Hub::new(cfg, "faux", None, None).unwrap();
+            let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+            let mut rx = h.subscribe();
+            h.submit("/tool bash {\"command\":\"sleep 10\"}".into(), None);
+            settled(&mut rx).await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if hub.issues.recent(Some("default"), 0, 100).iter().any(|e| e.kind == kind && e.scope.session_id.as_deref() == Some(&h.id)) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            hub.abort_all().await;
+        }
     }
 
     #[test]

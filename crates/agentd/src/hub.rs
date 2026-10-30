@@ -7,7 +7,10 @@ use anyhow::{bail, Result};
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -136,6 +139,7 @@ pub struct Hub {
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    shutting_down: AtomicBool,
     http: reqwest::Client,
     models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
 }
@@ -188,6 +192,7 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
 impl Hub {
     /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
     pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>) -> Result<Arc<Self>> {
+        config.validate()?;
         let provider: Arc<dyn Provider> = match provider_name {
             "faux" => Arc::new(FauxProvider),
             "openai" => {
@@ -201,15 +206,16 @@ impl Hub {
             other => bail!("unknown provider {other}"),
         };
         let registry = ToolRegistry::with_builtins();
-        // 启动时校验所有 profile 的工具名，配置错误尽早暴露
-        for (name, p) in &config.profiles {
-            for t in expand_tools(&p.tools)? {
-                if registry.risk(&t).is_none() {
-                    bail!("profile '{name}': unknown tool '{t}'");
-                }
-            }
-        }
-        Ok(Arc::new(Self { config, provider, registry, session_dir, sessions: Mutex::new(HashMap::new()), http: reqwest::Client::new(), models_cache: Default::default() }))
+        Ok(Arc::new(Self {
+            config,
+            provider,
+            registry,
+            session_dir,
+            sessions: Mutex::new(HashMap::new()),
+            shutting_down: AtomicBool::new(false),
+            http: reqwest::Client::new(),
+            models_cache: Default::default(),
+        }))
     }
 
     pub fn create_session(&self, client: &Client, req: SessionRequest) -> Result<Arc<SessionHandle>> {
@@ -223,6 +229,7 @@ impl Hub {
     fn create_session_with_ttl(&self, client: &Client, req: SessionRequest, ephemeral: bool) -> Result<Arc<SessionHandle>> {
         // 上限检查与插入共用 map 锁，避免并发创建突破上限。
         let mut sessions = self.sessions.lock().unwrap();
+        anyhow::ensure!(!self.shutting_down.load(Ordering::Relaxed), "server is shutting down");
         let cap = self.config.max_sessions_per_client;
         if cap != 0 && sessions.values().filter(|h| h.owner == client.name).count() >= cap {
             Self::evict_idle_from(&mut sessions, Instant::now(), Some(&client.name));
@@ -341,6 +348,22 @@ impl Hub {
         h.agent.abort();
         tracing::info!(session_id = %h.id, bot = %h.owner, "session deleted; persisted JSONL files retained");
         true
+    }
+
+    /// 关机时禁止新会话/提交，取消全部运行并等待持久化完成；释放 handle 后 SSE 也会结束。
+    pub async fn abort_all(&self) {
+        let sessions: Vec<_> = {
+            let mut sessions = self.sessions.lock().unwrap();
+            self.shutting_down.store(true, Ordering::Relaxed);
+            sessions.drain().map(|(_, h)| h).collect()
+        };
+        for h in &sessions {
+            h.agent.abort();
+        }
+        // Agent 在持久化回调之后才清除 running；不持有 map 锁跨 await。
+        while sessions.iter().any(|h| h.agent.is_running()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     pub fn evict_idle(&self, now: Instant) -> usize {
@@ -499,6 +522,35 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn abort_all_settles_persists_and_prevents_new_runs() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-shutdown-{}", uuid::Uuid::new_v4()));
+        let hub = Hub::new(config(), "faux", Some(dir.clone()), None).unwrap();
+        let client = &hub.config.clients[0];
+        let mut handles = vec![];
+        for _ in 0..2 {
+            let h = hub.create_session(client, SessionRequest::default()).unwrap();
+            let rx = h.subscribe();
+            h.submit("hello".into(), None);
+            h.submit("discard this queued message".into(), None);
+            handles.push((h, rx));
+        }
+        tokio::time::timeout(Duration::from_secs(5), hub.abort_all()).await.unwrap();
+        for (h, mut rx) in handles {
+            assert!(settled(&mut rx).await);
+            assert!(!h.agent.is_running());
+            let path = h.store.lock().unwrap().as_ref().unwrap().path.clone();
+            let persisted = Session::open(&path).unwrap().active_messages();
+            assert!(!persisted.is_empty());
+            assert_eq!(persisted, h.agent.messages().await);
+            assert!(!persisted.contains(&Message::user_text("discard this queued message")));
+            assert!(hub.submit(client, &h.id, "late".into(), None).is_none());
+        }
+        assert!(hub.create_session(client, SessionRequest::default()).err().unwrap().to_string().contains("shutting down"));
+        hub.abort_all().await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

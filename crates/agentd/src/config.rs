@@ -138,7 +138,32 @@ impl Config {
                 cfg.api_key_file = Some(dir.join(f));
             }
         }
+        cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// 只做结构/注册表校验，不访问工作目录或网络。
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let registry = agent_tools::ToolRegistry::with_builtins();
+        for (name, profile) in &self.profiles {
+            anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            for tool in &profile.tools {
+                let tools = match tool.strip_prefix("preset:") {
+                    Some(preset) => agent_tools::preset(preset).ok_or_else(|| anyhow::anyhow!("profile '{name}': unknown preset '{preset}'"))?,
+                    None => vec![tool.clone()],
+                };
+                for tool in tools {
+                    anyhow::ensure!(registry.risk(&tool).is_some(), "profile '{name}': unknown tool '{tool}'");
+                }
+            }
+        }
+        for client in &self.clients {
+            anyhow::ensure!(client.token_sha256.len() == 64 && client.token_sha256.bytes().all(|b| b.is_ascii_hexdigit()), "client '{}': tokenSha256 must be exactly 64 hex characters", client.name);
+            for profile in &client.profiles {
+                anyhow::ensure!(self.profiles.contains_key(profile), "client '{}': unknown profile '{profile}'", client.name);
+            }
+        }
+        Ok(())
     }
 
     /// 无配置文件时的默认值：一个以 `workspace` 为根、启用默认编码工具的 `default` profile + 单一 client。
@@ -189,7 +214,7 @@ impl Config {
     /// 常量时间比较哈希，找出 token 对应的客户端。
     pub fn client_for_token(&self, token: &str) -> Option<&Client> {
         let h = sha256_hex(token);
-        self.clients.iter().find(|c| c.token_sha256.len() == h.len() && c.token_sha256.bytes().zip(h.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0)
+        self.clients.iter().find(|c| c.token_sha256.len() == h.len() && c.token_sha256.bytes().zip(h.bytes()).fold(0u8, |a, (x, y)| a | (x.to_ascii_lowercase() ^ y)) == 0)
     }
 }
 
@@ -210,7 +235,39 @@ mod tests {
         let cfg = Config::fallback("faux".into(), "test-token", PathBuf::from("."));
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
         assert_eq!((cfg.stream_idle_timeout_secs, cfg.chat_timeout_secs), (300, 900));
+        cfg.validate().unwrap();
         assert_eq!(cfg.profiles["default"].run_timeout_secs, None);
+    }
+
+    #[test]
+    fn load_validates_profiles_tools_and_hashes() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-validation-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let valid = serde_json::json!({
+            "profiles": {"p": {"workspaceRoots": ["."], "tools": ["preset:readonly", "preset:no-shell", "preset:default", "clock", "http_fetch"]}},
+            "clients": [{"name": "bot", "tokenSha256": sha256_hex("test-token").to_uppercase(), "profiles": ["p"]}]
+        });
+        std::fs::write(&path, valid.to_string()).unwrap();
+        assert!(Config::load(&path).unwrap().client_for_token("test-token").is_some());
+        for (pointer, value, expected) in [
+            ("/clients/0/profiles/0", serde_json::json!("missing"), "client 'bot': unknown profile 'missing'"),
+            ("/profiles/p/workspaceRoots", serde_json::json!([]), "profile 'p': workspaceRoots must not be empty"),
+            ("/profiles/p/tools/0", serde_json::json!("missing"), "profile 'p': unknown tool 'missing'"),
+            ("/profiles/p/tools/0", serde_json::json!("preset:missing"), "profile 'p': unknown preset 'missing'"),
+        ] {
+            let mut invalid = valid.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            std::fs::write(&path, invalid.to_string()).unwrap();
+            assert_eq!(Config::load(&path).unwrap_err().to_string(), expected);
+        }
+        for hash in [String::new(), "a".repeat(63), "a".repeat(65), "g".repeat(64), "é".repeat(32), format!("{} ", "a".repeat(63))] {
+            let mut invalid = valid.clone();
+            invalid["clients"][0]["tokenSha256"] = serde_json::json!(hash);
+            std::fs::write(&path, invalid.to_string()).unwrap();
+            assert_eq!(Config::load(&path).unwrap_err().to_string(), "client 'bot': tokenSha256 must be exactly 64 hex characters");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

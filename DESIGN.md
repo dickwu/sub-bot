@@ -243,6 +243,16 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - 预算：profile 的 `maxOutputTokens` 限制单次输出；`tokenBudget` 限制整次运行，超出后注入一条提示并做最后一次不带工具的调用，让模型直接给出结论。
 - 表外模型（如 gpt-6.x）先原样发送；OpenAI 返回 400 时 `openai.rs` 解析错误（`Unrecognized request argument` → 不支持；`Supported values are: ...` → 可选档位），按模型缓存，warn 后自动重试一次。
 
+## v0.3.2 reliability
+
+- `agent-core::Agent::submit` 原子地启动或排队，返回 `Disposition`（`started` / `queued_steer` / `queued_follow_up`）；提交与收尾交接共用 state 锁，避免丢消息或重复启动。
+- 消息历史使用 `std::sync::Mutex`；模型请求读取快照，只在更新/复制时短暂持锁，不跨 `await`。工具调用前检查取消（含并行分支）；abort 后丢弃尚未消费的排队消息，持久化完成后才发送 `agent_settled`。
+- RPC 的长命令（历史快照、模型列表）放进 `JoinSet` 后台执行，stdin 循环仍可及时处理 abort/steer。
+- 会话 TTL、owner 删除和容量限制见上文「会话生命周期」；`serve` 同时处理 Ctrl-C / SIGTERM，关机时禁止新建/提交，abort 全部会话并等待收尾持久化。
+- 超时分三层：LLM 流空闲、profile 整次运行、非流式 chat 等待；chat 超时取消运行并返回 504 和部分结果。bash 使用独立进程组，取消/超时/清理时杀掉子孙进程；工具输出和网络响应均有资源上限，数值见 README。
+- 日志过滤在解析 `RUST_LOG` 后追加网络依赖的 `warn` 抑制指令，覆盖同名用户指令，避免请求头进入 trace 日志。
+- CI：fmt 检查、全 workspace/all-targets clippy（`-D warnings`），Ubuntu/macOS 跑 locked 测试。release 先检查 tag 与 workspace 版本一致并通过相同门禁，再构建四个目标、打包和发布校验和。
+
 ## (e) MVP 里程碑
 
 | 里程碑 | 内容 | 验收 |

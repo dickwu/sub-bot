@@ -37,6 +37,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 
 离线试用（不调用 OpenAI）：加上 `--provider faux`。
 
+`serve` 收到 Ctrl-C 或 SIGTERM 时停止接受新会话/提交，取消正在运行的会话，等运行收尾并写入 JSONL 后退出。
+
 ## 配置（`sub-bot.json`）
 
 ```jsonc
@@ -80,7 +82,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 }
 ```
 
-- **`sub-bot.example.json` 里的 `tokenSha256` 是占位符，必须替换**。配置里只存 token 的 SHA-256，不存原文。
+- **`sub-bot.example.json` 里的 `tokenSha256` 是占位符，必须替换**。配置里只存 token 的 SHA-256，不存原文；加载时要求恰好 64 个十六进制字符，并拒绝未知 profile 引用、空 `workspaceRoots`、未知工具或预设。
 - 全局参数（也可以用环境变量设置）：
   - `--config`（`SUB_BOT_CONFIG`）
   - `--provider openai|faux`
@@ -220,6 +222,14 @@ key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不�
 - 内容中含有 key 的其它环境变量（不是上面这些变量名）不会被识别，需要自己加进 `deny` 或用 `allowlist`。
 
 因此**推荐用 key 文件**（不出现在任何进程的环境里），文件放在 `workspaceRoots` 之外。要真正隔离，请让 sub-bot 以单独的系统用户运行，或者把 bash 放进容器/沙箱。
+
+## 工具资源上限
+
+- `bash`：通过 `sh -c` 运行，独立进程组；取消、超时或清理时杀掉整个进程组（含子孙进程）。`timeoutSecs` 默认 120 秒，最多 1800 秒，等待输出管道 EOF 也计入超时。stdout/stderr 各捕获 256 KiB（合计 512 KiB），继续排空超出的输出并报告丢弃字节数；返回文本最多 50,000 字节（另加状态/截断提示）。
+- `read`：最多读取 2 MiB，返回文本最多 50,000 字节，超出附截断提示。
+- `ls`：最多保留 1000 个目录项并排序，附省略项数。
+- `http_fetch`：响应体最多读取 2 MiB，返回文本最多 50,000 字节，超出附截断提示；连接超时 15 秒，总超时 60 秒（含响应体读取），支持取消。
+- 调用方 `callback`：响应体最多 1 MiB，超出报错；总超时 120 秒（含响应体读取），支持取消。
 
 ## 安全提示
 

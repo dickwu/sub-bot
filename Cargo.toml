@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/agent-ai", "crates/agent-core", "crates/agent-tools", "crates/agent-session", "crates/agentd"]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 repository = "https://github.com/dickwu/sub-bot"
 

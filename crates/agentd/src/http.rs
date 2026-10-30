@@ -90,6 +90,7 @@ fn router(st: AppState) -> Router {
 }
 
 pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let mut tasks = tokio::task::JoinSet::new();
     if let Some(period) = hub.sweep_interval() {
@@ -104,9 +105,14 @@ pub async fn serve(hub: Arc<Hub>, bind: SocketAddr) -> anyhow::Result<()> {
         });
     }
     // JoinSet 在退出（包括错误/取消）时终止后台清理任务。
-    axum::serve(listener, router(AppState { hub }))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
+    axum::serve(listener, router(AppState { hub: hub.clone() }))
+        .with_graceful_shutdown(async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+            tracing::info!("shutting down; aborting sessions");
+            hub.abort_all().await;
         })
         .await?;
     Ok(())

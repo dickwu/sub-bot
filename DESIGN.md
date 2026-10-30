@@ -115,7 +115,11 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 - 工具内部还会做一次 `resolve_in_root` 校验（拒绝绝对路径和 `..`）。
 - 请求里的 `tools` 只能在 profile 白名单范围内**收窄**，不能扩大。
 - `systemPrompt`/`appendSystemPrompt` 覆盖需要 profile 设置 `allowSystemPromptOverride`；调用方回调工具需要 `allowCallerTools`。
-- **OpenAI Key** 只从 `OPENAI_API_KEY` 环境变量读入内存，任何响应、事件和日志中都不会出现；bot 拿不到它。
+- **OpenAI Key（v0.3.1）**：`agent_ai::secrets` 负责加载，顺序为 `--openai-key-file` > `OPENAI_API_KEY_FILE` > 配置 `apiKeyFile` > `OPENAI_API_KEY`。读文件时去掉首尾空白；出错时只报路径和原因，不带内容。key 在内存里用 `Secret` 包装：`Debug`/`Display` 输出 `[redacted]`，drop 时清零，只在设置 `Authorization` 头时 `expose()`。任何响应、事件和日志里都不会出现 key，日志只记录来源。
+- **bash 子进程环境**：spawn 的地方只有一个（`builtin/fs.rs` 的 `BashTool`），这里会应用 `agent_tools::ShellEnv`。
+  - 内置密钥变量表 `secrets::secret_env_vars()` 包括各 provider 的 `*_API_KEY`/`*_API_KEY_FILE`（登记在 `PROVIDER_KEYS`，以后加 provider 时在这里加一行），以及 `SUB_BOT_TOKEN(_FILE)`。运行时还能用 `register_secret_var` 追加。这些变量总会被 `env_remove`。
+  - profile 的 `shellEnv {mode: inherit|allowlist, deny, allow}` 再做一层过滤：`inherit` 剔除 `deny` 中且不在 `allow` 中的变量；`allowlist` 先 `env_clear`，再只放回 `BASE_ALLOWLIST` 加 `allow`，最后减去 `deny`。
+  - 没有用进程内 `remove_var`：它清不掉 `/proc/<pid>/environ`，多线程下还不安全。同用户的子进程依然可以读 key 文件或 `/proc/<ppid>/environ`，所以 README 推荐用文件提供 key，并建议用独立用户或沙箱做真正隔离。
 - 默认只监听 `127.0.0.1:7878`。如果要跨机器访问，建议经过反向代理加 TLS（M3 会内建 rustls 支持）。
 
 ### HTTP API（`/v1`）
@@ -247,7 +251,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 ```bash
 cd /workspace/rust-agent
 cargo build --release
-export OPENAI_API_KEY=sk-...          # 只在本机环境中
+export OPENAI_API_KEY_FILE=~/.config/sub-bot/openai.key   # 推荐；也可用 --openai-key-file 或 OPENAI_API_KEY
 ./target/release/sub-bot hash-token my-bot-token   # 把结果填进配置的 tokenSha256
 ./target/release/sub-bot --config sub-bot.example.json serve           # HTTP 服务
 ./target/release/sub-bot --workspace ~/code rpc                       # stdio RPC

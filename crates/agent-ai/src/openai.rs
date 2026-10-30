@@ -10,7 +10,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 
 pub struct OpenAiProvider {
-    api_key: String,
+    api_key: crate::secrets::Secret,
     base_url: String,
     http: reqwest::Client,
     /// 运行时从 400 错误里学到的推理强度能力
@@ -63,7 +63,7 @@ fn parse_effort_error(body: &str) -> Option<EffortError> {
 
 impl OpenAiProvider {
     /// key 只在进程内存中，从不通过对外接口返回。
-    pub fn new(api_key: String, base_url: Option<String>) -> Self {
+    pub fn new(api_key: crate::secrets::Secret, base_url: Option<String>) -> Self {
         Self {
             api_key,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
@@ -136,7 +136,7 @@ impl Provider for OpenAiProvider {
     fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::models::ModelInfo>, String>> {
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let resp = self.http.get(format!("{}/models", self.base_url)).bearer_auth(&self.api_key).timeout(std::time::Duration::from_secs(30)).send().await.map_err(|e| e.to_string())?;
+            let resp = self.http.get(format!("{}/models", self.base_url)).bearer_auth(self.api_key.expose()).timeout(std::time::Duration::from_secs(30)).send().await.map_err(|e| e.to_string())?;
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             if !status.is_success() {
@@ -210,7 +210,7 @@ struct PartialCall {
 struct CallCtx {
     http: reqwest::Client,
     base_url: String,
-    key: String,
+    key: crate::secrets::Secret,
     effort_cache: EffortCache,
     api_cache: Arc<Mutex<HashMap<String, Api>>>,
 }
@@ -235,7 +235,7 @@ async fn run(ctx: CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Assi
             span.record("api", api.as_str());
             span.record("reasoning_effort", effort.map(|l| l.as_str()).unwrap_or("-"));
         };
-        let resp = ctx.http.post(&url).bearer_auth(&ctx.key).json(&body).send().await.map_err(|e| redact(&e.to_string()))?;
+        let resp = ctx.http.post(&url).bearer_auth(ctx.key.expose()).json(&body).send().await.map_err(|e| redact(&e.to_string()))?;
         if resp.status().is_success() {
             record(api, req.reasoning);
             break resp;

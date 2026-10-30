@@ -14,10 +14,12 @@ pub enum Risk {
 }
 
 /// 构造工具时所需的会话级上下文。`cwd` 是该会话的工作目录（所有文件路径都限制在其中）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub http_allow_hosts: Vec<String>,
+    /// bash 子进程的环境变量策略
+    pub shell_env: crate::ShellEnv,
 }
 
 /// 默认启用的编码工具（pi 的默认是 read/bash/edit/write，见 agent-session.ts 中的 defaultTools）。
@@ -44,7 +46,7 @@ impl ToolRegistry {
         r.register("ls", Risk::ReadFs, |c| Some(Arc::new(LsTool { root: c.cwd.clone() })));
         r.register("edit", Risk::WriteFs, |c| Some(Arc::new(EditTool { root: c.cwd.clone() })));
         r.register("write", Risk::WriteFs, |c| Some(Arc::new(WriteTool { root: c.cwd.clone() })));
-        r.register("bash", Risk::Exec, |c| Some(Arc::new(BashTool { root: c.cwd.clone() })));
+        r.register("bash", Risk::Exec, |c| Some(Arc::new(BashTool { root: c.cwd.clone(), env: c.shell_env.clone() })));
         // 可选辅助
         r.register("clock", Risk::Safe, |_| Some(Arc::new(ClockTool)));
         r.register("http_fetch", Risk::Network, |c| Some(Arc::new(HttpFetchTool { allow_hosts: c.http_allow_hosts.clone(), http: reqwest::Client::new() })));

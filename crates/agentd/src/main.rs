@@ -56,6 +56,9 @@ struct Cli {
     /// 会话 JSONL 存放目录（按 client 分子目录）；不填则不持久化
     #[arg(long, global = true, env = "SUB_BOT_SESSION_DIR")]
     session_dir: Option<PathBuf>,
+    /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile > OPENAI_API_KEY
+    #[arg(long, global = true)]
+    openai_key_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -134,16 +137,16 @@ async fn main() -> anyhow::Result<()> {
             if cli.config.is_none() {
                 eprintln!("no --config: single client 'default', Authorization: Bearer {token}");
             }
-            let hub = hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone())?;
+            let hub = hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
             eprintln!("sub-bot listening on http://{bind}");
             http::serve(hub, bind).await?;
         }
         Cmd::Rpc { ref profile } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone())?;
+            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
             rpc::run(hub, session_req(profile.clone())).await?;
         }
         Cmd::Run { ref profile, json, ref prompt } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone())?;
+            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
             let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone()))?;
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
@@ -191,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Cmd::Models { all, ref profile, json } => {
-            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone())?;
+            let hub = hub::Hub::new(load("")?, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())?;
             let mut list = hub.list_models(all).await?;
             if let Some(name) = profile {
                 let p = hub.config.profiles.get(name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;

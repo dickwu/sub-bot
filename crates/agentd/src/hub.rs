@@ -191,11 +191,16 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
 }
 
 impl Hub {
-    pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>) -> Result<Arc<Self>> {
+    /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
+    pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>) -> Result<Arc<Self>> {
         let provider: Arc<dyn Provider> = match provider_name {
             "faux" => Arc::new(FauxProvider),
             "openai" => {
-                let Ok(key) = std::env::var("OPENAI_API_KEY") else { bail!("OPENAI_API_KEY is not set (or use --provider faux)") };
+                let pk = agent_ai::secrets::provider_key("openai").expect("openai key spec");
+                let (key, source) = agent_ai::secrets::load_provider_key(pk, openai_key_file, config.api_key_file.as_deref(), |k| std::env::var(k).ok())
+                    .map_err(|e| anyhow::anyhow!("{e} (or use --provider faux)"))?;
+                // 只记录来源（变量名/路径），不记录 key
+                tracing::info!(provider = "openai", key_source = %source, "api key loaded");
                 Arc::new(OpenAiProvider::new(key, std::env::var("OPENAI_BASE_URL").ok()))
             }
             other => bail!("unknown provider {other}"),
@@ -243,7 +248,7 @@ impl Hub {
         let id = store.as_ref().map(|s| s.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let (cwd, root) = resolve_cwd(p, req.cwd.as_deref())?;
-        let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone() };
+        let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone(), shell_env: p.shell_env.clone() };
         let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&selected, &ctx)?;
         for spec in req.caller_tools {
             if tools.iter().any(|t| t.name() == spec.name) {

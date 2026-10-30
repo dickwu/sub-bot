@@ -25,7 +25,9 @@
 ## 快速开始
 
 ```bash
-export OPENAI_API_KEY=...
+# 推荐：key 放文件（600 权限），不进入环境变量，详见下文「API key」
+mkdir -p ~/.config/sub-bot && install -m 600 /dev/null ~/.config/sub-bot/openai.key && $EDITOR ~/.config/sub-bot/openai.key
+export OPENAI_API_KEY_FILE=~/.config/sub-bot/openai.key   # 或 --openai-key-file / 配置 apiKeyFile；也仍支持 OPENAI_API_KEY
 sub-bot hash-token "$(openssl rand -hex 24)"   # 记下 token 原文给 bot，把输出的哈希填进配置
 cp sub-bot.example.json sub-bot.json   # 编辑 profiles / clients
 sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
@@ -42,6 +44,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "defaultModel": "gpt-4.1-mini",
   "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
+  "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
   "profiles": {
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
@@ -57,7 +60,12 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
-      "maxTurns": 50
+      "maxTurns": 50,
+      "shellEnv": {                            // 可选：bash 子进程的环境变量策略
+        "mode": "inherit",                     // inherit（默认，继承后剔除）| allowlist（清空后只保留基础变量和 allow）
+        "deny": ["AWS_*", "GITHUB_TOKEN"],     // 额外剔除，支持 * 通配
+        "allow": []                            // inherit 下豁免 deny；allowlist 下额外保留
+      }
     }
   },
   "clients": [
@@ -74,6 +82,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh`
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
+  - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
   - `--log-level`、`--log-dir`、`--log-format`
 
 ## 模型与推理强度
@@ -171,6 +180,27 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 模型和推理强度用全局参数指定：`sub-bot --model gpt-5.4-mini --reasoning-effort low rpc --profile coder`。
 
 支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
+
+## API key
+
+sub-bot 按以下顺序查找 OpenAI key，取第一个非空的：
+
+1. `--openai-key-file <路径>`
+2. `OPENAI_API_KEY_FILE` 环境变量（指向文件）
+3. 配置文件里的 `apiKeyFile`
+4. `OPENAI_API_KEY` 环境变量
+
+key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不到、为空或中间含空白时会明确报错，但报错不会包含文件内容。文件权限对 group/other 可读时会打一条警告，建议 `chmod 600`。日志只记录 key 的来源（变量名或路径），不记录 key。`ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` 已登记在同一套机制里，供以后的 Anthropic provider 使用。
+
+**bash 工具的环境变量**：bash 子进程启动时总会剔除 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`SUB_BOT_TOKEN` 及对应的 `*_FILE` 变量，`allow` 也无法放行。其它变量由 profile 的 `shellEnv` 决定：默认 `inherit` 会继承其余变量；`allowlist` 只保留 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TZ`、`TMPDIR` 等基础变量和 `allow` 里的变量。如果你的环境里还有别的密钥（如 `AWS_*`、`GITHUB_TOKEN`），请写进 `deny`，或者直接用 `allowlist`。
+
+**局限（同用户）**：这只能阻止 key 通过环境变量直接传给子进程。bash 和 sub-bot 以同一个系统用户运行，所以：
+
+- 如果 key 来自环境变量，子进程仍可以读 `/proc/<sub-bot 的 pid>/environ`（Linux），里面是 sub-bot 启动时的环境，进程内 `unsetenv` 也清不掉；
+- 如果 key 来自文件，子进程可以直接读这个文件（只要知道路径）；
+- 内容中含有 key 的其它环境变量（不是上面这些变量名）不会被识别，需要自己加进 `deny` 或用 `allowlist`。
+
+因此**推荐用 key 文件**（不出现在任何进程的环境里），文件放在 `workspaceRoots` 之外。要真正隔离，请让 sub-bot 以单独的系统用户运行，或者把 bash 放进容器/沙箱。
 
 ## 安全提示
 

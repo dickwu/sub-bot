@@ -44,6 +44,8 @@ pub struct LsTool {
 }
 pub struct BashTool {
     pub root: PathBuf,
+    /// 子进程环境变量策略（默认剔除密钥变量）
+    pub env: crate::ShellEnv,
 }
 
 #[async_trait::async_trait]
@@ -134,6 +136,8 @@ impl AgentTool for BashTool {
         let mut c = tokio::process::Command::new("sh");
         c.args(["-c", cmd]);
         c.current_dir(&self.root).kill_on_drop(true);
+        // 不把 provider key / 服务 token 等密钥传给子进程
+        self.env.apply(&mut c);
         let out = tokio::select! {
             r = tokio::time::timeout(std::time::Duration::from_secs(secs), c.output()) => r.context("command timed out")??,
             _ = cancel.cancelled() => bail!("aborted"),
@@ -208,5 +212,37 @@ mod tests {
         let esc = t.execute("3", json!({"path":"../a.txt","edits":[]}), CancellationToken::new(), sink).await;
         assert!(esc.is_err());
         std::fs::remove_dir_all(root).ok();
+    }
+
+    fn out_text(r: &ToolResult) -> String {
+        r.content.iter().filter_map(|c| if let agent_ai::Content::Text { text } = c { Some(text.as_str()) } else { None }).collect()
+    }
+
+    /// bash 子进程看不到 provider key 等密钥变量。断言信息里不打印 env 输出，避免泄露测试机上的其它变量。
+    #[tokio::test]
+    async fn bash_does_not_inherit_secret_env() {
+        std::env::set_var("OPENAI_API_KEY", "sk-fake-test-key-not-real");
+        std::env::set_var("OPENAI_API_KEY_FILE", "/tmp/fake-key-file");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-fake-test");
+        std::env::set_var("SUBBOT_TEST_VISIBLE", "yes");
+        std::env::set_var("SUBBOT_TEST_DENIED", "secret");
+        let root = std::env::temp_dir();
+        let sink: UpdateSink = Arc::new(|_| {});
+        let run = |env: crate::ShellEnv, cmd: &'static str| {
+            let t = BashTool { root: root.clone(), env };
+            let sink = sink.clone();
+            async move { out_text(&t.execute("1", json!({"command": cmd}), CancellationToken::new(), sink).await.unwrap()) }
+        };
+        // 默认 inherit：密钥被剔除，其它变量保留
+        let out = run(Default::default(), "env | grep -c -e '^OPENAI_API_KEY' -e '^ANTHROPIC_API_KEY' -e 'sk-fake-test-key-not-real' -e 'sk-ant-fake-test'; echo visible=$SUBBOT_TEST_VISIBLE").await;
+        assert!(out.starts_with("0\n"), "secret env vars leaked into bash (output withheld)");
+        assert!(out.contains("visible=yes"), "non-secret variable should be inherited");
+        // deny 额外剔除
+        let deny = crate::ShellEnv { deny: vec!["SUBBOT_TEST_DEN*".into()], ..Default::default() };
+        assert!(run(deny, "echo d=${SUBBOT_TEST_DENIED:-unset}").await.contains("d=unset"));
+        // allowlist：只保留基础变量和 allow
+        let allow = crate::ShellEnv { mode: crate::EnvMode::Allowlist, allow: vec!["OPENAI_API_KEY".into()], ..Default::default() };
+        let out = run(allow, "echo v=${SUBBOT_TEST_VISIBLE:-unset} p=${PATH:+set} k=${OPENAI_API_KEY:-unset}").await;
+        assert!(out.contains("v=unset p=set k=unset"), "allowlist mode misbehaved");
     }
 }

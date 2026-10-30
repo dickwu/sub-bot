@@ -2,6 +2,7 @@
   "defaultModel": "gpt-4.1",
   "defaultReasoningEffort": "low",
   "defaultApi": "auto",
+  "apiKeyFile": "/etc/sub-bot/openai.key",
   "profiles": {
     "coder": {
       "model": "gpt-5.4-mini",
@@ -16,7 +17,15 @@
       "appendSystemPrompt": "Run the project's tests after making changes when possible.",
       "allowSystemPromptOverride": true,
       "allowCallerTools": true,
-      "api": "auto"
+      "api": "auto",
+      "shellEnv": {
+        "mode": "inherit",
+        "deny": [
+          "AWS_*",
+          "GITHUB_TOKEN"
+        ],
+        "allow": []
+      }
     },
     "reviewer": {
       "model": "gpt-4.1-mini",
@@ -29,7 +38,14 @@
       "appendSystemPrompt": "You only review code. Never modify files.",
       "maxTurns": 25,
       "maxOutputTokens": 8000,
-      "tokenBudget": 300000
+      "tokenBudget": 300000,
+      "shellEnv": {
+        "mode": "allowlist",
+        "allow": [
+          "CARGO_HOME",
+          "RUSTUP_HOME"
+        ]
+      }
     },
     "docs-writer": {
       "tools": [

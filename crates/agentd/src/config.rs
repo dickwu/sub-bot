@@ -37,6 +37,9 @@ pub struct Profile {
     pub load_context_files: bool,
     #[serde(default)]
     pub http_allow_hosts: Vec<String>,
+    /// bash 子进程的环境变量策略：`{mode: inherit|allowlist, deny, allow}`；默认 inherit 并剔除内置密钥变量
+    #[serde(default)]
+    pub shell_env: agent_tools::ShellEnv,
     /// 是否允许调用方在会话里覆盖 system prompt
     #[serde(default)]
     pub allow_system_prompt_override: bool,
@@ -77,6 +80,9 @@ pub struct Config {
     /// 默认 OpenAI API：auto（默认，gpt-5.4+/gpt-6.x/o 系列走 Responses）| chat | responses
     #[serde(default)]
     pub default_api: agent_ai::Api,
+    /// OpenAI API key 文件（相对路径相对于配置文件所在目录）。优先级低于 --openai-key-file 和 OPENAI_API_KEY_FILE，高于 OPENAI_API_KEY
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -92,7 +98,13 @@ pub fn sha256_hex(s: &str) -> String {
 
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
+        let mut cfg: Self = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        if let (Some(f), Some(dir)) = (&cfg.api_key_file, path.parent()) {
+            if f.is_relative() {
+                cfg.api_key_file = Some(dir.join(f));
+            }
+        }
+        Ok(cfg)
     }
 
     /// 无配置文件时的默认值：一个以 `workspace` 为根、启用默认编码工具的 `default` profile + 单一 client。
@@ -113,6 +125,7 @@ impl Config {
                 workspace_roots: vec![workspace],
                 load_context_files: true,
                 http_allow_hosts: vec![],
+                shell_env: Default::default(),
                 allow_system_prompt_override: true,
                 allow_caller_tools: true,
                 max_turns: 30,
@@ -122,6 +135,7 @@ impl Config {
             default_model: model,
             default_reasoning_effort: None,
             default_api: Default::default(),
+            api_key_file: None,
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()] }],
         }
@@ -136,5 +150,24 @@ impl Config {
     pub fn client_for_token(&self, token: &str) -> Option<&Client> {
         let h = sha256_hex(token);
         self.clients.iter().find(|c| c.token_sha256.len() == h.len() && c.token_sha256.bytes().zip(h.bytes()).fold(0u8, |a, (x, y)| a | (x ^ y)) == 0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_file_is_relative_to_config_and_shell_env_parses() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sub-bot.json");
+        std::fs::write(&path, r#"{"apiKeyFile":"keys/openai","profiles":{"p":{"workspaceRoots":["."],"shellEnv":{"mode":"allowlist","allow":["CARGO_*"]}}}}"#).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.api_key_file.as_deref(), Some(dir.join("keys/openai").as_path()));
+        let se = &cfg.profiles["p"].shell_env;
+        assert_eq!(se.mode, agent_tools::EnvMode::Allowlist);
+        assert_eq!(se.allow, vec!["CARGO_*".to_string()]);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

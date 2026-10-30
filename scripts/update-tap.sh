@@ -33,7 +33,7 @@ LINUX_INTEL_SHA=$(checksum x86_64-unknown-linux-musl)
 mkdir -p "$TAP_DIR/Formula"
 cat > "$TAP_DIR/Formula/sub-bot.rb" <<EOF
 class SubBot < Formula
-  desc "Self-hosted Rust agent server with tools, sessions, async tasks and signed webhooks"
+  desc "Self-hosted Rust agent server with sessions, async tasks and signed webhooks"
   homepage "https://github.com/dickwu/sub-bot"
   version "$VERSION"
 

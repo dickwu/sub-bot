@@ -809,7 +809,7 @@ pub(crate) fn required_accounts(config: &Config, default: &str) -> BTreeSet<Acco
 pub(crate) fn timed_keychain(inner: Arc<dyn KeychainReader>, timeout_secs: u64, grace: Duration, issues: Arc<Reporter>) -> TimedKeychain {
     TimedKeychain::new(inner, Duration::from_secs(timeout_secs)).grace(grace).on_wait(move |service, account| {
         let hint = agent_ai::keychain::wait_hint(service, account);
-        tracing::warn!(service, account, "{hint}");
+        tracing::warn!(issue = "typed", service, account, "{hint}");
         issues.report(IssueEvent::new(Severity::Warn, "keychain_waiting", "config", hint).details(serde_json::json!({"service": service, "account": account})));
     })
 }
@@ -864,7 +864,7 @@ fn load_providers(
                         KeyLoadError::Source(_) => "source_error",
                         KeyLoadError::Keychain(_) => "keychain",
                     };
-                    tracing::warn!(provider = id, account = %name, error = %e, "account unavailable");
+                    tracing::warn!(issue = "typed", provider = id, account = %name, error = %e, "account unavailable");
                     issues.report(
                         IssueEvent::new(Severity::Warn, "account_unavailable", "config", format!("Account {} could not be loaded; requests selecting it will fail", key_id.label()))
                             .scope(IssueScope { provider: Some(id.into()), account: Some(name.clone()), ..Default::default() })
@@ -1616,7 +1616,7 @@ pub(crate) mod tests {
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
         let slow = Arc::new(MockKeychain::with([(("sub-bot", "anthropic/default"), Ok("test-slow-value"))]).delayed(Duration::from_secs(30)));
         let kc = timed_keychain(slow.clone(), cfg.keychain_timeout_secs, Duration::from_millis(100), reporter.clone());
-        let (logs, guard) = capture_all();
+        let (logs, guard) = capture_with_issues(&reporter);
         let started = Instant::now();
         let e = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, |_| None, &kc, &ManagedStore::None).err().unwrap();
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1633,6 +1633,9 @@ pub(crate) mod tests {
         assert_eq!(logs.iter().filter(|l| l.contains(hint)).count(), 1, "{logs:?}");
         reporter.flush(Duration::from_secs(1)).await;
         let events = reporter.recent(None, 0, 100);
+        // 只有一条 typed keychain_waiting：WARN 日志带 issue="typed"，不会再被 IssuesLayer 转成 log_warn 重复上报
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(!events.iter().any(|e| e.kind == "log_warn"), "{events:?}");
         let waiting: Vec<_> = events.iter().filter(|e| e.kind == "keychain_waiting").collect();
         assert_eq!(waiting.len(), 1, "{events:?}");
         assert_eq!((waiting[0].severity, waiting[0].message.as_str()), (Severity::Warn, hint));
@@ -1938,6 +1941,14 @@ pub(crate) mod tests {
         use tracing_subscriber::layer::SubscriberExt;
         let capture = Capture::default();
         let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        (capture, guard)
+    }
+
+    /// 同 [`capture_all`]，并把 WARN/ERROR 日志按生产 IssuesLayer 的规则转发到 `reporter`（用于检查 log_warn 重复上报）。
+    fn capture_with_issues(reporter: &Arc<Reporter>) -> (AllFields, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = AllFields::default();
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()).with(crate::logging::IssuesTo(reporter.clone())));
         (capture, guard)
     }
 
@@ -2665,7 +2676,7 @@ pub(crate) mod tests {
             _ => None,
         };
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
-        let (logs, guard) = capture_all();
+        let (logs, guard) = capture_with_issues(&reporter);
         let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, env, &MockKeychain::default(), &ManagedStore::None).unwrap();
         drop(guard);
         // 一次性加载全部声明的账号；失败的可选账号只 warn
@@ -2681,6 +2692,9 @@ pub(crate) mod tests {
         reporter.flush(Duration::from_secs(1)).await;
         let events = reporter.recent(None, 0, 100);
         assert_eq!(events.iter().find(|e| e.kind == "llm_auth").unwrap().message, "[redacted] [redacted] [redacted]");
+        // 一次 typed account_unavailable，没有 log_warn 重复
+        assert_eq!(events.iter().filter(|e| e.kind == "account_unavailable").count(), 1, "{events:?}");
+        assert!(!events.iter().any(|e| e.kind == "log_warn"), "{events:?}");
         let unavailable = events.iter().find(|e| e.kind == "account_unavailable").expect("account_unavailable issue");
         assert_eq!(unavailable.severity, Severity::Warn);
         assert_eq!((unavailable.scope.provider.as_deref(), unavailable.scope.account.as_deref()), (Some("openai"), Some("broken")));
@@ -2891,7 +2905,7 @@ pub(crate) mod tests {
         inner.config.providers.get_mut("openai").unwrap().accounts.get_mut("work").unwrap().fallback_accounts = vec!["backup".into(), "default".into()];
         inner.config.providers.get_mut("openai").unwrap().failover_cooldown_secs = Some(3600);
         let client = hub.config.clients[0].clone();
-        let (logs, guard) = capture_all();
+        let (logs, guard) = capture_with_issues(&hub.issues);
         let h = hub.create_session(&client, SessionRequest::default()).unwrap();
         prompt_and_wait(&h, "hello").await;
         drop(guard);
@@ -2907,6 +2921,9 @@ pub(crate) mod tests {
         assert_eq!(failover[0].details, serde_json::json!({"from": "work", "to": "default", "reason": "quota", "attempt": 1}));
         assert_eq!(failover[0].scope.account.as_deref(), Some("default"));
         assert!(!issues.iter().any(|e| e.kind == "llm_retry"));
+        // failover WARN 日志带 issue="typed"：不会再多一条 log_warn
+        let all = hub.issues.recent(None, 0, 100);
+        assert!(!all.iter().any(|e| e.kind == "log_warn"), "{all:?}");
         let logs = logs.0.lock().unwrap().clone();
         assert!(logs.iter().any(|l| l.starts_with("span:session_run") && l.contains("account=work")), "{logs:?}");
         assert!(logs.iter().any(|l| l.contains("session created") && l.contains("account=work")), "{logs:?}");

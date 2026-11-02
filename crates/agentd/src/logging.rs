@@ -61,6 +61,18 @@ impl<S: tracing::Subscriber> Layer<S> for IssuesLayer {
     }
 }
 
+/// Test-only IssuesLayer that reports into a given reporter instead of the global one.
+#[cfg(test)]
+pub(crate) struct IssuesTo(pub std::sync::Arc<crate::issues::Reporter>);
+#[cfg(test)]
+impl<S: tracing::Subscriber> Layer<S> for IssuesTo {
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(issue) = issue_from_event(event) {
+            self.0.report(issue);
+        }
+    }
+}
+
 fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEvent> {
     let meta = event.metadata();
     let target = meta.target();

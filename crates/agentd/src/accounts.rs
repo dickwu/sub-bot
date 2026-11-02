@@ -158,7 +158,8 @@ impl Provider for FailoverProvider {
                                 cooldowns.mark(&slot.key, Instant::now() + cooldown);
                                 if let Some(next) = order.get(i + 1).filter(|_| !cancel.is_cancelled()) {
                                     attempt += 1;
-                                    tracing::warn!(provider = %slot.key.provider, from = %slot.key.account, to = %next.key.account, class, "account failover");
+                                    // typed：hub 收到下面的 Retry 后上报 account_failover issue，日志不再重复转成 log_warn
+                                    tracing::warn!(issue = "typed", provider = %slot.key.provider, from = %slot.key.account, to = %next.key.account, class, "account failover");
                                     let reason = format!("{FAILOVER_PREFIX}{} -> {} ({class})", slot.key.account, next.key.account);
                                     if tx.send(AssistantEvent::Retry { attempt, reason }).await.is_err() {
                                         return;

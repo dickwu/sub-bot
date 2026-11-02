@@ -262,6 +262,9 @@ pub async fn run(args: &Ask, data_dir: PathBuf) -> anyhow::Result<()> {
         None => std::env::var("SUB_BOT_TOKEN").ok(),
     };
     let default_socket = data_dir.join("sub-bot.sock");
+    if args.socket.is_none() && args.url.is_none() {
+        crate::config::prepare_temp_data_dir(&default_socket, false)?;
+    }
     let socket = args.socket.clone().or_else(|| (args.url.is_none() && default_socket.exists()).then_some(default_socket));
     let client = Client::new(socket, args.url.clone(), token.as_deref())?;
     if !args.asynchronous {

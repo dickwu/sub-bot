@@ -32,8 +32,10 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
     };
     let Some(dir) = dir else {
         tracing_subscriber::registry().with(IssuesLayer).with(stderr).init();
+        crate::config::warn_data_dir_fallback();
         return Ok(None);
     };
+    crate::config::prepare_temp_data_dir(&dir, true)?;
     std::fs::create_dir_all(&dir)?;
     let appender = rolling::Builder::new().rotation(rolling::Rotation::DAILY).filename_prefix("sub-bot").filename_suffix("log").max_log_files(14).build(&dir)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
@@ -41,6 +43,7 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
     // text 文件层用独立的字段格式化类型：否则它和 stderr 层共用同一个 span 扩展，`span.record` 的字段会被追加两次
     let file = if format == "text" { file.fmt_fields(FileFields::default()).boxed() } else { file.json().with_current_span(true).with_span_list(true).boxed() };
     tracing_subscriber::registry().with(IssuesLayer).with(stderr).with(file.with_filter(filter())).init();
+    crate::config::warn_data_dir_fallback();
     tracing::debug!(log_dir = %dir.display(), "file logging enabled");
     Ok(Some(guard))
 }

@@ -87,11 +87,12 @@ mod tests {
     fn username_mapping_uses_kernel_uid() {
         // SAFETY: geteuid has no memory preconditions.
         let uid = unsafe { libc::geteuid() };
-        let name = username(uid).expect("current user has passwd entry");
+        let name = username(uid);
+        let has_passwd_entry = name.is_some();
         let mut cfg = Config::fallback("faux".into(), "token", ".".into());
-        cfg.local_clients = vec![crate::config::LocalClient { uid: None, username: Some(name), any: false, client: "default".into() }];
+        cfg.local_clients = vec![crate::config::LocalClient { uid: None, username: Some(name.unwrap_or_else(|| "sub-bot-nonexistent-user".into())), any: false, client: "default".into() }];
         cfg.validate().unwrap();
-        assert!(Peer::Unix { uid, gid: 0, pid: None }.client(&cfg).is_some());
+        assert_eq!(Peer::Unix { uid, gid: 0, pid: None }.client(&cfg).is_some(), has_passwd_entry);
         cfg.local_clients[0].username = Some("sub-bot-nonexistent-user".into());
         assert!(Peer::Unix { uid, gid: 0, pid: None }.client(&cfg).is_none());
     }
@@ -122,6 +123,7 @@ pub mod socket {
     }
 
     pub fn bind(path: &Path, mode: u32) -> anyhow::Result<(tokio::net::UnixListener, SocketGuard)> {
+        crate::config::prepare_temp_data_dir(path, true)?;
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
         match std::fs::symlink_metadata(path) {

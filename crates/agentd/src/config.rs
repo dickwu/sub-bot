@@ -2,7 +2,15 @@
 //! 示例见仓库根目录 `sub-bot.example.json`。
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Once,
+    },
+};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -309,9 +317,104 @@ pub fn sha256_hex(s: &str) -> String {
     Sha256::digest(s.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+static DATA_DIR_FALLBACK_USED: AtomicBool = AtomicBool::new(false);
+static DATA_DIR_FALLBACK_WARNING: Once = Once::new();
+
+/// Logging may not yet be initialized when the default log directory is resolved.
+pub(crate) fn warn_data_dir_fallback() {
+    if DATA_DIR_FALLBACK_USED.load(Ordering::Relaxed) && tracing::enabled!(tracing::Level::WARN) {
+        DATA_DIR_FALLBACK_WARNING.call_once(|| {
+            tracing::warn!("system data directory unavailable; using a fallback directory; set --data-dir or dataDir to select a persistent data directory");
+        });
+    }
+}
+
+fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    // SAFETY: geteuid has no arguments or memory preconditions.
+    unsafe {
+        libc::geteuid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn temp_data_dir(tmp: PathBuf, euid: u32) -> PathBuf {
+    #[cfg(unix)]
+    {
+        tmp.join(format!("sub-bot-{euid}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = euid;
+        tmp.join("sub-bot")
+    }
+}
+
+fn resolve_default_data_dir(base: Option<PathBuf>, xdg: Option<OsString>, tmp: PathBuf, euid: u32) -> PathBuf {
+    if let Some(base) = base {
+        return base.join("sub-bot");
+    }
+    if let Some(xdg) = xdg.filter(|p| !p.is_empty()).map(PathBuf::from).filter(|p| p.is_absolute()) {
+        return xdg.join("sub-bot");
+    }
+    temp_data_dir(tmp, euid)
+}
+
+/// Protect the predictable temporary fallback before any child is created/opened.
+/// Explicit directories outside this tree retain their existing permission policy.
+pub(crate) fn prepare_temp_data_dir(path: &Path, create: bool) -> anyhow::Result<()> {
+    let euid = effective_uid();
+    let root = temp_data_dir(std::env::temp_dir(), euid);
+    if path.starts_with(&root) {
+        check_temp_data_dir(&root, euid, create)?;
+    }
+    Ok(())
+}
+
+fn check_temp_data_dir(root: &Path, euid: u32, create: bool) -> anyhow::Result<()> {
+    use anyhow::Context;
+    if create {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        // Do not chmod an existing directory: reject hostile pre-created directories unchanged.
+        match builder.create(root) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("cannot create fallback data directory {}", root.display())),
+        }
+    }
+    let meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("cannot inspect fallback data directory {}", root.display())),
+    };
+    anyhow::ensure!(meta.is_dir() && !meta.file_type().is_symlink(), "unsafe fallback data directory {}: must be a directory, not a symlink", root.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        anyhow::ensure!(meta.uid() == euid, "unsafe fallback data directory {}: not owned by current euid {euid}", root.display());
+        anyhow::ensure!(meta.mode() & 0o022 == 0, "unsafe fallback data directory {}: group/world writable", root.display());
+    }
+    #[cfg(not(unix))]
+    let _ = euid;
+    Ok(())
+}
+
 impl Config {
     pub fn default_data_dir() -> PathBuf {
-        directories::BaseDirs::new().expect("system data directory unavailable").data_local_dir().join("sub-bot")
+        let base = directories::BaseDirs::new().map(|dirs| dirs.data_local_dir().to_owned());
+        if base.is_none() {
+            DATA_DIR_FALLBACK_USED.store(true, Ordering::Relaxed);
+            warn_data_dir_fallback();
+        }
+        resolve_default_data_dir(base, std::env::var_os("XDG_DATA_HOME"), std::env::temp_dir(), effective_uid())
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -469,6 +572,58 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_data_dir_resolution_chain() {
+        let tmp = std::env::temp_dir();
+        let base = tmp.join("system-data");
+        let xdg = tmp.join("xdg-data");
+        assert_eq!(resolve_default_data_dir(Some(base.clone()), Some(xdg.clone().into_os_string()), tmp.clone(), 42), base.join("sub-bot"));
+        assert_eq!(resolve_default_data_dir(None, Some(xdg.clone().into_os_string()), tmp.clone(), 42), xdg.join("sub-bot"));
+        for xdg in [None, Some(OsString::new()), Some(OsString::from("relative/data"))] {
+            let resolved = resolve_default_data_dir(None, xdg, tmp.clone(), 42);
+            #[cfg(unix)]
+            assert_eq!(resolved, tmp.join("sub-bot-42"));
+            #[cfg(not(unix))]
+            assert_eq!(resolved, tmp.join("sub-bot"));
+        }
+        #[cfg(unix)]
+        assert_ne!(resolve_default_data_dir(None, None, tmp.clone(), 42), resolve_default_data_dir(None, None, tmp, 43));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_data_dir_rejects_unsafe_existing_directories() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let parent = std::env::temp_dir().join(format!("sub-bot-permissions-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("fallback");
+        let uid = effective_uid();
+        check_temp_data_dir(&root, uid, false).unwrap();
+        assert!(!root.exists(), "read-only socket lookup must not create the directory");
+        check_temp_data_dir(&root, uid, true).unwrap();
+        let meta = std::fs::symlink_metadata(&root).unwrap();
+        assert_eq!(meta.uid(), uid);
+        assert_eq!(meta.mode() & 0o777, 0o700);
+        check_temp_data_dir(&root, uid, true).unwrap();
+        // Inject a different expected uid: no root/chown privileges needed.
+        assert!(check_temp_data_dir(&root, uid.wrapping_add(1), true).unwrap_err().to_string().contains("not owned by current euid"));
+        for mode in [0o720, 0o702, 0o777] {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(mode)).unwrap();
+            for create in [false, true] {
+                assert!(check_temp_data_dir(&root, uid, create).unwrap_err().to_string().contains("group/world writable"));
+                assert_eq!(std::fs::metadata(&root).unwrap().mode() & 0o777, mode, "must reject, not chmod");
+            }
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = parent.join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(check_temp_data_dir(&link, uid, true).unwrap_err().to_string().contains("not a symlink"));
+        let file = parent.join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(check_temp_data_dir(&file, uid, true).is_err());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn multi_targets_defaults_caps_and_secrets() {

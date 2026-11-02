@@ -7,7 +7,7 @@
 - OpenAI / Anthropic API key 从文件或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.6.1。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.7.0。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -42,7 +42,7 @@
 
 `sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录，每个模型都有 `provider` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
 
-> 集成分支说明：此分支的 `agent-ai/anthropic.rs` 是明确标记的最小 stub（调用返回 `anthropic stub`）；实际 Anthropic 网络实现由 v070-a 合并替换。
+> Anthropic Messages API 已接入：支持 SSE 工具调用、签名 thinking 回放、prompt caching、分页模型目录及共享瞬态重试策略。
 
 ## 持久化、重启恢复与 issue 路由
 

@@ -353,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
             session.submit(prompt.clone(), None);
             let mut last = None;
             let (mut total, mut turns, mut tool_calls) = (agent_ai::Usage::default(), 0usize, 0usize);
-            let mut used: Option<(agent_ai::Api, Option<ThinkingLevel>)> = None;
+            let mut used: Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)> = None;
             loop {
                 match events.recv().await {
                     Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => {
@@ -362,10 +362,11 @@ async fn main() -> anyhow::Result<()> {
                         total.input += a.usage.input;
                         total.output += a.usage.output;
                         total.cache_read += a.usage.cache_read;
+                        total.cache_write += a.usage.cache_write;
                         total.reasoning += a.usage.reasoning;
                         total.total_tokens += a.usage.total_tokens;
-                        if let Some(api) = a.api {
-                            used = Some((api, a.reasoning_effort));
+                        if a.api.is_some() || session.agent.config.provider.id() == "anthropic" {
+                            used = Some((a.api, a.reasoning_effort));
                         }
                         last = Some(a)
                     }
@@ -380,7 +381,7 @@ async fn main() -> anyhow::Result<()> {
             if json {
                 // reasoningEffort / api 是实际发送给模型的值（运行时降级后），requestedReasoningEffort 是请求值
                 let (api, effort) = match used {
-                    Some((a, e)) => (a.as_str().to_string(), e),
+                    Some((a, e)) => (a.map(|a| a.as_str()).unwrap_or("n/a").to_string(), e),
                     None => (hub.effective_api(&session.agent.config).to_string(), session.agent.config.reasoning),
                 };
                 println!(

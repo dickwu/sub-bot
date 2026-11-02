@@ -382,7 +382,7 @@ impl StreamState {
                 self.usage(&value["usage"]);
                 if let Some(reason) = value["delta"]["stop_reason"].as_str() {
                     self.message.stop_reason = match reason {
-                        "max_tokens" => StopReason::Length,
+                        "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
                         "tool_use" => StopReason::ToolUse,
                         // No refusal/pause variants exist. These are completed, non-tool turns.
                         "end_turn" | "stop_sequence" | "refusal" | "pause_turn" => StopReason::Stop,
@@ -394,7 +394,7 @@ impl StreamState {
             "error" => {
                 return Err(CallError {
                     reason: format!("Anthropic stream error: {}", value["error"]),
-                    transient: matches!(value["error"]["type"].as_str(), Some("overloaded_error" | "api_error")),
+                    transient: matches!(value["error"]["type"].as_str(), Some("overloaded_error" | "api_error" | "rate_limit_error")),
                     retry_after: None,
                 })
             }

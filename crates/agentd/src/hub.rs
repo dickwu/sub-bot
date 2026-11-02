@@ -34,7 +34,7 @@ pub struct SessionHandle {
     /// 调用方/配置请求的推理强度（解析前）
     pub requested_effort: Option<ThinkingLevel>,
     /// 最近一次成功调用实际使用的 (API, 推理强度)
-    last_call: Mutex<Option<(agent_ai::Api, Option<ThinkingLevel>)>>,
+    last_call: Mutex<Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)>>,
     store: Mutex<Option<Session>>,
     last_activity: Mutex<Instant>,
     idle_ttl: Duration,
@@ -98,8 +98,8 @@ impl SessionHandle {
                         input += a.usage.input;
                         output += a.usage.output;
                         reasoning_tokens += a.usage.reasoning;
-                        if let Some(api) = a.api {
-                            *this.last_call.lock().unwrap() = Some((api, a.reasoning_effort));
+                        if a.api.is_some() || this.agent.config.provider.id() == "anthropic" {
+                            *this.last_call.lock().unwrap() = Some((a.api, a.reasoning_effort));
                         }
                         stop = Some(a.stop_reason);
                         if let Some(e) = &a.error_message {
@@ -137,7 +137,7 @@ impl SessionHandle {
 
     /// 最近一次调用实际使用的 API（还没调用过时为 None）。
     pub fn effective_api(&self) -> Option<agent_ai::Api> {
-        self.last_call.lock().unwrap().map(|(a, _)| a)
+        self.last_call.lock().unwrap().and_then(|(a, _)| a)
     }
 
     pub fn set_request_id(&self, request_id: String) {
@@ -245,11 +245,11 @@ pub enum TaskStatus {
 pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
     let text = message.to_lowercase();
     let status = [401, 403, 429].into_iter().find(|code| text.contains(&code.to_string()));
-    let kind = if matches!(status, Some(401 | 403)) || text.contains("invalid api key") {
+    let kind = if matches!(status, Some(401 | 403)) || text.contains("invalid api key") || text.contains("authentication_error") || text.contains("permission_error") {
         "llm_auth"
-    } else if status == Some(429) {
+    } else if status == Some(429) || text.contains("rate_limit_error") {
         "llm_rate_limit"
-    } else if text.contains("context length") || text.contains("context_length") {
+    } else if text.contains("context length") || text.contains("context_length") || text.contains("prompt is too long") {
         "llm_context_overflow"
     } else if text.contains("idle timeout") || text.contains("idle timed out") {
         "llm_stream_timeout"
@@ -978,6 +978,8 @@ mod tests {
             }
         }
         assert_eq!(text, "echo: hello");
+        assert_eq!(h.effective_effort(), None); // Non-OpenAI messages still record the actual thinking level.
+        assert_eq!(h.effective_api(), None);
     }
 
     #[tokio::test]
@@ -1227,6 +1229,12 @@ mod tests {
             ("429", "llm_rate_limit"),
             ("context length exceeded", "llm_context_overflow"),
             ("stream idle timeout", "llm_stream_timeout"),
+            ("Anthropic HTTP 401 Unauthorized: authentication failed", "llm_auth"),
+            ("Anthropic HTTP 403 Forbidden: denied", "llm_auth"),
+            (r#"Anthropic stream error: {"type":"authentication_error","message":"authentication failed"}"#, "llm_auth"),
+            (r#"Anthropic stream error: {"type":"permission_error","message":"denied"}"#, "llm_auth"),
+            (r#"Anthropic stream error: {"type":"rate_limit_error","message":"busy"}"#, "llm_rate_limit"),
+            ("Anthropic HTTP 400 Bad Request: prompt is too long: 210000 tokens", "llm_context_overflow"),
             ("unknown", "llm_error"),
         ] {
             assert_eq!(classify_llm_error(text).0, expected);
@@ -1241,6 +1249,12 @@ mod tests {
             assert_eq!(events[0].kind, kind);
             assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_OUTPUT"));
         }
+        h.report_event(&AgentEvent::MessageRetry { attempt: 1, reason: "Anthropic HTTP 529: overloaded".into() });
+        hub.issues.flush(Duration::from_secs(2)).await;
+        let events = hub.issues.recent(Some("default"), 0, 1);
+        assert_eq!(events[0].kind, "llm_retry");
+        assert_eq!(events[0].details["attempt"], 1);
+        assert_eq!(events[0].scope.provider.as_deref(), Some("faux"));
         h.report_lag(42);
         hub.issues.flush(Duration::from_secs(2)).await;
         let events = hub.issues.recent(Some("default"), 0, 1);

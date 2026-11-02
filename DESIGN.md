@@ -11,16 +11,16 @@
 
 ---
 
-## 多 provider 集成（v070-b）
+## 多 provider 集成（v0.7.0）
 
 - Hub 持有按 id 索引的 provider registry；每个 Agent 的 LoopConfig 持有选定 provider 的 Arc，不依赖服务全局单一 provider。选择顺序为 session.provider > profile.provider > 有效模型 `claude-` 推断 > CLI/config 默认（最终 openai）。已建会话不会因后续请求而换 provider。
 - 启动计算 needed 集合：默认 provider + 默认模型推断 + 每个 profile 的显式/推断选择。needed 缺 key 即失败；其它 provider 有来源才加载，无来源静默跳过（debug）。faux 无需 key、始终注册。显式配置但无效的 key 文件仍是错误，不降级到低优先级来源。
 - `providers.<id>` 保存 apiKeyFile/baseUrl；顶层 apiKeyFile 是 OpenAI 别名，两者冲突拒绝。key 文件按配置目录解析，CLI 文件 > provider FILE 环境变量 > 配置文件 > provider key 环境变量。base URL 环境变量优先于配置。Hub 加载时只记录 key_source，并将所有 key 注册到共享 Reporter 的脱敏列表。
 - 模型目录按 provider 独立缓存 10 分钟，输出扁平模型信息 + provider；筛选只请求选定 provider，OpenAI 对话/快照过滤不影响其它 provider。目录请求失败整体返回错误（不返回不完整目录）。profiles 暴露解析后的 provider；LLM issue scope 带 provider，用于归因和去重。
-- 非 OpenAI 忽略 API 选择，reasoning 作为 thinking level 原样传入。AnthropicProvider 使用与 OpenAI 相同的 `with_stream_idle_timeout(Secret, Option<String>, Duration)` 构造接口；此分支仅保留 `// STUB - replaced by v070-a` 实现，合并后替换，无需改 hub。
+- 非 OpenAI 忽略 API 选择，reasoning 作为 thinking level 原样传入。Hub 使用 `AnthropicProvider::with_stream_idle_timeout(Secret, Option<String>, Duration)` 连接真实 Messages API，传入已加载的 key、base URL 和 idle timeout。支持 tool_result 合并、签名 thinking 回放、最多三个缓存断点及分页模型目录；message_start / message_delta 的 usage 按字段保留最新非 null 值。
 - ask 的同步 SSE 错误、异步提交/轮询 HTTP 错误包含服务端 JSON error；非 JSON 错误保留 HTTP 状态摘要。
 
-## v0.6.1 流式客户端与可靠性改进
+## v0.7.0 流式客户端与可靠性改进
 
 - `ask` 同步使用 SSE，实时输出文本 delta；`--json` 逐事件输出 NDJSON，异步轮询保持不变。
 - 默认数据目录不再 panic：依次使用 BaseDirs、绝对路径 XDG_DATA_HOME、temp/sub-bot-<euid>；临时目录检查所有权、权限和符号链接，显式与自动发现的 ask socket 同样受保护。
@@ -50,7 +50,7 @@
 SessionHandle 在 submit 前订阅 `ScopeKey::Session`，覆盖同步 chat、SSE、普通 session 及 RPC 运行；async task 使用 `ScopeKey::Task`。settled 后 250ms 再取消 session 订阅，并用运行代数防止旧运行清理新订阅。Reporter 的路由始终校验 scope.client 与订阅 owner，按 events/minSeverity 过滤；取消订阅后保存至少 dedupWindowSecs 的缓存。入队 issue 捕获路由快照，窗口汇总不会因 task/session 已结束而丢失路由；dedup key 包含 task ID，避免同一 session 连续任务混并。管理员 alerts 是独立路由，不参与 client 间广播。issue webhook 在 `serve` 中同样进入持久化队列，其它命令使用内存队列，失败通知禁止递归。
 ## LLM transient retry / webhook progress
 
-OpenAI provider 在每次尝试内新建流解析器，通过单独事件通道转发增量并跟踪工具调用边界。连接/请求超时、body read 错误、未完成 EOF、idle timeout、HTTP 408/429/5xx 可重试；其它 HTTP 4xx（包括认证、上下文溢出）不可重试。文本或思考增量允许回滚，工具事件一旦出现则禁止重试。
+OpenAI / Anthropic provider 共享重试策略，在每次尝试内新建流解析器，通过单独事件通道转发增量并跟踪工具调用边界。连接/请求超时、body read 错误、未完成 EOF、idle timeout、HTTP 408/429/5xx 可重试；其它 HTTP 4xx（包括认证、上下文溢出）不可重试。文本或思考增量允许回滚，工具事件一旦出现则禁止重试。
 `llmMaxRetries` 全局默认 3，profile 可覆盖（0 禁用）；1s 指数退避加 jitter，最大 30s，`Retry-After` 是额外的最短等待约束（先限制到最多 60s）。整个重试循环在取消 select 内运行，abort 同时取消网络和 sleep。
 `AssistantEvent::Retry` 转为 `AgentEvent::MessageRetry`，消费者清理当前部分输出，hub 只增加 `llm_retry` warn 映射；最终失败沿用 `llm_*`。日志标注 `issue="typed"` 防止重复上报。只有最终消息进入 context/AgentEnd。
 异步任务过滤空白助手 progress；webhook Retry-After 支持 delta-seconds 和 HTTP-date，过去日期为零、上限 60s。

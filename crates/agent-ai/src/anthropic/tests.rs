@@ -229,6 +229,7 @@ async fn transient_failures_retry_and_discard_partial_text() {
         (200, cut),
         (200, sse(vec![json!({"type":"error", "error":{"type":"overloaded_error", "message":"busy"}})])),
         (200, sse(vec![json!({"type":"error", "error":{"type":"api_error", "message":"busy"}})])),
+        (200, sse(vec![json!({"type":"error", "error":{"type":"rate_limit_error", "message":"busy"}})])),
     ] {
         let server = server(vec![first, (200, sse(text_events()))]).await;
         let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
@@ -264,6 +265,18 @@ async fn auth_errors_redact_key_and_do_not_retry() {
         let error = message.error_message.as_ref().unwrap();
         assert!(error.contains(&format!("Anthropic HTTP {code}")));
         assert!(!error.contains("test-key") && !error.contains("sk-ant"));
+        assert_eq!(server.mock.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn stream_auth_errors_do_not_retry() {
+    for kind in ["authentication_error", "permission_error"] {
+        let server = server(vec![(200, sse(vec![json!({"type":"error", "error":{"type":kind,"message":"denied"}})]))]).await;
+        let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
+        let events = collect(&provider, request()).await;
+        assert!(matches!(events.last(), Some(AssistantEvent::Error { message }) if message.error_message.as_ref().unwrap().contains(kind)));
+        assert!(!events.iter().any(|e| matches!(e, AssistantEvent::Retry { .. })));
         assert_eq!(server.mock.requests.lock().unwrap().len(), 1);
     }
 }
@@ -325,11 +338,35 @@ async fn idle_timeout_and_cancellation() {
 }
 
 #[test]
+fn usage_keeps_latest_non_null_fields() {
+    let mut state = StreamState::new("claude-test");
+    let mut events = vec![];
+    for event in [
+        json!({"type":"message_start", "message":{"usage":{"input_tokens":10,"output_tokens":1,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}}),
+        json!({"type":"message_delta", "usage":{"input_tokens":12,"output_tokens":5,"cache_read_input_tokens":22,"cache_creation_input_tokens":32}}),
+        json!({"type":"message_delta", "usage":{"input_tokens":null,"output_tokens":7,"cache_read_input_tokens":null}}),
+    ] {
+        state.on_event(&event, &mut events).unwrap_or_else(|e| panic!("{}", e.reason));
+    }
+    let u = state.message.usage;
+    assert_eq!((u.input, u.output, u.cache_read, u.cache_write, u.total_tokens), (12, 7, 22, 32, 73));
+}
+
+#[test]
+fn base_url_normalization() {
+    for base in ["https://example.test", "https://example.test/", "https://example.test/v1", "https://example.test/v1/"] {
+        assert_eq!(AnthropicProvider::new(crate::Secret::new("test-key"), Some(base.into())).base_url, "https://example.test/v1");
+    }
+    assert_eq!(AnthropicProvider::new(crate::Secret::new("test-key"), Some("https://example.test/proxy/v1/".into())).base_url, "https://example.test/proxy/v1");
+}
+
+#[test]
 fn stop_reasons_and_legacy_serialization() {
     for (reason, expected) in [
         ("end_turn", StopReason::Stop),
         ("stop_sequence", StopReason::Stop),
         ("max_tokens", StopReason::Length),
+        ("model_context_window_exceeded", StopReason::Length),
         ("tool_use", StopReason::ToolUse),
         ("refusal", StopReason::Stop),
         ("pause_turn", StopReason::Stop),

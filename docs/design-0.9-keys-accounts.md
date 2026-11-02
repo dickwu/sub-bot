@@ -168,6 +168,16 @@ Keychain 处于“配置文件来源”同一层级（它就是配置里声明�
 - **启动失败即退出**：Keychain 错误在启动时发生（§4.5 的“必需账号”），sub-bot 直接 fatal + `startup_failed` issue（message 为通用文本；详细错误只进日志 stderr，不含 key）。`startup_failure()` 的 typed allowlist 新增 `KeychainError`（它的 Display 已保证不含 key）。
 - **不做运行期懒加载**：避免服务运行中突然弹 ACL 对话框或挂起。
 
+### 2.6 读取超时（v0.9.2）
+
+问题：`brew upgrade` 换了二进制后，条目 ACL 不再信任它，SecurityAgent 弹出“允许访问”对话框，`SecItemCopyMatching` 一直阻塞到有人点击；0.9.1 的 `serve` 与 `keys check` 因此无限挂起且无日志。
+
+- `agent-ai::keychain::with_timeout(service, account, timeout, grace, on_wait, call)`：在独立的 `std::thread` 上执行读取，通过容量 1 的 channel 等待结果。`grace`（常量 `WAIT_HINT_GRACE` = 1s）内未返回 ⇒ 调用一次 `on_wait`；`timeout` 内未返回 ⇒ `KeychainError::Timeout { service, account, secs }`。超时后**不 join** 读取线程：它可能一直阻塞在 Security.framework 里，进程退出不等它；迟到的 `Secret` 随 channel 丢弃并在析构时清零。读取线程 panic 在调用方重新抛出。
+- `TimedKeychain`（实现 `KeychainReader`）包装 `Arc<dyn KeychainReader>`，供启动加载与 `probe-efforts` 使用；`keys` CLI 用 `TimedStore`（`get` / `list` 限时，`set` / `delete` 透传——写入超时后结果不确定）。测试注入带延迟的 `MockKeychain`（`delayed(..)`），用 1s 超时 / 100ms grace 覆盖 慢读 ⇒ 提示 + Timeout、快读 ⇒ 无提示。
+- 超时：全局配置 `keychainTimeoutSecs`（默认 30，校验 >= 1），`--keychain-timeout-secs` / `SUB_BOT_KEYCHAIN_TIMEOUT_SECS` 覆盖（对 `keys` 子命令同样生效）。
+- 等待提示：`waiting for macOS Keychain authorization for <service>/<account> — check for a dialog on the Mac's screen; after brew upgrade choose "Always Allow"`。`serve` / `run` / `rpc`：WARN 日志 + issue `keychain_waiting`（Warn，component `config`，details `{service, account}`；reporter 在 Hub 构造前已安装，可直接上报）；`keys check` / `keys list`：打到 stderr。
+- `Timeout` 是普通的 `KeychainError` 变体，走既有路径：必需账号 ⇒ 启动失败，`startup_failure` 显示其 Display（details `{"reason": "keychain"}`）；可选账号 ⇒ 仅该账号 `account_unavailable`；`keys check` ⇒ 该账号 `FAILED: ...`。Display 解释：N 秒内 Keychain 无应答；多半是授权对话框在等待（brew upgrade 后二进制变化）或会话没有 GUI；点“Always Allow”或重新 `sub-bot keys set`，无头部署用 apiKeyFile。
+
 ---
 
 ## 3. CLI：`sub-bot keys set|list|delete|check`
@@ -271,7 +281,7 @@ macOS 默认删 Keychain 条目（`delete_generic`），`--file` 删指定文件
 
 ### 3.4 `check`
 
-`Config::load` 后对每个将被加载的账号（§4.5 规则）调用 `load_account_key`，打印 `openai/work: ok (keychain service=sub-bot account=openai/work)` 或 `FAILED: <错误>`；任何失败 ⇒ 退出码 1。用途：launchd 部署前在 GUI 终端里触发并确认 ACL 授权。
+`Config::load` 后对每个将被加载的账号（§4.5 规则）调用 `load_account_key`，打印 `openai/work: ok (keychain service=sub-bot account=openai/work)`、`FAILED: <错误>` 或 `skipped (not used by this configuration)`；任何失败 ⇒ 退出码 1。Keychain 读取限时（§2.6）：等待超过 1s 先在 stderr 打印提示，超时后该账号 `FAILED`。用途：launchd 部署前在 GUI 终端里触发并确认 ACL 授权。
 
 ### 3.5 CLI 全局 `--account`
 
@@ -483,22 +493,31 @@ pub fn load_account_key(spec: &AccountKeySpec<'_>, getenv: impl Fn(&str) -> Opti
 ### 4.5 启动加载规则（`load_providers` 重写）
 
 ```rust
-fn load_providers(config: &Config, default: &str, files: KeyFiles<'_>, issues: &Reporter, getenv: impl Fn(&str) -> Option<String>, keychain: &dyn KeychainReader)
-    -> Result<(BTreeMap<AccountKey, Arc<dyn Provider>>, BTreeMap<AccountKey, String> /* unavailable */)>;
+pub(crate) fn required_accounts(config: &Config, default: &str) -> BTreeSet<AccountKey>;
+fn load_providers(config: &Config, default: &str, files: KeyFiles<'_>, issues: &Reporter, getenv: impl Fn(&str) -> Option<String>,
+                  keychain: &dyn KeychainReader /* 生产：TimedKeychain（§2.6） */, managed: &ManagedStore) -> Result<LoadedProviders /* providers + unavailable */>;
 ```
 
-1. **needed providers**（同现在）：默认 provider、全局默认模型推断的 provider、每个 profile 解析的 provider。
-2. **required accounts**（加载失败 ⇒ 启动失败）：
-   - 每个 needed provider 的默认账号（`defaultAccount`）；
-   - 每个 profile 的 `account`（若设）；
-   - profile/账号 `fallbackAccounts` 里的账号（failover 链必须可用，否则配置无意义；若希望宽松可改为 warn，但本设计选严格）。
-3. **optional accounts**：provider 配置里其余显式声明的 `accounts.*`，以及 needed/非 needed provider 的 default 账号在“有来源”时（现有 `present` 判定：CLI 文件 / env / 配置声明；**不**为了判定 present 去探测受管存储或 Keychain）。
+> v0.9.1 起的规则（实现见 `hub.rs` 的 `required_accounts` / `load_providers`；下文取代 v0.9.0 最初设计里“每个 needed provider 的默认账号都必需”“fallbackAccounts 也必需”的写法）。
+
+1. **required accounts**（加载失败 ⇒ 启动失败），`required_accounts(config, default)` 计算：
+   - **默认 provider** 的默认账号（`providers.<id>.defaultAccount`，缺省 `default`）；
+   - **全局默认模型（`defaultModel`）推断出的 provider** 的默认账号（`claude-*` ⇒ anthropic，否则为默认 provider）；
+   - **每个 profile 自己的账号**：profile 解析出的 provider（`profile.provider` > 按 `profile.model`（缺省全局默认模型）推断 > 默认 provider）下，profile 显式写的 `account`，未写则为该 provider 的 `defaultAccount`；
+   - `faux` 不计入。
+   - **只经由 profile 使用、且这些 profile 都钉了命名账号的 provider，其默认账号不是必需的**（例如 `anthropic` 只被 `{"provider":"anthropic","account":"ci"}` 的 profile 使用 ⇒ 只要求 `anthropic/ci`，不要求 `anthropic/default`）。profile 不写 `account` 时该 provider 的默认账号重新变为必需。
+   - `fallbackAccounts` 里的账号**不**自动成为必需（它们按 optional 加载，失败时 failover 跳过）。
+   - required 账号在其 provider 下根本没有声明（例如 CLI `--provider` 改变了 profile 解析出的 provider，而 `profile.account` 只在原 provider 下定义）⇒ 启动失败：`account '<name>' is not configured for provider <id>`。
+2. **失败的类型**：缺失/未找到的必需账号以 typed `KeyConfigError` 返回（`provider <id> is not configured (...)` / `<Label> API key not found for account '<name>' (...)` / `account '...' is not configured for provider ...`），文案只含 provider、账号、环境变量名与配置路径；`main.rs` 的 `startup_failure` 将其原样作为启动错误与 `startup_failed` issue 消息（details `{"reason": "key_config"}`）。Keychain 错误（含 v0.9.2 的 `Timeout`）保留为 typed `KeychainError`（details `{"reason": "keychain"}`）；其它来源错误（可能回显路径/读取细节）只显示通用文案。
+3. **optional accounts**：provider 配置里其余显式声明的 `accounts.*`，以及非必需的 default 账号在“有显式来源”时（CLI 文件 / `*_API_KEY_FILE` / 配置声明 / `*_API_KEY`；**不**为了判定是否配置去探测受管存储或 Keychain）。
    - 加载成功 ⇒ 进 `providers`；
-   - 加载失败 ⇒ `tracing::warn!(provider, account, error = %e, "account unavailable")` + issue `account_unavailable`（Warn，component `config`，details `{provider, account}`），进 `unavailable`。
-4. **不懒加载**：启动后集合固定；运行期选择未加载账号直接报错（§4.6）。
-5. provider 既不 needed 也没有任何账号来源 ⇒ 跳过（同现在）。
-6. 每个加载成功的 key：`issues.add_secret(key.expose().to_owned())`；日志 `info!(provider, account, key_source = %src, "api key loaded")`。
-7. 实例：`openai` ⇒ `OpenAiProvider::with_options(key, OpenAiOptions{ base_url: env <P>_BASE_URL(仅 default) > account.baseUrl > provider.baseUrl, organization, project, stream_idle_timeout })`；`anthropic` ⇒ 现有构造；`faux` ⇒ `("faux","default")`。
+   - 加载失败 ⇒ `tracing::warn!(provider, account, error = %e, "account unavailable")` + issue `account_unavailable`（Warn，component `config`，details `{provider, account, reason}`，reason ∈ `not_found` / `source_error` / `keychain`），进 `unavailable`。
+   - 非必需且没有显式来源的 default 账号 ⇒ 跳过（debug 日志）。
+4. **`keys check` 使用同一规则**：调用同一个 `required_accounts`；所有声明的命名账号都检查；非必需且没有显式来源的 default 账号打印 `<provider>/default: skipped (not used by this configuration)`（`--provider` 显式筛选时不跳过）。任何失败 ⇒ 退出码 1。
+5. **不懒加载**：启动后集合固定；运行期选择未加载账号直接报错（§4.6）。
+6. provider 既没有必需账号也没有任何显式账号来源 ⇒ 跳过。
+7. 每个加载成功的 key：`issues.add_secret(key.expose().to_owned())`；日志 `info!(provider, account, key_source = %src, "api key loaded")`。
+8. 实例：`openai` ⇒ `OpenAiProvider::with_options(key, OpenAiOptions{ base_url: env <P>_BASE_URL(仅 default) > account.baseUrl > provider.baseUrl, organization, project, stream_idle_timeout })`；`anthropic` ⇒ 现有构造；`faux` ⇒ `("faux","default")`。
 
 ### 4.6 会话选择账号（`create_session_with_ttl`）
 

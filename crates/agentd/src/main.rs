@@ -78,6 +78,9 @@ struct Cli {
     /// 从文件读取 Anthropic API key。优先级：本参数 > ANTHROPIC_API_KEY_FILE > 配置 providers.anthropic.apiKeyFile / apiKeyKeychain（macOS Keychain）> ANTHROPIC_API_KEY > 受管存储（`sub-bot keys set` 写入：macOS Keychain sub-bot/anthropic/default，Linux ~/.config/sub-bot/keys/anthropic-default.key）
     #[arg(long, global = true)]
     anthropic_key_file: Option<PathBuf>,
+    /// 每次 macOS Keychain 读取的等待上限（秒，>= 1，默认 30）；覆盖配置 keychainTimeoutSecs。超过 1 秒未返回会提示去 Mac 屏幕上找授权对话框
+    #[arg(long, global = true, env = "SUB_BOT_KEYCHAIN_TIMEOUT_SECS", value_parser = clap::value_parser!(u64).range(1..))]
+    keychain_timeout_secs: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -310,6 +313,9 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(dir) = &cli.data_dir {
         loaded.data_dir = Some(dir.clone());
+    }
+    if let Some(secs) = cli.keychain_timeout_secs {
+        loaded.keychain_timeout_secs = secs;
     }
     #[cfg(unix)]
     if let Cmd::Serve { unix_socket: Some(path), .. } = &cli.cmd {
@@ -741,6 +747,16 @@ mod tests {
         assert!(matches!(cli.cmd, Cmd::Keys { command: keys::KeysCmd::Check }));
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
         assert!(Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "openai", "extra-positional-key"]).is_err());
+    }
+
+    #[test]
+    fn keychain_timeout_flag_is_global_and_validated() {
+        let cli = Cli::try_parse_from(["sub-bot", "keys", "check", "--keychain-timeout-secs", "5"]).unwrap();
+        assert_eq!(cli.keychain_timeout_secs, Some(5));
+        let cli = Cli::try_parse_from(["sub-bot", "--keychain-timeout-secs", "2", "serve"]).unwrap();
+        assert_eq!(cli.keychain_timeout_secs, Some(2));
+        assert!(Cli::try_parse_from(["sub-bot", "keys", "check", "--keychain-timeout-secs", "0"]).is_err());
+        assert!(Cli::try_parse_from(["sub-bot", "keys", "check", "--keychain-timeout-secs", "x"]).is_err());
     }
 
     #[test]

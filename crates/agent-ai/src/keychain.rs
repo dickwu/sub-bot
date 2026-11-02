@@ -5,8 +5,12 @@
 //! - 平台相关代码全部集中在私有 `sys` 模块：macOS 用 `security-framework`（不 shell 调 `security`），
 //!   其它平台是返回 [`KeychainError::Unsupported`] 的 stub。
 //!
+//! - 读取可能被 macOS 的授权对话框无限期阻塞（例如 `brew upgrade` 换了二进制后 ACL 不再信任它），
+//!   因此调用方用 [`TimedKeychain`] / [`with_timeout`] 在独立线程上读取并限时等待。
+//!
 //! 约定：错误信息只含 service/account 名，绝不包含条目内容。
 use crate::secrets::{validate_key_text, wipe_bytes, Secret};
+use std::{sync::Arc, time::Duration};
 
 /// 受管 Keychain 条目的默认 service；account 约定为 `<provider>/<account>`。
 pub const DEFAULT_SERVICE: &str = "sub-bot";
@@ -19,6 +23,12 @@ pub const ERR_INTERACTION_NOT_ALLOWED: i32 = -25308;
 pub const ERR_AUTH_FAILED: i32 = -25293;
 /// errSecUserCanceled
 pub const ERR_USER_CANCELED: i32 = -128;
+
+/// Keychain 读取的默认超时（秒）；配置 `keychainTimeoutSecs` / `--keychain-timeout-secs` 覆盖。
+pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+/// 读取超过该时长仍未返回才提示“可能在等授权对话框”（正常读取远快于此，避免噪音）。
+pub const WAIT_HINT_GRACE: Duration = Duration::from_secs(1);
 
 /// 当前构建是否支持 Keychain。
 pub const fn supported() -> bool {
@@ -48,6 +58,11 @@ pub enum KeychainError {
     Unsupported,
     #[error("keychain error {code} (service={service}, account={account})")]
     Other { code: i32, service: String, account: String },
+    /// 读取在 `secs` 秒内没有返回（多半是授权对话框在等人点击，或会话没有 GUI 无法显示对话框）
+    #[error(
+        "no answer from macOS Keychain within {secs}s (service={service}, account={account}): an authorization dialog is probably waiting (the sub-bot binary changed, e.g. after `brew upgrade`) or this session has no GUI to show it; click \"Always Allow\" in the dialog or re-run `sub-bot keys set`, or use apiKeyFile for headless use (ssh / LaunchDaemon)"
+    )]
+    Timeout { service: String, account: String, secs: u64 },
 }
 
 impl KeychainError {
@@ -86,6 +101,94 @@ pub fn secret_from_bytes(bytes: Vec<u8>, service: &str, account: &str) -> Result
 /// 可注入的读取器（测试用 mock；生产用 [`SystemKeychain`]）。
 pub trait KeychainReader: Send + Sync {
     fn get(&self, service: &str, account: &str) -> Result<Secret, KeychainError>;
+}
+
+/// 读取等待超过 [`WAIT_HINT_GRACE`] 时给用户的提示（只含 service/account 名）。
+pub fn wait_hint(service: &str, account: &str) -> String {
+    format!("waiting for macOS Keychain authorization for {service}/{account} — check for a dialog on the Mac's screen; after brew upgrade choose \"Always Allow\"")
+}
+
+/// 在独立线程上执行 Keychain 调用 `call`，最多等待 `timeout`：
+/// - `grace`（< `timeout`）内未返回 ⇒ 调用一次 `on_wait`（提示用户去看授权对话框）；
+/// - `timeout` 内未返回 ⇒ [`KeychainError::Timeout`]。
+///
+/// 超时后读取线程被放弃（不 join）：它可能一直阻塞在 Security.framework 里直到有人响应对话框；
+/// 进程退出不等待它。迟到的结果（含 `Secret`）随 channel 一起丢弃，`Secret` 析构时清零。
+/// 线程 panic 会在调用方线程重新抛出。
+pub fn with_timeout<T: Send + 'static>(
+    service: &str,
+    account: &str,
+    timeout: Duration,
+    grace: Duration,
+    on_wait: impl FnOnce(),
+    call: impl FnOnce() -> Result<T, KeychainError> + Send + 'static,
+) -> Result<T, KeychainError> {
+    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let started = std::time::Instant::now();
+    // 容量 1：超时后读取线程的 send 不会阻塞（接收端已丢弃时直接失败）
+    let (tx, rx) = sync_channel(1);
+    let handle = std::thread::Builder::new()
+        .name("keychain-read".into())
+        .spawn(move || {
+            let _ = tx.send(call());
+        })
+        .expect("spawn keychain reader thread");
+    let rethrow = |handle: std::thread::JoinHandle<()>| -> ! {
+        match handle.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("keychain reader exited without sending a result"),
+        }
+    };
+    let grace = grace.min(timeout);
+    match rx.recv_timeout(grace) {
+        Ok(result) => return result,
+        Err(RecvTimeoutError::Disconnected) => rethrow(handle),
+        Err(RecvTimeoutError::Timeout) if grace < timeout => on_wait(),
+        Err(RecvTimeoutError::Timeout) => {}
+    }
+    match rx.recv_timeout(timeout.saturating_sub(started.elapsed())) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Disconnected) => rethrow(handle),
+        // 不 join：线程可能永远阻塞
+        Err(RecvTimeoutError::Timeout) => Err(KeychainError::Timeout { service: service.into(), account: account.into(), secs: timeout.as_secs() }),
+    }
+}
+
+/// 等待提示回调（参数为 service、account）。
+pub type WaitHook = Box<dyn Fn(&str, &str) + Send + Sync>;
+
+/// 限时读取的包装：每次 `get` 都在独立线程上调用内层读取器（见 [`with_timeout`]）。
+pub struct TimedKeychain {
+    inner: Arc<dyn KeychainReader>,
+    timeout: Duration,
+    grace: Duration,
+    on_wait: WaitHook,
+}
+
+impl TimedKeychain {
+    /// `grace` 默认 [`WAIT_HINT_GRACE`]；`on_wait` 默认什么都不做。
+    pub fn new(inner: Arc<dyn KeychainReader>, timeout: Duration) -> Self {
+        Self { inner, timeout, grace: WAIT_HINT_GRACE, on_wait: Box::new(|_, _| {}) }
+    }
+
+    pub fn grace(mut self, grace: Duration) -> Self {
+        self.grace = grace;
+        self
+    }
+
+    /// 读取超过 grace 仍未返回时调用（参数为 service、account；每次读取最多一次）。
+    pub fn on_wait(mut self, hook: impl Fn(&str, &str) + Send + Sync + 'static) -> Self {
+        self.on_wait = Box::new(hook);
+        self
+    }
+}
+
+impl KeychainReader for TimedKeychain {
+    fn get(&self, service: &str, account: &str) -> Result<Secret, KeychainError> {
+        let inner = self.inner.clone();
+        let (s, a) = (service.to_string(), account.to_string());
+        with_timeout(service, account, self.timeout, self.grace, || (self.on_wait)(service, account), move || inner.get(&s, &a))
+    }
 }
 
 /// 系统 Keychain（非 macOS 上总是返回 `Unsupported`）。
@@ -175,23 +278,34 @@ mod sys {
 pub mod mock {
     use super::{secret_from_bytes, KeychainError, KeychainReader};
     use crate::secrets::Secret;
-    use std::{collections::BTreeMap, sync::Mutex};
+    use std::{collections::BTreeMap, sync::Mutex, time::Duration};
 
     /// `(service, account)` → 条目内容或预设错误。
     #[derive(Default)]
     pub struct MockKeychain {
         pub items: Mutex<BTreeMap<(String, String), Result<String, KeychainError>>>,
+        /// 每次 `get` 先阻塞这么久（模拟等待授权对话框）
+        pub delay: Option<Duration>,
     }
 
     impl MockKeychain {
         pub fn with(entries: impl IntoIterator<Item = ((&'static str, &'static str), Result<&'static str, KeychainError>)>) -> Self {
             let items = entries.into_iter().map(|((s, a), v)| ((s.to_string(), a.to_string()), v.map(str::to_string))).collect();
-            Self { items: Mutex::new(items) }
+            Self { items: Mutex::new(items), delay: None }
+        }
+
+        /// 每次 `get` 前阻塞 `delay`。
+        pub fn delayed(mut self, delay: Duration) -> Self {
+            self.delay = Some(delay);
+            self
         }
     }
 
     impl KeychainReader for MockKeychain {
         fn get(&self, service: &str, account: &str) -> Result<Secret, KeychainError> {
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             match self.items.lock().unwrap().get(&(service.to_string(), account.to_string())) {
                 Some(Ok(v)) => secret_from_bytes(v.clone().into_bytes(), service, account),
                 Some(Err(e)) => Err(e.clone()),
@@ -238,6 +352,76 @@ mod tests {
         assert!(kc.get("sub-bot", "openai/missing").unwrap_err().is_not_found());
         assert!(matches!(kc.get("sub-bot", "openai/locked"), Err(KeychainError::InteractionNotAllowed { .. })));
         assert_eq!(kc.get("sub-bot", "openai/mac").unwrap_err(), KeychainError::Unsupported);
+    }
+
+    fn counting_timed(kc: MockKeychain, timeout: Duration, grace: Duration) -> (TimedKeychain, Arc<std::sync::Mutex<Vec<String>>>) {
+        let hints = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = hints.clone();
+        let timed = TimedKeychain::new(Arc::new(kc), timeout).grace(grace).on_wait(move |s, a| seen.lock().unwrap().push(wait_hint(s, a)));
+        (timed, hints)
+    }
+
+    #[test]
+    fn timed_reader_fast_path_has_no_hint() {
+        let kc = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-fast"))]);
+        let (timed, hints) = counting_timed(kc, Duration::from_secs(1), Duration::from_millis(100));
+        assert_eq!(timed.get("sub-bot", "openai/default").unwrap().expose(), "sk-fast");
+        assert!(timed.get("sub-bot", "openai/missing").unwrap_err().is_not_found());
+        assert!(hints.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn timed_reader_slow_read_hints_then_succeeds() {
+        let kc = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-slow"))]).delayed(Duration::from_millis(300));
+        let (timed, hints) = counting_timed(kc, Duration::from_secs(2), Duration::from_millis(50));
+        assert_eq!(timed.get("sub-bot", "openai/default").unwrap().expose(), "sk-slow");
+        assert_eq!(hints.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn timed_reader_times_out_with_hint() {
+        // 读取线程阻塞 30s：调用方在 1s 后返回 Timeout，不等待（也不 join）该线程
+        let kc = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-never"))]).delayed(Duration::from_secs(30));
+        let (timed, hints) = counting_timed(kc, Duration::from_secs(1), Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let e = timed.get("sub-bot", "openai/default").unwrap_err();
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_secs(1) && waited < Duration::from_secs(5), "{waited:?}");
+        assert_eq!(e, KeychainError::Timeout { service: "sub-bot".into(), account: "openai/default".into(), secs: 1 });
+        assert_eq!(
+            *hints.lock().unwrap(),
+            ["waiting for macOS Keychain authorization for sub-bot/openai/default — check for a dialog on the Mac's screen; after brew upgrade choose \"Always Allow\""]
+        );
+        let text = e.to_string();
+        for needle in ["within 1s", "service=sub-bot", "account=openai/default", "brew upgrade", "Always Allow", "sub-bot keys set", "apiKeyFile"] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(!text.contains("sk-never"));
+    }
+
+    #[test]
+    fn with_timeout_skips_hint_when_grace_is_not_shorter_than_timeout() {
+        let mut hinted = false;
+        let e = with_timeout(
+            "s",
+            "a",
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            || hinted = true,
+            || {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(e, KeychainError::Timeout { secs: 0, .. }));
+        assert!(!hinted);
+    }
+
+    #[test]
+    #[should_panic(expected = "reader boom")]
+    fn with_timeout_propagates_reader_panic() {
+        let _ = with_timeout::<()>("s", "a", Duration::from_secs(5), Duration::from_secs(1), || {}, || panic!("reader boom"));
     }
 
     #[cfg(not(target_os = "macos"))]

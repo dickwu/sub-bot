@@ -405,6 +405,57 @@ struct ChatBody {
     /// 新会话的账号（同 session.account，顶层优先）；已有 sessionId 时忽略（账号是会话属性）
     #[serde(default)]
     account: Option<String>,
+    /// `session.profile` 的别名（两处都给且不同 ⇒ 400）
+    #[serde(default)]
+    profile: Option<String>,
+    /// `session.model` 的别名（两处都给且不同 ⇒ 400）
+    #[serde(default)]
+    model: Option<String>,
+    /// 其余未知顶层字段：收集起来在 handler 里返回 400（而不是静默忽略）。
+    /// 用 flatten 收集而不是 deny_unknown_fields，是为了给出可操作的提示（session.* 字段该放进 "session"）。
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `/v1/chat` 文档化的顶层字段（未知字段错误里列出）。
+const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model"];
+/// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"；profile/model/reasoningEffort/depth/account 顶层可用）。
+const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools"];
+
+/// 错误信息里展示的字段名：去掉控制字符并截断（只回显键名，不回显任何值）。
+fn field_label(key: &str) -> String {
+    key.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
+/// 未知顶层字段 ⇒ 400 文案；会话选项优先提示放进 "session"。
+fn unknown_chat_field(unknown: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(key) = unknown.keys().find(|k| SESSION_ONLY_FIELDS.contains(&k.as_str())) {
+        return Some(format!(r#"unknown field '{}'; session options go under "session": {{...}}"#, field_label(key)));
+    }
+    unknown.keys().next().map(|key| format!("unknown field '{}'; expected one of: {}", field_label(key), CHAT_FIELDS.join(", ")))
+}
+
+/// 顶层别名并入 `session`：只给一处 ⇒ 使用它；两处相同 ⇒ 接受；两处不同 ⇒ 400。
+fn merge_session_alias(name: &str, top: Option<String>, session: &mut Option<String>) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match (top, session.as_ref()) {
+        (Some(top), Some(inner)) if &top != inner => Err(bad_request(format!("{name} given both at top level and in session; put it in session.{name}"))),
+        (Some(top), _) => {
+            *session = Some(top);
+            Ok(())
+        }
+        (None, _) => Ok(()),
+    }
+}
+
+impl ChatBody {
+    /// 拒绝未知字段并合并 profile/model 别名。
+    fn normalize(&mut self) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+        if let Some(message) = unknown_chat_field(&self.unknown) {
+            return Err(bad_request(message));
+        }
+        merge_session_alias("profile", self.profile.take(), &mut self.session.profile)?;
+        merge_session_alias("model", self.model.take(), &mut self.session.model)
+    }
 }
 
 /// A host entry allows any port; host:port restricts it. The configured URL implicitly
@@ -467,6 +518,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
     if st.hub.is_shutting_down() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"}))));
     }
+    b.normalize()?;
     if b.asynchronous && b.stream {
         return Err(bad_request("async and stream cannot be combined"));
     }
@@ -1337,6 +1389,9 @@ mod tests {
                         reasoning_effort: None,
                         depth: None,
                         account: None,
+                        profile: None,
+                        model: None,
+                        unknown: Default::default(),
                     }),
                 ),
             )
@@ -1355,6 +1410,82 @@ mod tests {
             assert_eq!(hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(601)), 1);
             assert!(hub.get(&client, &h.id).is_none());
         }
+    }
+
+    fn reviewer_app() -> Router {
+        let mut cfg = config();
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let reviewer = cfg.profiles["default"].clone();
+        cfg.profiles.insert("reviewer".into(), reviewer);
+        cfg.clients[0].profiles.push("reviewer".into());
+        router(AppState { hub: Hub::new(cfg, "faux", None, None).unwrap() })
+    }
+
+    async fn chat_session_view(app: &Router, body: Value) -> Value {
+        let (status, response) = request(app, "POST", "/v1/chat", Some("test-token"), body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {response}");
+        let (status, view) = request(app, "GET", &format!("/v1/sessions/{}", response["sessionId"].as_str().unwrap()), Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        view
+    }
+
+    #[tokio::test]
+    async fn chat_top_level_profile_and_model_alias_session_fields() {
+        let app = reviewer_app();
+        // 以前顶层 profile 被静默忽略（落到 default）；现在等价于 session.profile
+        assert_eq!(chat_session_view(&app, json!({"message": "hi", "profile": "reviewer"})).await["profile"], "reviewer");
+        assert_eq!(chat_session_view(&app, json!({"message": "hi", "profile": "reviewer", "session": {"profile": "reviewer"}})).await["profile"], "reviewer");
+        let view = chat_session_view(&app, json!({"message": "hi", "model": "faux-alt"})).await;
+        assert_eq!((view["profile"].as_str(), view["model"].as_str()), (Some("default"), Some("faux-alt")));
+        // 现有写法不变
+        assert_eq!(chat_session_view(&app, json!({"message": "hi", "session": {"profile": "reviewer", "model": "faux-alt"}})).await["model"], "faux-alt");
+        assert_eq!(chat_session_view(&app, json!({"message": "hi"})).await["profile"], "default");
+        for (body, error) in [
+            (json!({"message": "hi", "profile": "reviewer", "session": {"profile": "default"}}), "profile given both at top level and in session; put it in session.profile"),
+            (json!({"message": "hi", "model": "faux-a", "session": {"model": "faux-b"}}), "model given both at top level and in session; put it in session.model"),
+        ] {
+            assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), body).await, (StatusCode::BAD_REQUEST, json!({"error": error})));
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_and_session_reject_unknown_fields() {
+        let app = reviewer_app();
+        for field in ["cwd", "systemPrompt", "provider", "tools", "callerTools", "api", "appendSystemPrompt"] {
+            let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", field: "x"})).await;
+            assert_eq!((status, body), (StatusCode::BAD_REQUEST, json!({"error": format!(r#"unknown field '{field}'; session options go under "session": {{...}}"#)})));
+        }
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", "apiKey": "sk-secret-value"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let error = body["error"].as_str().unwrap();
+        assert!(error.starts_with("unknown field 'apiKey'; expected one of: message, sessionId, session,"), "{error}");
+        assert!(!error.contains("sk-secret-value"), "{error}");
+        // session 内部的未知字段同样 400（不再静默忽略拼写错误）
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", "session": {"profiel": "reviewer"}})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("unknown field `profiel`"), "{body}");
+        let (status, body) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"profile": "reviewer", "message": "sk-secret-value"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("unknown field `message`") && !body.to_string().contains("sk-secret-value"), "{body}");
+        // 文档化的 session 字段与顶层字段仍然可用
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/v1/sessions",
+            Some("test-token"),
+            json!({"provider": "faux", "profile": "reviewer", "cwd": ".", "model": "faux", "reasoningEffort": "high", "depth": "standard", "api": "auto", "account": "default", "tools": ["read"], "callerTools": [], "systemPrompt": "s", "appendSystemPrompt": "a"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = request(
+            &app,
+            "POST",
+            "/v1/chat",
+            Some("test-token"),
+            json!({"message": "hi", "session": {"profile": "reviewer"}, "stream": false, "async": false, "timeoutSecs": 30, "reasoningEffort": "low", "depth": "standard", "account": "default", "webhookEvents": "final"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     /// default profile：openai，只允许 default；multi profile：allowedAccounts [default, work]。

@@ -152,7 +152,10 @@ pub async fn run(cli: &crate::Cli, cfg: &crate::config::Config, args: &Probe) ->
     let account = cfg.account_config(id, &account_name).ok_or_else(|| anyhow::anyhow!("account '{account_name}' is not configured for provider {id}"))?;
     let files = crate::hub::KeyFiles { openai: cli.openai_key_file.as_deref(), anthropic: cli.anthropic_key_file.as_deref() };
     let spec = crate::hub::account_key_spec(pk, &account_name, &account, files, &agent_ai::secrets::ManagedStore::system());
-    let (key, _) = agent_ai::secrets::load_account_key(&spec, |k| std::env::var(k).ok(), &agent_ai::keychain::SystemKeychain).map_err(|e| match e {
+    // 限时读取：授权对话框无人响应时提示并在 keychainTimeoutSecs 后报错，而不是挂起
+    let keychain = agent_ai::keychain::TimedKeychain::new(std::sync::Arc::new(agent_ai::keychain::SystemKeychain), std::time::Duration::from_secs(cfg.keychain_timeout_secs))
+        .on_wait(|service, account| tracing::warn!(service, account, "{}", agent_ai::keychain::wait_hint(service, account)));
+    let (key, _) = agent_ai::secrets::load_account_key(&spec, |k| std::env::var(k).ok(), &keychain).map_err(|e| match e {
         // Keychain 错误文案只含 service/account，可直接展示（锁定/拒绝时用户需要知道怎么处理）
         agent_ai::secrets::KeyLoadError::Keychain(k) => anyhow::anyhow!("cannot load {id} API key for account '{account_name}': {k}"),
         _ => anyhow::anyhow!("cannot load {id} API key for account '{account_name}' (check key-file/configuration)"),

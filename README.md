@@ -7,7 +7,7 @@
 - OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -255,6 +255,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
   "streamIdleTimeoutSecs": 300,               // LLM 流连续无字节的超时；推理模型可能长时间静默
   "chatTimeoutSecs": 900,                     // /v1/chat 非流式默认等待上限
+  "keychainTimeoutSecs": 30,                  // 每次 macOS Keychain 读取的等待上限（>= 1），见「Keychain 读取超时」
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
   "profiles": {
     "coder": {
@@ -303,6 +304,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
   - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
+  - `--keychain-timeout-secs`（`SUB_BOT_KEYCHAIN_TIMEOUT_SECS`）：覆盖 `keychainTimeoutSecs`（>= 1），对 `serve` / `run` / `rpc` / `keys check` / `keys list` 等所有读取 Keychain 的命令生效
   - `--log-level`、`--log-dir`、`--log-format`
 
 ## 模型与推理强度
@@ -437,7 +439,7 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/health` | 健康检查（无需鉴权） |
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`） |
 | `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`（未知字段返回 400），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
 | `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404 |
 | `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?}`：修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
 | `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
@@ -445,8 +447,14 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
-| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；响应带 `model`、推理强度字段和 `routing` |
+| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` 是 `session.profile` / `session.model` 的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
+
+`/v1/chat` 请求体校验（v0.9.2）：
+- 顶层 `profile` / `model` 等价于 `session.profile` / `session.model`（新会话使用；带 `sessionId` 时与 `session` 一样被忽略）。两处都给且值不同 ⇒ 400 `profile given both at top level and in session; put it in session.profile`（`model` 同理）；相同则接受。以前顶层 `profile` 会被静默忽略并落到默认 profile。
+- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
+- `session` 对象（以及 `POST /v1/sessions` 请求体）里的未知字段同样返回 400（serde 报 ``unknown field `profiel`, expected one of ...``），拼写错误不再被静默忽略。
+- 顶层 `reasoningEffort` / `depth` / `account` 的语义不变（`account` 顶层优先于 `session.account`）。
 
 超时行为：
 - `streamIdleTimeoutSecs`（全局，默认 300 秒）适用于 OpenAI Chat Completions 和 Responses；每次收到字节重置计时。超时产生 `stopReason: "error"`、`errorMessage: "stream idle timeout after Ns"`。连接超时为 30 秒，初始响应头等待上限为 120 秒。
@@ -704,13 +712,15 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
 | `-25293` | `errSecAuthFailed` | ``keychain access denied (…): approve sub-bot in the Keychain prompt or re-run `sub-bot keys set` after upgrading the binary`` | ACL 不信任当前二进制（典型：brew upgrade 之后），或授权失败。见下文“升级后重新授权”。 |
 | `-128` | `errSecUserCanceled` | 同上（`keychain access denied (…)`） | 在授权弹窗里点了“拒绝”或取消。重新运行并选择“始终允许”。 |
 | 其它 | — | `keychain error <code> (service=…, account=…)` | 用 `security error <code>` 查看含义。 |
+| （超时） | — | `no answer from macOS Keychain within Ns (service=…, account=…): an authorization dialog is probably waiting …` | 读取在 `keychainTimeoutSecs` 内没有返回：多半是授权弹窗在等人点击（brew upgrade 换了二进制），或会话没有 GUI 显示弹窗。见下文「Keychain 读取超时」。 |
 
 ### 首次访问弹窗、升级与后台运行
 
-- **首次 Keychain 访问弹窗**：由 sub-bot 自己 `keys set` 创建的条目，ACL 的“始终允许”列表里就是创建它的这个 sub-bot 二进制，之后同一个二进制读取**不会弹窗**。用“钥匙串访问”或 `security add-generic-password` 创建的条目，sub-bot 第一次读取时会弹出“sub-bot 想要使用钥匙串中的机密信息”：输入登录密码并点 **“始终允许”**，以后不再弹；点“拒绝”得到 `-128`。只做属性搜索的 `keys list` 不读条目内容，不会触发弹窗；`keys check` 和服务启动会读取内容。
-- **brew 升级后 ACL 失效，需要重新授权**：Homebrew 把每个版本装在不同的 Cellar 路径下，新二进制的路径和签名/hash 都和旧的不同，Keychain 视之为另一个应用，原来的“始终允许”对它不再生效（手动替换二进制同理）。GUI 会话里会再弹一次授权；没有 GUI（ssh、后台进程）时读取失败，报 `keychain access denied (...)`（`-25293`）或 `keychain interaction not allowed (...)`（`-25308`）。升级后、重启服务之前，在**图形界面登录会话的终端**里执行一次：
-  - `sub-bot --config sub-bot.json keys check`，在弹窗里点“始终允许”；或
+- **首次 Keychain 访问弹窗**：由 sub-bot 自己 `keys set` 创建的条目，ACL 的“始终允许”列表里就是创建它的这个 sub-bot 二进制，之后同一个二进制读取**不会弹窗**。用“钥匙串访问”或 `security add-generic-password` 创建的条目，sub-bot 第一次读取时会弹出“sub-bot 想要使用钥匙串中的机密信息”：输入登录密码并点 **“始终允许”**，以后不再弹；点“拒绝”得到 `-128`。只做属性搜索的 `keys list` 不读条目内容，不会触发 ACL 弹窗；`keys check` 和服务启动会读取内容。两者都受下文「Keychain 读取超时」保护，不会无限挂起。
+- **brew 升级后 ACL 失效，需要重新授权**：**每次** `brew upgrade` 都会替换 sub-bot 二进制。Homebrew 把每个版本装在不同的 Cellar 路径下，新二进制的路径和签名/hash 都和旧的不同，Keychain 视之为另一个应用，旧二进制创建或授权过的条目，原来的“始终允许”对新二进制不再生效（手动替换二进制同理），因此升级后授权弹窗会再次出现。GUI 会话里会再弹一次授权，而在有人点击之前读取一直阻塞（v0.9.2 起有超时，见下一节）；没有 GUI（ssh、后台进程）时读取失败，报 `keychain access denied (...)`（`-25293`）、`keychain interaction not allowed (...)`（`-25308`），或者等不到回应而超时。升级后、重启服务之前，在**图形界面登录会话的终端**里执行一次：
+  - `sub-bot --config sub-bot.json keys check`，在弹窗里点 **“始终允许 / Always Allow”**（每次升级后点一次即可）；或
   - `sub-bot keys delete --provider openai && sub-bot keys set --provider openai`，让新二进制重新创建条目（ACL 随之归属新二进制）。
+- **关于 `security add-generic-password -T`**：也可以用 `security add-generic-password -U -s sub-bot -a openai/<account> -T "$(brew --prefix)/bin/sub-bot" -w` 更新条目并把指定路径的程序加入信任列表（`-w` 后面不带值时会交互提示输入密码，**不要**把 key 直接写在命令行上，否则会进 shell 历史和 `ps`）。`-T` 信任的是指定路径上的程序，但 macOS 同时记录该程序当时的代码签名；Homebrew 升级会把它换成签名不同的新二进制，macOS 仍可能再次弹窗，所以这**不是**可靠的修复办法；升级后照样按上一条点一次“始终允许”。
 - **ssh 会话下钥匙串锁定**：ssh 登录不会解锁登录钥匙串，也无法弹窗，读取返回 `-25308`。在同一个 ssh 会话里先解锁再运行：
 
   ```bash
@@ -720,7 +730,16 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
 
   解锁不会给新二进制授权：如果条目 ACL 不信任当前二进制（例如刚升级），ssh 下仍会失败，需要按上一条在 GUI 会话里授权一次。
 - **LaunchAgent（可用）vs LaunchDaemon（不可用）**：要让后台常驻的 `sub-bot serve` 使用 Keychain，请用 **LaunchAgent**：plist 放在 `~/Library/LaunchAgents/`，以登录用户身份在其会话中运行，能访问该用户（已解锁的）登录钥匙串，例如 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.sub-bot.plist`。**LaunchDaemon**（`/Library/LaunchDaemons/`，系统级、通常以 root 运行、不属于任何用户登录会话）没有登录钥匙串可用，Keychain 来源会失败——这种部署请改用 `apiKeyFile` 或 `keys set --file` 写出的 0600 key 文件。Homebrew tap 的 formula 没有提供服务定义，launchd plist 需要自己编写。
+- **无头部署（ssh、LaunchDaemon、没有人看屏幕的机器）**：推荐直接用 `apiKeyFile`（或 `keys set --file` 写出的 0600 key 文件），完全绕开 Keychain 授权弹窗。
 - **启动失败即退出**：Keychain 读取只发生在启动阶段（不做运行期懒加载，避免服务运行中突然弹窗或挂起）。失败时 sub-bot 直接退出并上报 `startup_failed` issue，消息为上表中的 Keychain 错误文本（只含 service/account 名，不含 key）。同样，`provider ... is not configured`、`... API key not found for account ...`、`account '...' is not configured for provider ...` 这类 key 配置错误（只含 provider / 账号 / 环境变量名 / 配置路径）会原样显示，issue details 为 `{"reason": "key_config"}`；key 文件读取失败等其它错误只显示通用的 `service initialization failed (check provider and key configuration)`。部署 LaunchAgent 前先在 GUI 终端里跑一次 `sub-bot keys check`。
+
+### Keychain 读取超时（v0.9.2）
+
+授权弹窗出现时，Security.framework 的读取会一直阻塞到有人点击。v0.9.1 及以前，`serve` 和 `sub-bot keys check` 会因此无限挂起且没有任何日志。v0.9.2 起每次 Keychain 读取都放在独立线程上并限时等待：
+
+- **超过 1 秒仍未返回**（正常读取远快于此，不会产生噪音）：记一条 WARN 日志 `waiting for macOS Keychain authorization for sub-bot/openai/default — check for a dialog on the Mac's screen; after brew upgrade choose "Always Allow"`（service/account 为实际条目名）；`serve` / `run` / `rpc` 还会上报一个 `keychain_waiting` issue（severity `warn`，details `{service, account}`）。`keys check` / `keys list` 把同一行提示打到 stderr（stdout 只放结果）。
+- **超过 `keychainTimeoutSecs`（全局配置，默认 30，必须 >= 1；`--keychain-timeout-secs` / `SUB_BOT_KEYCHAIN_TIMEOUT_SECS` 覆盖）**：该次读取失败，报 `no answer from macOS Keychain within 30s (service=sub-bot, account=openai/default): an authorization dialog is probably waiting (the sub-bot binary changed, e.g. after `brew upgrade`) or this session has no GUI to show it; click "Always Allow" in the dialog or re-run `sub-bot keys set`, or use apiKeyFile for headless use (ssh / LaunchDaemon)`。处理方式与其它 Keychain 错误相同：启动必需的账号 ⇒ `serve` 退出并在 `startup_failed` issue 里显示这条消息（details `{"reason": "keychain"}`）；可选账号 ⇒ 只有该账号标记为不可用（`account_unavailable` issue），服务照常启动。`keys check` 把该账号报告为 `FAILED: no answer from macOS Keychain ...` 并以非零状态退出；`keys list` 的状态列显示 `unknown (no answer from macOS Keychain ...)`。
+- 超时后被放弃的读取线程可能一直阻塞在 Security.framework 里，直到有人响应弹窗；sub-bot 不等待它，进程退出也不受影响。之后再点“始终允许”不会让本次已失败的启动恢复，重新启动即可。
 
 ## 同一 provider 多账号（v0.9.0）
 

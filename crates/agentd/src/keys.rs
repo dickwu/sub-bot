@@ -18,6 +18,8 @@ use std::{
     collections::BTreeMap,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
 /// provider 用全局 `--provider` 选择（set/delete 必填；list/check 作为筛选）。
@@ -75,6 +77,42 @@ impl KeychainStore for SystemKeychain {
     }
     fn list(&self, service: &str) -> Result<Vec<String>, KeychainError> {
         keychain::list_accounts(service)
+    }
+}
+
+/// 读取（`get` / `list`）限时的 Keychain 存储（见 [`keychain::with_timeout`]）：`keys check` / `keys list` 不会因为
+/// 无人响应的授权对话框而挂起；超过 grace 仍未返回 ⇒ 调用 `on_wait`（CLI 里把提示打到 stderr）。
+/// `set` / `delete` 直接透传（不限时：写入超时后结果不确定）。
+pub struct TimedStore {
+    inner: Arc<dyn KeychainStore>,
+    timeout: Duration,
+    grace: Duration,
+    on_wait: keychain::WaitHook,
+}
+
+impl TimedStore {
+    pub fn new(inner: Arc<dyn KeychainStore>, timeout: Duration, grace: Duration, on_wait: impl Fn(&str, &str) + Send + Sync + 'static) -> Self {
+        Self { inner, timeout, grace, on_wait: Box::new(on_wait) }
+    }
+}
+
+impl KeychainReader for TimedStore {
+    fn get(&self, service: &str, account: &str) -> Result<Secret, KeychainError> {
+        let (inner, s, a) = (self.inner.clone(), service.to_string(), account.to_string());
+        keychain::with_timeout(service, account, self.timeout, self.grace, || (self.on_wait)(service, account), move || inner.get(&s, &a))
+    }
+}
+
+impl KeychainStore for TimedStore {
+    fn set(&self, service: &str, account: &str, secret: &Secret) -> Result<(), KeychainError> {
+        self.inner.set(service, account, secret)
+    }
+    fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError> {
+        self.inner.delete(service, account)
+    }
+    fn list(&self, service: &str) -> Result<Vec<String>, KeychainError> {
+        let (inner, s) = (self.inner.clone(), service.to_string());
+        keychain::with_timeout(service, "*", self.timeout, self.grace, || (self.on_wait)(service, "*"), move || inner.list(&s))
     }
 }
 
@@ -299,6 +337,8 @@ pub fn delete(stores: &Stores<'_>, pk: &ProviderKey, account: &str, target: &Tar
 pub struct KeyConfig {
     #[serde(default)]
     pub api_key_file: Option<PathBuf>,
+    #[serde(default)]
+    pub keychain_timeout_secs: Option<u64>,
     #[serde(default)]
     pub providers: BTreeMap<String, KeyProviderConfig>,
 }
@@ -548,6 +588,18 @@ fn require_provider(cli: &crate::Cli) -> anyhow::Result<&'static ProviderKey> {
     provider_key(id).ok_or_else(|| anyhow::anyhow!("unknown provider '{id}' (expected one of: {})", PROVIDER_KEYS.iter().map(|k| k.provider).collect::<Vec<_>>().join(", ")))
 }
 
+/// `--keychain-timeout-secs` > 配置 `keychainTimeoutSecs` > 默认 30 秒。
+fn keychain_timeout(cli: &crate::Cli, configured: Option<u64>) -> anyhow::Result<Duration> {
+    let secs = cli.keychain_timeout_secs.or(configured).unwrap_or_else(crate::config::default_keychain_timeout_secs);
+    anyhow::ensure!(secs >= 1, "keychainTimeoutSecs must be >= 1");
+    Ok(Duration::from_secs(secs))
+}
+
+/// 系统 Keychain + 限时读取；等待超过 grace 时把提示打到 stderr（stdout 只放结果）。
+fn timed_system_store(timeout: Duration) -> TimedStore {
+    TimedStore::new(Arc::new(SystemKeychain), timeout, keychain::WAIT_HINT_GRACE, |service, account| eprintln!("{}", keychain::wait_hint(service, account)))
+}
+
 pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
     let stores = Stores { macos: keychain::supported(), managed_dir: managed_key_dir(), keychain: &SystemKeychain };
     let getenv = |k: &str| std::env::var(k).ok();
@@ -570,13 +622,18 @@ pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
             if let Some(f) = cli.provider.as_deref() {
                 anyhow::ensure!(provider_key(f).is_some(), "unknown provider '{f}'");
             }
+            let timed = timed_system_store(keychain_timeout(cli, cfg.keychain_timeout_secs)?);
+            let stores = Stores { keychain: &timed, ..stores };
             print_rows(&list_rows(&stores, &cfg, cli.provider.as_deref(), files, &getenv), *json, &mut out)
         }
         KeysCmd::Check => {
-            let cfg = match &cli.config {
+            let mut cfg = match &cli.config {
                 Some(p) => Config::load(p).map_err(|e| anyhow::anyhow!("configuration load failed: {e}"))?,
                 None => Config::fallback_for(cli.provider.as_deref(), cli.model.clone(), "", cli.workspace.clone()),
             };
+            cfg.keychain_timeout_secs = keychain_timeout(cli, Some(cfg.keychain_timeout_secs))?.as_secs();
+            let timed = timed_system_store(Duration::from_secs(cfg.keychain_timeout_secs));
+            let stores = Stores { keychain: &timed, ..stores };
             let default = cfg.default_provider.clone().unwrap_or_else(|| "openai".into());
             check(&stores, &cfg, &default, cli.provider.as_deref(), files, &getenv, &mut out)
         }
@@ -597,6 +654,9 @@ mod tests {
             self.items.lock().unwrap().remove(&(service.into(), account.into())).map(|_| ()).ok_or_else(|| KeychainError::NotFound { service: service.into(), account: account.into() })
         }
         fn list(&self, service: &str) -> Result<Vec<String>, KeychainError> {
+            if let Some(delay) = self.delay {
+                std::thread::sleep(delay);
+            }
             Ok(self.items.lock().unwrap().keys().filter(|(s, _)| s == service).map(|(_, a)| a.clone()).collect())
         }
     }
@@ -892,5 +952,60 @@ mod tests {
         );
         assert!(!out.contains("sk-named-only"), "{out}");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    type Hints = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn hint_recorder() -> (Hints, impl Fn(&str, &str) + Send + Sync + 'static) {
+        let hints = Arc::new(std::sync::Mutex::new(vec![]));
+        let seen = hints.clone();
+        (hints, move |s: &str, a: &str| seen.lock().unwrap().push(keychain::wait_hint(s, a)))
+    }
+
+    /// 授权对话框无人响应：`keys check` 先打印提示（grace 后），超时后报告该账号 FAILED 而不是挂起。
+    #[test]
+    fn check_times_out_on_blocked_keychain_and_prints_hint() {
+        let dir = temp_dir("check-timeout");
+        let mut cfg = Config::fallback("gpt-6.1-sol".into(), "t", dir.clone());
+        std::fs::write(dir.join("openai.key"), "sk-timeout-openai\n").unwrap();
+        cfg.api_key_file = Some(dir.join("openai.key"));
+        cfg.providers.insert("anthropic".into(), crate::config::ProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        let slow = MockKeychain::with([(("sub-bot", "anthropic/default"), Ok("sk-timeout-anthropic"))]).delayed(Duration::from_secs(30));
+        let (hints, hook) = hint_recorder();
+        let timed = TimedStore::new(Arc::new(slow), Duration::from_secs(1), Duration::from_millis(100), hook);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &timed };
+        let started = std::time::Instant::now();
+        let (r, out) = output(|o| check(&stores, &cfg, "openai", None, KeyFiles::default(), &|_| None, o));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(r.unwrap_err().to_string(), "one or more API keys failed to load");
+        let timeout = KeychainError::Timeout { service: "sub-bot".into(), account: "anthropic/default".into(), secs: 1 };
+        assert!(out.contains("openai/default: ok (config apiKeyFile"), "{out}");
+        assert!(out.contains(&format!("anthropic/default: FAILED: {timeout}")), "{out}");
+        assert!(!out.contains("sk-timeout"), "{out}");
+        assert_eq!(*hints.lock().unwrap(), [keychain::wait_hint("sub-bot", "anthropic/default")]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn list_times_out_on_blocked_keychain_search() {
+        let mut cfg = KeyConfig::default();
+        cfg.providers.insert("openai".into(), KeyProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        let slow = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-list-secret"))]).delayed(Duration::from_secs(30));
+        let (hints, hook) = hint_recorder();
+        let timed = TimedStore::new(Arc::new(slow), Duration::from_secs(1), Duration::from_millis(100), hook);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &timed };
+        let rows = list_rows(&stores, &cfg, Some("openai"), KeyFiles::default(), &|_| None);
+        let row = rows.iter().find(|r| r.account == "default").unwrap();
+        assert!(row.status.starts_with("unknown (no answer from macOS Keychain within 1s"), "{row:?}");
+        // 每个 service 只搜索一次 ⇒ 只等待/提示一次
+        assert_eq!(hints.lock().unwrap().len(), 1);
+        // 快速路径：不提示
+        let fast = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-list-secret"))]);
+        let (hints, hook) = hint_recorder();
+        let timed = TimedStore::new(Arc::new(fast), Duration::from_secs(1), Duration::from_millis(100), hook);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &timed };
+        let rows = list_rows(&stores, &cfg, Some("openai"), KeyFiles::default(), &|_| None);
+        assert_eq!(rows.iter().find(|r| r.account == "default").unwrap().status, "present");
+        assert!(hints.lock().unwrap().is_empty());
     }
 }

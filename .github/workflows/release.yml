@@ -1,4 +1,4 @@
-# 打 tag（v*）时为 4 个目标（Linux musl x86_64/aarch64、macOS x86_64/aarch64）构建预编译二进制并上传到 GitHub Release。
+# 打 tag（v*）时为 4 个目标（Linux musl x86_64/aarch64、macOS x86_64/aarch64）构建预编译二进制并上传到 GitHub Release；两个 macOS 目标在同一台 macos-15（arm64）runner 上构建。
 name: release
 on:
   push:
@@ -9,6 +9,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,9 +29,11 @@ jobs:
   test:
     needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # 显式 arm64 标签：macos-latest 在发布高峰常常长时间分配不到 runner
+        os: [ubuntu-latest, macos-15]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -38,49 +41,51 @@ jobs:
       - run: cargo test --workspace --locked
   build:
     needs: test
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest,  cross: true }
-          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest,  cross: true }
-          - { target: x86_64-apple-darwin,        os: macos-latest }
-          - { target: aarch64-apple-darwin,       os: macos-latest }
+          - { targets: x86_64-unknown-linux-musl,  os: ubuntu-latest, cross: true, artifact: x86_64-unknown-linux-musl,  toolchain: x86_64-unknown-linux-musl }
+          - { targets: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true, artifact: aarch64-unknown-linux-musl, toolchain: aarch64-unknown-linux-musl }
+          # 两个 macOS 目标在同一台 arm64 runner 上构建（x86_64 由 arm64 交叉编译），只需排队一台 mac
+          - { targets: "aarch64-apple-darwin x86_64-apple-darwin", os: macos-15, artifact: apple-darwin, toolchain: "aarch64-apple-darwin,x86_64-apple-darwin" }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "${{ matrix.target }}" }
+        with: { targets: "${{ matrix.toolchain }}" }
       - uses: Swatinem/rust-cache@v2
-        with: { key: "${{ matrix.target }}" }
+        with: { key: "${{ matrix.artifact }}" }
       - uses: taiki-e/install-action@v2
         if: matrix.cross
         with: { tool: cross }
-      - name: build (cross)
-        if: matrix.cross
-        run: cross build --release --locked --target ${{ matrix.target }} -p agentd
-      - name: build
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }} -p agentd
-      - name: package
+      - name: build and package
         shell: bash
         run: |
-          name=sub-bot-${GITHUB_REF_NAME}-${{ matrix.target }}
-          mkdir -p "$name"
-          cp "target/${{ matrix.target }}/release/sub-bot" sub-bot.example.json README.md DESIGN.md "$name/"
-          tar czf "$name.tar.gz" "$name"; f="$name.tar.gz"
-          (command -v sha256sum >/dev/null && sha256sum "$f" || shasum -a 256 "$f") > "$f.sha256"
-          echo "ASSET=$f" >> "$GITHUB_ENV"
+          set -euo pipefail
+          for target in ${{ matrix.targets }}; do
+            if [[ "${{ matrix.cross }}" == "true" ]]; then
+              cross build --release --locked --target "$target" -p agentd
+            else
+              cargo build --release --locked --target "$target" -p agentd
+            fi
+            name=sub-bot-${GITHUB_REF_NAME}-$target
+            mkdir -p "dist/$name"
+            cp "target/$target/release/sub-bot" sub-bot.example.json README.md DESIGN.md "dist/$name/"
+            (cd dist && tar czf "$name.tar.gz" "$name" && { command -v sha256sum >/dev/null && sha256sum "$name.tar.gz" || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
+          done
       - uses: actions/upload-artifact@v4
         with:
-          name: sub-bot-${{ matrix.target }}
+          name: sub-bot-${{ matrix.artifact }}
           if-no-files-found: error
           path: |
-            ${{ env.ASSET }}
-            ${{ env.ASSET }}.sha256
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -99,6 +104,7 @@ jobs:
     needs: publish
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: check tap token

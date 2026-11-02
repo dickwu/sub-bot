@@ -5,7 +5,7 @@ use crate::{
     issues::{IssueEvent, IssueScope, Reporter, Severity},
     webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
-use agent_ai::keychain::{KeychainReader, SystemKeychain};
+use agent_ai::keychain::{KeychainReader, SystemKeychain, TimedKeychain};
 use agent_ai::secrets::{load_account_key, AccountKeySpec, KeyLoadError, ManagedStore, ProviderKey, DEFAULT_ACCOUNT};
 use agent_ai::{
     anthropic::AnthropicProvider,
@@ -484,9 +484,9 @@ impl SessionHandle {
     }
 }
 
-/// 调用方在创建会话时可以提交的覆盖项（都受 profile 权限约束）。
+/// 调用方在创建会话时可以提交的覆盖项（都受 profile 权限约束）。未知字段 ⇒ 反序列化失败（HTTP 400），避免拼写错误被静默忽略。
 #[derive(Debug, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SessionRequest {
     pub provider: Option<String>,
     pub profile: Option<String>,
@@ -803,6 +803,17 @@ pub(crate) fn required_accounts(config: &Config, default: &str) -> BTreeSet<Acco
     required
 }
 
+/// 限时的 Keychain 读取器（启动加载用）：每次读取在独立线程上进行，最多等 `keychainTimeoutSecs`；
+/// 超过 `grace` 仍未返回 ⇒ 记一次 WARN + `keychain_waiting` issue（提示去 Mac 屏幕上找授权对话框）。
+/// 超时 ⇒ `KeychainError::Timeout`，与其它 Keychain 错误同样处理（必需账号 ⇒ 启动失败；可选账号 ⇒ unavailable）。
+pub(crate) fn timed_keychain(inner: Arc<dyn KeychainReader>, timeout_secs: u64, grace: Duration, issues: Arc<Reporter>) -> TimedKeychain {
+    TimedKeychain::new(inner, Duration::from_secs(timeout_secs)).grace(grace).on_wait(move |service, account| {
+        let hint = agent_ai::keychain::wait_hint(service, account);
+        tracing::warn!(service, account, "{hint}");
+        issues.report(IssueEvent::new(Severity::Warn, "keychain_waiting", "config", hint).details(serde_json::json!({"service": service, "account": account})));
+    })
+}
+
 /// 加载结果：成功的 provider 实例 + 失败的可选账号。
 pub(crate) struct LoadedProviders {
     pub providers: BTreeMap<AccountKey, Arc<dyn Provider>>,
@@ -887,7 +898,8 @@ impl Hub {
 
     pub fn with_provider_keys(config: Config, provider_name: &str, session_dir: Option<PathBuf>, files: KeyFiles<'_>, issues: Arc<Reporter>, store_mode: StoreMode) -> Result<Arc<Self>> {
         config.validate()?;
-        let LoadedProviders { providers, unavailable } = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok(), &SystemKeychain, &ManagedStore::system())?;
+        let keychain = timed_keychain(Arc::new(SystemKeychain), config.keychain_timeout_secs, agent_ai::keychain::WAIT_HINT_GRACE, issues.clone());
+        let LoadedProviders { providers, unavailable } = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok(), &keychain, &ManagedStore::system())?;
         let registry = ToolRegistry::with_builtins();
         let store = match store_mode {
             StoreMode::Memory => crate::store::Store::memory(),
@@ -1592,6 +1604,61 @@ pub(crate) mod tests {
         assert!(matches!(e.downcast_ref::<KeychainError>(), Some(KeychainError::Denied { .. })));
         let e = load_providers(&config(), "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &MockKeychain::default(), &managed).err().unwrap();
         assert_eq!(e.to_string(), not_configured("openai").to_string());
+    }
+
+    /// 授权对话框无人响应：读取被阻塞 ⇒ grace 后 WARN + keychain_waiting issue，超时后 typed `KeychainError::Timeout`。
+    #[tokio::test]
+    async fn slow_keychain_read_warns_and_times_out() {
+        let mut cfg = config();
+        cfg.keychain_timeout_secs = 1;
+        cfg.providers.insert("anthropic".into(), crate::config::ProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let slow = Arc::new(MockKeychain::with([(("sub-bot", "anthropic/default"), Ok("test-slow-value"))]).delayed(Duration::from_secs(30)));
+        let kc = timed_keychain(slow.clone(), cfg.keychain_timeout_secs, Duration::from_millis(100), reporter.clone());
+        let (logs, guard) = capture_all();
+        let started = Instant::now();
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, |_| None, &kc, &ManagedStore::None).err().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(guard);
+        let timeout = KeychainError::Timeout { service: "sub-bot".into(), account: "anthropic/default".into(), secs: 1 };
+        assert_eq!(e.downcast_ref::<KeychainError>(), Some(&timeout));
+        // serve 启动失败显示这条具体错误（typed allowlist）
+        let (message, event) = crate::startup_failure(Some(&e));
+        assert_eq!(message, timeout.to_string());
+        assert!(message.contains("no answer from macOS Keychain within 1s"), "{message}");
+        assert_eq!(event.details, serde_json::json!({"reason": "keychain"}));
+        let hint = "waiting for macOS Keychain authorization for sub-bot/anthropic/default — check for a dialog on the Mac's screen; after brew upgrade choose \"Always Allow\"";
+        let logs = logs.0.lock().unwrap().clone();
+        assert_eq!(logs.iter().filter(|l| l.contains(hint)).count(), 1, "{logs:?}");
+        reporter.flush(Duration::from_secs(1)).await;
+        let events = reporter.recent(None, 0, 100);
+        let waiting: Vec<_> = events.iter().filter(|e| e.kind == "keychain_waiting").collect();
+        assert_eq!(waiting.len(), 1, "{events:?}");
+        assert_eq!((waiting[0].severity, waiting[0].message.as_str()), (Severity::Warn, hint));
+        assert_eq!(waiting[0].details, serde_json::json!({"service": "sub-bot", "account": "anthropic/default"}));
+        // 可选账号超时只让该账号不可用，启动继续
+        cfg.profiles.get_mut("default").unwrap().provider = None;
+        let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None).unwrap();
+        assert_eq!(names(&loaded), ["faux/default"]);
+        assert_eq!(loaded.unavailable.get(&AccountKey::from("anthropic")), Some(&timeout.to_string()));
+    }
+
+    #[tokio::test]
+    async fn fast_keychain_read_does_not_warn() {
+        let mut cfg = config();
+        cfg.providers.insert("anthropic".into(), crate::config::ProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let fast = Arc::new(MockKeychain::with([(("sub-bot", "anthropic/default"), Ok("test-fast-value"))]));
+        let kc = timed_keychain(fast, 1, Duration::from_millis(100), reporter.clone());
+        let (logs, guard) = capture_all();
+        let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, |_| None, &kc, &ManagedStore::None).unwrap();
+        drop(guard);
+        assert_eq!(names(&loaded), ["anthropic/default", "faux/default"]);
+        assert!(!logs.0.lock().unwrap().iter().any(|l| l.contains("waiting for macOS Keychain")));
+        reporter.flush(Duration::from_secs(1)).await;
+        assert!(!reporter.recent(None, 0, 100).iter().any(|e| e.kind == "keychain_waiting"));
     }
 
     struct CatalogProvider(&'static str);

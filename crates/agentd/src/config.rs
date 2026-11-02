@@ -271,6 +271,9 @@ pub struct Config {
     pub stream_idle_timeout_secs: u64,
     #[serde(default = "default_llm_max_retries")]
     pub llm_max_retries: u32,
+    /// 每次 macOS Keychain 读取的等待上限（秒，>= 1）；超时 ⇒ `KeychainError::Timeout`（多半是授权对话框无人响应）。
+    #[serde(default = "default_keychain_timeout_secs")]
+    pub keychain_timeout_secs: u64,
     /// /v1/chat 非流式等待上限（秒）。
     #[serde(default = "default_chat_timeout_secs")]
     pub chat_timeout_secs: u64,
@@ -419,6 +422,9 @@ fn default_stream_idle_timeout_secs() -> u64 {
 }
 fn default_chat_timeout_secs() -> u64 {
     900
+}
+pub(crate) fn default_keychain_timeout_secs() -> u64 {
+    agent_ai::keychain::DEFAULT_TIMEOUT_SECS
 }
 
 fn default_model() -> String {
@@ -598,6 +604,7 @@ impl Config {
     /// 只做结构/注册表校验，不访问工作目录或网络。
     pub fn validate(&self) -> anyhow::Result<()> {
         self.socket_mode()?;
+        anyhow::ensure!(self.keychain_timeout_secs >= 1, "keychainTimeoutSecs must be >= 1");
         for id in self.default_provider.iter().chain(self.providers.keys()).chain(self.profiles.values().filter_map(|p| p.provider.as_ref())) {
             validate_provider(id)?;
         }
@@ -821,6 +828,7 @@ impl Config {
             webhook_max_attempts: default_webhook_attempts(),
             stream_idle_timeout_secs: default_stream_idle_timeout_secs(),
             llm_max_retries: default_llm_max_retries(),
+            keychain_timeout_secs: default_keychain_timeout_secs(),
             chat_timeout_secs: default_chat_timeout_secs(),
             default_model: model,
             default_reasoning_effort: None,
@@ -1104,6 +1112,18 @@ mod tests {
             assert_eq!(Config::load(&path).unwrap_err().to_string(), "client 'bot': tokenSha256 must be exactly 64 hex characters");
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn keychain_timeout_defaults_and_validation() {
+        let cfg: Config = serde_json::from_value(serde_json::json!({"profiles": {}})).unwrap();
+        assert_eq!(cfg.keychain_timeout_secs, 30);
+        assert_eq!(Config::fallback("faux".into(), "t", ".".into()).keychain_timeout_secs, 30);
+        let cfg: Config = serde_json::from_value(serde_json::json!({"keychainTimeoutSecs": 5, "profiles": {}})).unwrap();
+        assert_eq!(cfg.keychain_timeout_secs, 5);
+        cfg.validate().unwrap();
+        let cfg: Config = serde_json::from_value(serde_json::json!({"keychainTimeoutSecs": 0, "profiles": {}})).unwrap();
+        assert_eq!(cfg.validate().unwrap_err().to_string(), "keychainTimeoutSecs must be >= 1");
     }
 
     #[test]

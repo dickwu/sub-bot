@@ -863,4 +863,34 @@ mod tests {
         assert!(!out.contains("sk-acct-secret"), "{out}");
         std::fs::remove_dir_all(dir).ok();
     }
+
+    /// 回归：anthropic 只被 profile 以命名账号 ci 使用 ⇒ anthropic/default 跳过，而不是 FAILED（与 serve 启动规则一致）。
+    #[test]
+    fn check_skips_default_account_of_provider_used_only_via_named_profile_account() {
+        let dir = temp_dir("named-only");
+        std::fs::write(dir.join("ci.key"), "sk-named-only-ci\n").unwrap();
+        std::fs::write(dir.join("openai.key"), "sk-named-only-openai\n").unwrap();
+        let config_path = dir.join("sub-bot.json");
+        let value = serde_json::json!({
+            "defaultProvider": "openai",
+            "providers": {"openai": {"apiKeyFile": "openai.key"}, "anthropic": {"accounts": {"ci": {"apiKeyFile": "ci.key"}}}},
+            "profiles": {"claude": {"provider": "anthropic", "account": "ci", "workspaceRoots": ["."]}}
+        });
+        std::fs::write(&config_path, value.to_string()).unwrap();
+        let cfg = Config::load(&config_path).unwrap();
+        let kc = MockKeychain::default();
+        let stores = Stores { macos: false, managed_dir: Some(dir.join("keys")), keychain: &kc };
+        let (r, out) = output(|o| check(&stores, &cfg, "openai", None, KeyFiles::default(), &|_| None, o));
+        r.unwrap();
+        assert_eq!(
+            out,
+            format!(
+                "openai/default: ok (config apiKeyFile {})\nanthropic/ci: ok (config apiKeyFile {})\nanthropic/default: skipped (not used by this configuration)\n",
+                dir.join("openai.key").display(),
+                dir.join("ci.key").display()
+            )
+        );
+        assert!(!out.contains("sk-named-only"), "{out}");
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

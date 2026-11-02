@@ -204,6 +204,12 @@ fn startup_failure(error: Option<&anyhow::Error>) -> (String, issues::IssueEvent
         event.message = message.clone();
         event = event.details(serde_json::json!({"reason": "keychain"}));
         (message, event)
+    } else if let Some(key_config) = error.and_then(|e| e.downcast_ref::<hub::KeyConfigError>()) {
+        // provider 未配置 / key 未找到 / 必需账号未声明：只含 provider、账号、环境变量名与配置路径，不含 key
+        let message = key_config.to_string();
+        event.message = message.clone();
+        event = event.details(serde_json::json!({"reason": "key_config"}));
+        (message, event)
     } else {
         ("service initialization failed (check provider and key configuration)".into(), event)
     }
@@ -683,6 +689,40 @@ mod tests {
         assert!(message.contains("service=sub-bot") && message.contains("account=openai/default"));
         assert_eq!(event.message, message);
         assert_eq!(event.details, serde_json::json!({"reason": "keychain"}));
+    }
+
+    #[test]
+    fn startup_failure_exposes_typed_key_config_error() {
+        let cause = "provider anthropic is not configured (set --anthropic-key-file / ANTHROPIC_API_KEY_FILE / providers.anthropic.apiKeyFile / apiKeyKeychain / ANTHROPIC_API_KEY, or run `sub-bot keys set --provider anthropic`)";
+        let error = anyhow::Error::new(hub::KeyConfigError(cause.into())).context("sensitive provider context");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, cause);
+        assert!(!message.contains("sensitive"));
+        assert_eq!(event.message, message);
+        assert_eq!(event.kind, "startup_failed");
+        assert_eq!(event.severity, issues::Severity::Fatal);
+        assert_eq!(event.details, serde_json::json!({"reason": "key_config"}));
+    }
+
+    #[test]
+    fn startup_failure_exposes_hub_key_errors_but_not_source_errors() {
+        let mut cfg = config::Config::fallback("gpt-4.1".into(), "t", std::env::temp_dir());
+        cfg.data_dir = Some(std::env::temp_dir().join(format!("sub-bot-startup-{}", uuid::Uuid::new_v4())));
+        // profile.account 只在 openai 下声明；--provider anthropic 改变了 profile 解析出的 provider ⇒ typed 错误
+        let mut other = cfg.clone();
+        other.providers.insert("openai".into(), serde_json::from_value(serde_json::json!({"accounts": {"work": {}}})).unwrap());
+        other.profiles.get_mut("default").unwrap().account = Some("work".into());
+        let error = hub::Hub::new(other, "anthropic", None, None).err().expect("missing required account");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, "account 'work' is not configured for provider anthropic");
+        assert_eq!(event.message, message);
+        assert_eq!(event.details, serde_json::json!({"reason": "key_config"}));
+        // KeyLoadError::Source 可能回显路径 ⇒ 保持通用文案（CLI key 文件优先级最高，不受环境变量影响）
+        let missing = std::env::temp_dir().join(format!("sub-bot-missing-{}/sensitive-path.key", uuid::Uuid::new_v4()));
+        let error = hub::Hub::new(cfg, "openai", None, Some(&missing)).err().expect("unreadable key file");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, "service initialization failed (check provider and key configuration)");
+        assert_eq!(event.details, serde_json::json!({}));
     }
 
     #[test]

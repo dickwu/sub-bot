@@ -725,9 +725,24 @@ pub fn select_provider<'a>(requested: Option<&'a str>, profile: Option<&'a str>,
     requested.or(profile).unwrap_or_else(|| if model.starts_with("claude-") { "anthropic" } else { default })
 }
 
-fn not_configured(id: &str) -> String {
+/// key 配置错误：provider 未配置 / key 未找到 / 必需账号未声明。文案只含 provider、账号、环境变量名与配置路径，
+/// 不含 key 材料，因此可以原样进入 `serve` 的启动错误与 startup_failed issue（见 main.rs `startup_failure`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyConfigError(pub String);
+
+impl std::fmt::Display for KeyConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for KeyConfigError {}
+
+fn not_configured(id: &str) -> KeyConfigError {
     let upper = id.to_ascii_uppercase();
-    format!("provider {id} is not configured (set --{id}-key-file / {upper}_API_KEY_FILE / providers.{id}.apiKeyFile / apiKeyKeychain / {upper}_API_KEY, or run `sub-bot keys set --provider {id}`)")
+    KeyConfigError(format!(
+        "provider {id} is not configured (set --{id}-key-file / {upper}_API_KEY_FILE / providers.{id}.apiKeyFile / apiKeyKeychain / {upper}_API_KEY, or run `sub-bot keys set --provider {id}`)"
+    ))
 }
 
 /// 一个账号的 key 来源声明（hub / probe / `keys check` 共用）：CLI 文件（仅 default）、账号块声明的来源、受管存储。
@@ -763,26 +778,23 @@ pub(crate) fn build_provider(config: &Config, id: &str, name: &str, account: &Ac
     }
 }
 
-/// 保留 `KeychainError` 类型（其 Display 不含 key，可进入 startup_failed issue）；其它错误转成纯文本。
+/// 保留可安全展示的类型：`KeychainError`（只含 service/account）与 `NotFound` → [`KeyConfigError`]（只含来源描述）。
+/// `Source` 可能回显路径/读取细节，转成纯文本（启动失败时只显示通用文案）。
 pub(crate) fn key_load_error(e: KeyLoadError) -> anyhow::Error {
     match e {
         KeyLoadError::Keychain(k) => anyhow::Error::new(k),
+        KeyLoadError::NotFound(m) => anyhow::Error::new(KeyConfigError(m)),
         e => anyhow::Error::msg(e.to_string()),
     }
 }
 
-/// 启动时必须可用的 provider：默认 provider、全局默认模型推断的 provider、每个 profile 解析出的 provider。
-pub(crate) fn needed_providers<'a>(config: &'a Config, default: &'a str) -> BTreeSet<&'a str> {
-    let mut needed = BTreeSet::from([default, select_provider(None, None, &config.default_model, default)]);
-    for p in config.profiles.values() {
-        needed.insert(select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&config.default_model), default));
-    }
-    needed
-}
-
-/// 启动时必须加载成功的账号：needed provider 的默认账号 + 每个 profile 的 account（显式或默认）。其它账号可选。
+/// 启动时必须加载成功的账号（其它账号可选）：
+/// - 默认 provider 与全局默认模型推断出的 provider 的默认账号；
+/// - 每个 profile 解析出的 provider 下 profile 自己的账号（显式 `account`，缺省为该 provider 的 defaultAccount）。
+///
+/// 只经由 profile（且 profile 指定了命名账号）使用的 provider，其默认账号不是必需的。
 pub(crate) fn required_accounts(config: &Config, default: &str) -> BTreeSet<AccountKey> {
-    let mut required: BTreeSet<AccountKey> = needed_providers(config, default).into_iter().map(|id| AccountKey::new(id, config.default_account_of(id))).collect();
+    let mut required: BTreeSet<AccountKey> = [default, select_provider(None, None, &config.default_model, default)].into_iter().map(|id| AccountKey::new(id, config.default_account_of(id))).collect();
     for p in config.profiles.values() {
         let id = select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&config.default_model), default);
         required.insert(AccountKey::new(id, p.account.as_deref().unwrap_or_else(|| config.default_account_of(id))));
@@ -810,7 +822,7 @@ fn load_providers(
     let required = required_accounts(config, default);
     // 例如 CLI --provider 改变了 profile 解析出的 provider，而 profile.account 只在原 provider 下定义
     if let Some(missing) = required.iter().find(|k| !config.provider_accounts(&k.provider).contains_key(&k.account)) {
-        bail!("account '{}' is not configured for provider {}", missing.account, missing.provider);
+        return Err(KeyConfigError(format!("account '{}' is not configured for provider {}", missing.account, missing.provider)).into());
     }
     let mut providers: BTreeMap<AccountKey, Arc<dyn Provider>> = BTreeMap::new();
     let mut unavailable = BTreeMap::new();
@@ -833,7 +845,7 @@ fn load_providers(
                     tracing::info!(provider = id, account = %name, key_source = %source, "api key loaded");
                     providers.insert(key_id, build_provider(config, id, &name, &account, key, &getenv));
                 }
-                Err(KeyLoadError::NotFound(_)) if is_required && name == DEFAULT_ACCOUNT => bail!(not_configured(id)),
+                Err(KeyLoadError::NotFound(_)) if is_required && name == DEFAULT_ACCOUNT => return Err(not_configured(id).into()),
                 Err(e) if is_required => return Err(key_load_error(e)),
                 Err(e) => {
                     let reason = match &e {
@@ -1503,13 +1515,13 @@ pub(crate) mod tests {
         assert!(load(&cfg, "openai").err().unwrap().to_string().contains("provider openai is not configured"));
         assert_eq!(names(&load(&cfg, "faux").unwrap()), ["faux/default"]);
         cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
-        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic").to_string());
         cfg.profiles.get_mut("default").unwrap().provider = None;
         cfg.profiles.get_mut("default").unwrap().model = Some("claude-sonnet-4-5".into());
-        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic").to_string());
         cfg.profiles.get_mut("default").unwrap().model = None;
         cfg.default_model = "claude-sonnet-4-5".into();
-        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic").to_string());
     }
 
     #[tokio::test]
@@ -1579,7 +1591,7 @@ pub(crate) mod tests {
         let e = load_providers(&config(), "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &managed).err().unwrap();
         assert!(matches!(e.downcast_ref::<KeychainError>(), Some(KeychainError::Denied { .. })));
         let e = load_providers(&config(), "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &MockKeychain::default(), &managed).err().unwrap();
-        assert_eq!(e.to_string(), not_configured("openai"));
+        assert_eq!(e.to_string(), not_configured("openai").to_string());
     }
 
     struct CatalogProvider(&'static str);
@@ -2634,6 +2646,67 @@ pub(crate) mod tests {
         let mut cfg = config();
         cfg.providers.insert("openai".into(), crate::config::ProviderConfig { default_account: Some("work".into()), ..openai_accounts(&[("work", serde_json::json!({}))]) });
         assert_eq!(required_accounts(&cfg, "openai").into_iter().map(|k| k.label()).collect::<Vec<_>>(), ["openai/work"]);
+    }
+
+    /// 回归：provider 只被 profile 以命名账号使用时，其默认账号不是必需的（README「同一 provider 多账号」）。
+    #[test]
+    fn provider_used_only_via_named_profile_account_does_not_require_default_account() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-required-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ci.key"), "test-anthropic-ci\n").unwrap();
+        let path = dir.join("sub-bot.json");
+        let value = serde_json::json!({
+            "defaultProvider": "openai",
+            "providers": {"anthropic": {"accounts": {"ci": {"apiKeyFile": "ci.key"}}}},
+            "profiles": {"claude": {"provider": "anthropic", "account": "ci", "workspaceRoots": ["."]}}
+        });
+        std::fs::write(&path, value.to_string()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let labels = |cfg: &Config| required_accounts(cfg, "openai").into_iter().map(|k| k.label()).collect::<Vec<_>>();
+        assert_eq!(labels(&cfg), ["anthropic/ci", "openai/default"]);
+        let env = |var: &str| (var == "OPENAI_API_KEY").then(|| "test-openai-default".to_string());
+        let kc = MockKeychain::default();
+        let loaded = load_providers(&cfg, "openai", KeyFiles::default(), &Reporter::noop(), env, &kc, &ManagedStore::None).unwrap();
+        assert_eq!(names(&loaded), ["anthropic/ci", "faux/default", "openai/default"]);
+        assert!(loaded.unavailable.is_empty());
+        // 默认 provider 的默认账号仍是必需的（typed，可展示）
+        let e = load_providers(&cfg, "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None).err().unwrap();
+        assert_eq!(e.downcast_ref::<KeyConfigError>(), Some(&not_configured("openai")));
+        // profile 不写 account ⇒ anthropic 默认账号重新变为必需
+        let mut implicit = cfg.clone();
+        implicit.profiles.get_mut("claude").unwrap().account = None;
+        assert_eq!(labels(&implicit), ["anthropic/default", "openai/default"]);
+        let e = load_providers(&implicit, "openai", KeyFiles::default(), &Reporter::noop(), env, &kc, &ManagedStore::None).err().unwrap();
+        assert_eq!(e.downcast_ref::<KeyConfigError>(), Some(&not_configured("anthropic")));
+        // 全局默认模型推断出的 provider 的默认账号也是必需的
+        let mut claude_default = cfg.clone();
+        claude_default.default_model = "claude-sonnet-4-5".into();
+        assert_eq!(labels(&claude_default), ["anthropic/ci", "anthropic/default", "openai/default"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn key_config_errors_are_typed_and_source_errors_are_not() {
+        let mut cfg = config();
+        cfg.providers.insert("openai".into(), openai_accounts(&[("work", serde_json::json!({})), ("broken", serde_json::json!({"apiKeyEnv": "TEST_OPENAI_KEY_BROKEN"}))]));
+        let profile = cfg.profiles.get_mut("default").unwrap();
+        profile.provider = Some("openai".into());
+        profile.account = Some("work".into());
+        let kc = MockKeychain::default();
+        let load = |cfg: &Config| load_providers(cfg, "faux", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None).err().unwrap();
+        // 命名账号 key 未找到
+        let e = load(&cfg);
+        assert!(e.downcast_ref::<KeyConfigError>().is_some_and(|k| k.0.starts_with("OpenAI API key not found for account 'work'")), "{e}");
+        // 必需账号在解析出的 provider 下未声明
+        let mut other = cfg.clone();
+        other.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        let e = load(&other);
+        assert_eq!(e.downcast_ref::<KeyConfigError>().map(ToString::to_string).as_deref(), Some("account 'work' is not configured for provider anthropic"));
+        // 来源读取失败（KeyLoadError::Source）保持无类型
+        cfg.profiles.get_mut("default").unwrap().account = Some("broken".into());
+        let e = load(&cfg);
+        assert!(e.downcast_ref::<KeyConfigError>().is_none(), "{e}");
+        assert_eq!(e.to_string(), "OpenAI API key env TEST_OPENAI_KEY_BROKEN is not set");
     }
 
     /// openai 多账号 hub：账号 default / work / proxy 已加载（RecordingProvider），backup 配置了但“加载失败”。

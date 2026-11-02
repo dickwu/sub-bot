@@ -154,7 +154,7 @@ sub-bot ask --socket /path/to/sub-bot.sock "hello"
 sub-bot ask --url http://127.0.0.1:7878 --token-file /path/to/token "hello"
 ```
 
-`ask` 不启动模型/provider，也不读取 OpenAI key。默认优先使用数据目录中的默认 socket（若存在），否则连接 `http://127.0.0.1:7878`；自定义 socket 路径或 TCP 端口需显式传 `--socket` / `--url`（二者互斥）。`--config` 中的 `dataDir` 和 `--data-dir` 同样影响默认 socket 查找。Token 可来自 `--token-file`，否则读取 `SUB_BOT_TOKEN`，不会打印。默认同步请求使用 SSE，助手文本增量到达即写入并 flush stdout，结束时换行（工具事件不打印）。同步 `--json` 逐事件即时输出 NDJSON，每行一个服务端原始 JSON 对象，包含文本、工具、错误和最终 `agent_settled` 事件，不是最终响应对象；多行 SSE data 合并为单行 JSON。`--async` 使用异步任务 API 并轮询到最终结果后打印最终文本，`--async --json` 仍打印完整最终 task 对象。HTTP/模型失败、abort 或流在 settled 前断开会向 stderr 报错并返回非零退出码，stdout 可能已包含部分输出。`--timeout <secs>`（默认 3600）限制从发出请求到取得最终结果的总等待时间，包括异步轮询和网络等待；超时返回明确错误和非零退出码，但不会自动取消服务端任务。
+`ask` 不启动模型/provider，也不读取 OpenAI key。默认优先使用数据目录中的默认 socket（若存在），否则连接 `http://127.0.0.1:7878`；自定义 socket 路径或 TCP 端口需显式传 `--socket` / `--url`（二者互斥）。`--config` 中的 `dataDir` 和 `--data-dir` 同样影响默认 socket 查找。Token 可来自 `--token-file`，否则读取 `SUB_BOT_TOKEN`，不会打印。默认同步请求使用 SSE，助手文本增量到达即写入并 flush stdout，结束时换行（工具事件不打印）。同步 `--json` 即时输出 NDJSON：第一行是从响应头 `x-session-id` 取得的 `{"type":"session","sessionId":"<id>"}`，可将该 ID 传给后续 `ask --session <id>` 继续会话（旧服务端未返回此头时省略该行）。之后每行一个服务端原始 JSON 对象，包含文本、工具、错误，最后一行仍是服务端最终 `agent_settled` 事件，不是最终响应对象；多行 SSE data 合并为单行 JSON。Unix socket 与 TCP 行为一致，纯文本 stdout 不变。`--async` 使用异步任务 API 并轮询到最终结果后打印最终文本，`--async --json` 仍打印完整最终 task 对象。HTTP/模型失败、abort 或流在 settled 前断开会向 stderr 报错并返回非零退出码，stdout 可能已包含部分输出。`--timeout <secs>`（默认 3600）限制从发出请求到取得最终结果的总等待时间，包括异步轮询和网络等待；超时返回明确错误和非零退出码，但不会自动取消服务端任务。
 
 ## 问题上报 (issues)
 

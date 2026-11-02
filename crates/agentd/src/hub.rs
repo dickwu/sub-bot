@@ -164,9 +164,10 @@ impl SessionHandle {
             AgentEvent::MessageEnd { message: Message::Assistant(a) }
                 if a.stop_reason == agent_ai::StopReason::Error || (a.error_message.is_some() && a.stop_reason != agent_ai::StopReason::Aborted) =>
             {
-                let (kind, status) = classify_llm_error(a.error_message.as_deref().unwrap_or(""));
-                // Only fixed summaries escape this boundary, never provider bodies or echoed input.
-                self.report_issue(Severity::Error, kind, "llm", kind, serde_json::json!({"status": status, "stopReason": a.stop_reason}));
+                let error = a.error_message.as_deref().unwrap_or("");
+                let (kind, status) = classify_llm_error(error);
+                let summary = llm_error_summary(error, &self.issues);
+                self.report_issue(Severity::Error, kind, "llm", &summary, serde_json::json!({"status": status, "stopReason": a.stop_reason}));
             }
             AgentEvent::ToolExecutionEnd { tool_name, tool_call_id, result, is_error: true } => {
                 let text = result.content.iter().filter_map(|c| if let agent_ai::Content::Text { text } = c { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join(" ").to_lowercase();
@@ -244,7 +245,10 @@ pub enum TaskStatus {
 
 pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
     let text = message.to_lowercase();
-    let status = [401, 403, 429].into_iter().find(|code| text.contains(&code.to_string()));
+    let status = text.split("http ").skip(1).find_map(|suffix| {
+        let digits = suffix.as_bytes();
+        (digits.len() >= 3 && digits[..3].iter().all(u8::is_ascii_digit) && !digits.get(3).is_some_and(u8::is_ascii_digit)).then(|| suffix[..3].parse::<u16>().ok()).flatten()
+    });
     let kind = if matches!(status, Some(401 | 403)) || text.contains("invalid api key") || text.contains("authentication_error") || text.contains("permission_error") {
         "llm_auth"
     } else if status == Some(429) || text.contains("rate_limit_error") {
@@ -257,6 +261,21 @@ pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
         "llm_error"
     };
     (kind, status)
+}
+
+// Prefer the provider's message over its full JSON body (request IDs, metadata, etc.).
+fn llm_error_summary(message: &str, reporter: &Reporter) -> String {
+    let body = message.find('{').and_then(|start| serde_json::from_str::<serde_json::Value>(&message[start..]).ok());
+    let summary = body
+        .as_ref()
+        .and_then(|body| body.pointer("/error/message").or_else(|| body.get("message")))
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+        .unwrap_or(message)
+        .trim();
+    let summary = if summary.is_empty() { "LLM request failed" } else { summary };
+    // Redact before truncation: cutting a configured secret first could expose a prefix.
+    reporter.redact(summary).chars().take(300).collect()
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1220,13 +1239,64 @@ mod tests {
         server.abort();
     }
 
+    #[test]
+    fn llm_http_status_is_generic_and_not_taken_from_body_numbers() {
+        for (text, expected) in [
+            ("Anthropic HTTP 404 Not Found: model missing", ("llm_error", Some(404))),
+            ("OpenAI HTTP 500 Internal Server Error", ("llm_error", Some(500))),
+            ("Anthropic HTTP 529: overloaded", ("llm_error", Some(529))),
+            ("OpenAI HTTP 401 Unauthorized", ("llm_auth", Some(401))),
+            ("OpenAI HTTP 403 Forbidden", ("llm_auth", Some(403))),
+            ("OpenAI HTTP 429 Too Many Requests", ("llm_rate_limit", Some(429))),
+            ("OpenAI HTTP 400: input has 429 tokens", ("llm_error", Some(400))),
+            ("model-401-403-429 not found", ("llm_error", None)),
+            ("HTTP 4040", ("llm_error", None)),
+            ("HTTP 40", ("llm_error", None)),
+            ("HTTP 错误", ("llm_error", None)),
+        ] {
+            assert_eq!(classify_llm_error(text), expected, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_issue_summaries_are_informative_redacted_and_bounded() {
+        let mut hub = Hub::new(config(), "faux", None, None).unwrap();
+        Arc::get_mut(&mut hub).unwrap().issues = Reporter::new(&hub.config.alerts, None, vec!["configured-private-value".into()]);
+        let long_message = format!("{}configured-private-value {}", "界".repeat(290), "尾".repeat(50));
+        for (error, expected, status) in [
+            (
+                r#"Anthropic HTTP 404 Not Found: {"type":"error","error":{"type":"not_found_error","message":"model: claude-nonexistent-xyz"},"request_id":"unused"}"#,
+                "model: claude-nonexistent-xyz".to_owned(),
+                Some(404),
+            ),
+            (
+                r#"OpenAI HTTP 404 Not Found (responses API): {"error":{"message":"Unknown model; sk-private-key configured-private-value","type":"invalid_request_error"}}"#,
+                "Unknown model; [redacted] [redacted]".to_owned(),
+                Some(404),
+            ),
+            (r#"Anthropic stream error: {"type":"api_error","message":"provider unavailable"}"#, "provider unavailable".to_owned(), None),
+            ("OpenAI HTTP 502: upstream unavailable sk-private-key", "OpenAI HTTP 502: upstream unavailable [redacted]".to_owned(), Some(502)),
+            (long_message.as_str(), format!("{}[redacted]", "界".repeat(290)), None),
+            ("", "LLM request failed".to_owned(), None),
+        ] {
+            let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+            h.report_event(&AgentEvent::MessageEnd { message: Message::Assistant(agent_ai::AssistantMessage::failed("test-model", agent_ai::StopReason::Error, error)) });
+            hub.issues.flush(Duration::from_secs(2)).await;
+            let events = hub.issues.recent(Some("default"), 0, 1);
+            assert_eq!(events[0].kind, "llm_error");
+            assert_eq!(events[0].message, expected);
+            assert_eq!(events[0].details["status"], serde_json::json!(status));
+            assert!(events[0].message.chars().count() <= 300);
+        }
+    }
+
     #[tokio::test]
     async fn llm_classification_and_safe_tool_issues() {
         for (text, expected) in [
             ("HTTP 401 secret", "llm_auth"),
-            ("403", "llm_auth"),
+            ("HTTP 403", "llm_auth"),
             ("invalid API key", "llm_auth"),
-            ("429", "llm_rate_limit"),
+            ("HTTP 429", "llm_rate_limit"),
             ("context length exceeded", "llm_context_overflow"),
             ("stream idle timeout", "llm_stream_timeout"),
             ("Anthropic HTTP 401 Unauthorized: authentication failed", "llm_auth"),

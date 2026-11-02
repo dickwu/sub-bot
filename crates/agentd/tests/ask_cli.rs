@@ -64,17 +64,26 @@ async fn streaming_cli_preserves_output_and_client_only_initialization() {
             let body = body.clone();
             async move {
                 assert_eq!(request["stream"], true);
-                ([("content-type", "text/event-stream")], body)
+                ([("content-type", "text/event-stream"), ("x-session-id", "cli-session")], body)
             }
         }),
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
+    let socket = dir.0.join("ask.sock");
+    let unix_listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let unix_app = app.clone();
     let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move { axum::serve(unix_listener, unix_app).await.unwrap() });
     servers.spawn(async move { axum::serve(listener, app).await.unwrap() });
-    for json_output in [false, true] {
+    for (unix, json_output) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_sub-bot"));
-        command.env_remove("SUB_BOT_TOKEN").arg("--config").arg(&config).arg("--log-dir").arg(&logs).args(["--provider", "invalid-provider", "ask", "--url", &format!("http://{address}")]);
+        command.env_remove("SUB_BOT_TOKEN").arg("--config").arg(&config).arg("--log-dir").arg(&logs).args(["--provider", "invalid-provider", "ask"]);
+        if unix {
+            command.arg("--socket").arg(&socket);
+        } else {
+            command.args(["--url", &format!("http://{address}")]);
+        }
         if json_output {
             command.arg("--json");
         }
@@ -83,7 +92,9 @@ async fn streaming_cli_preserves_output_and_client_only_initialization() {
         let stdout = String::from_utf8(output.stdout).unwrap();
         if json_output {
             let actual: Vec<Value> = stdout.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-            assert_eq!(actual, events);
+            assert_eq!(actual[0], json!({"type":"session", "sessionId":"cli-session"}));
+            assert_eq!(&actual[1..], events.as_slice());
+            assert_eq!(actual.last(), events.last());
         } else {
             assert_eq!(stdout, "你好 world\n");
         }

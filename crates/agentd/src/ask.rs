@@ -21,7 +21,7 @@ pub struct Ask {
     /// Maximum seconds to wait for the request and final result (including async polling).
     #[arg(long, default_value_t = 3600)]
     pub timeout: u64,
-    /// Emit NDJSON events incrementally in sync mode; with --async, print the final task JSON.
+    /// Emit session metadata then NDJSON events in sync mode; with --async, print the final task JSON.
     #[arg(long)]
     pub json: bool,
     /// Message, or - to read stdin.
@@ -64,7 +64,12 @@ impl Client {
         Ok(Self { socket, url, token, http, provider: None })
     }
 
-    async fn response(&self, method: axum::http::Method, path: &str, body: Option<&Value>) -> anyhow::Result<(axum::http::StatusCode, axum::body::Body, tokio::task::JoinSet<()>)> {
+    async fn response(
+        &self,
+        method: axum::http::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> anyhow::Result<(axum::http::StatusCode, axum::http::HeaderMap, axum::body::Body, tokio::task::JoinSet<()>)> {
         #[cfg(unix)]
         if let Some(socket) = &self.socket {
             use http_body_util::Full;
@@ -80,8 +85,8 @@ impl Client {
             }
             let body = axum::body::Bytes::from(body.map(Value::to_string).unwrap_or_default());
             let response = sender.send_request(request.body(Full::new(body))?).await?;
-            let status = response.status();
-            return Ok((status, axum::body::Body::new(response.into_body()), connections));
+            let (parts, body) = response.into_parts();
+            return Ok((parts.status, parts.headers, axum::body::Body::new(body), connections));
         }
         let mut request = self.http.request(method, format!("{}{path}", self.url.trim_end_matches('/')));
         if let Some(token) = &self.token {
@@ -92,12 +97,13 @@ impl Client {
         }
         let response = request.send().await.map_err(|_| anyhow::anyhow!("HTTP request failed"))?;
         let status = response.status();
-        Ok((status, axum::body::Body::from_stream(response.bytes_stream()), tokio::task::JoinSet::new()))
+        let headers = response.headers().clone();
+        Ok((status, headers, axum::body::Body::from_stream(response.bytes_stream()), tokio::task::JoinSet::new()))
     }
 
     pub async fn request(&self, method: axum::http::Method, path: &str, body: Option<&Value>) -> anyhow::Result<(axum::http::StatusCode, Value)> {
         use http_body_util::BodyExt;
-        let (status, body, _connections) = self.response(method, path, body).await?;
+        let (status, _, body, _connections) = self.response(method, path, body).await?;
         let bytes = body.collect().await?.to_bytes();
         let value = serde_json::from_slice(&bytes).map_err(|_| if status.is_success() { anyhow::anyhow!("invalid server JSON") } else { http_error(status, None) })?;
         Ok((status, value))
@@ -107,10 +113,14 @@ impl Client {
         use http_body_util::BodyExt;
         let request = async {
             let body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session, "stream": true});
-            let (status, mut body, _connections) = self.response(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
+            let (status, headers, mut body, _connections) = self.response(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
             if !status.is_success() {
                 let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
                 return Err(http_error(status, serde_json::from_slice::<Value>(&bytes).ok().as_ref()));
+            }
+            if let Some(session_id) = headers.get("x-session-id").and_then(|value| value.to_str().ok()) {
+                let event = json!({"type": "session", "sessionId": session_id});
+                on_event(&event.to_string(), &event)?;
             }
             let mut parser = SseParser::default();
             let mut outcome = StreamOutcome::default();
@@ -385,7 +395,7 @@ mod tests {
                             rest.push_str("data: {\"type\":\"agent_settled\",\"aborted\":false}\n\n");
                             let _ = tx.send(Ok(Bytes::from(rest))).await;
                         });
-                        axum::http::Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))).unwrap()
+                        axum::http::Response::builder().header("content-type", "text/event-stream").header("x-session-id", "test-session").body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))).unwrap()
                     }
                 }));
                 let mut servers = tokio::task::JoinSet::new();
@@ -413,8 +423,9 @@ mod tests {
                     })
                     .await;
                 assert_eq!(text, "你好 world");
-                assert_eq!(events[0], format!("{}\n{}", &delta[..1], &delta[1..]));
-                assert!(events.last().unwrap().contains("agent_settled"));
+                assert_eq!(serde_json::from_str::<Value>(&events[0]).unwrap(), json!({"type":"session", "sessionId":"test-session"}));
+                assert_eq!(events[1], format!("{}\n{}", &delta[..1], &delta[1..]));
+                assert_eq!(serde_json::from_str::<Value>(events.last().unwrap()).unwrap(), json!({"type":"agent_settled", "aborted":false}));
                 if fail {
                     assert_eq!(result.unwrap_err().to_string(), "fake provider failed");
                 } else {

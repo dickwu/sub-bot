@@ -260,6 +260,10 @@ impl Reporter {
         self.secrets.lock().unwrap().push(secret);
     }
 
+    pub(crate) fn redact(&self, text: &str) -> String {
+        redact(text, &self.secrets.lock().unwrap())
+    }
+
     fn sanitize(&self, mut event: IssueEvent) -> IssueEvent {
         let secrets = self.secrets.lock().unwrap();
         event.message = redact(&event.message, &secrets).chars().take(500).collect();

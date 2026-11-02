@@ -132,6 +132,7 @@ impl Store {
     }
 
     pub fn open(dir: &Path, ttl: Duration) -> Result<Arc<Self>> {
+        crate::config::prepare_temp_data_dir(dir, true)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

@@ -13,6 +13,8 @@
 
 仅 `serve` 打开持久化 journal store：异步 task 状态和待投递 webhook 自动写入 `<dataDir>/state` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，不受 `--session-dir` 影响。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
 
+默认目录按顺序选择：`BaseDirs::data_local_dir()/sub-bot`；系统目录不可用时使用非空且为绝对路径的 `$XDG_DATA_HOME/sub-bot`；否则 Unix 使用 `std::env::temp_dir()/sub-bot-<euid>`（非 Unix 为 `temp_dir()/sub-bot`）。回退时会警告一次，建议设置 `--data-dir` 或配置 `dataDir`（默认日志目录也使用该回退链，日志可用 `--log-dir` 单独指定）。临时回退目录按需以 0700 创建；Unix 上已有目录必须属于当前有效 UID，且不能允许组/其他用户写入，也不能是符号链接，否则 store、socket 和日志访问会返回错误，不会自动修复权限。临时目录可能被系统清理，持久服务应显式配置稳定的数据目录。
+
 ```json
 {
   "dataDir": "/var/lib/sub-bot",

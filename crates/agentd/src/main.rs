@@ -201,6 +201,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if let Cmd::Ask(ref args) = cli.cmd {
+        // ask only needs stderr diagnostics; never create a log directory or store.
+        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
         // Read only dataDir: ask must not load provider/webhook secret files or initialize a Hub.
         let configured_dir = if cli.data_dir.is_none() {
             #[derive(serde::Deserialize)]

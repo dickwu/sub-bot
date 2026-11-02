@@ -11,6 +11,12 @@
 
 ---
 
+## v0.6.1 流式客户端与可靠性改进
+
+- `ask` 同步使用 SSE，实时输出文本 delta；`--json` 逐事件输出 NDJSON，异步轮询保持不变。
+- 默认数据目录不再 panic：依次使用 BaseDirs、绝对路径 XDG_DATA_HOME、temp/sub-bot-<euid>；临时目录检查所有权、权限和符号链接，显式与自动发现的 ask socket 同样受保护。
+- `/v1/issues` 在 worker 处理重复 issue 后立即更新同一条目的 count / lastTs / severity，不等待窗口结束；webhook 汇总不重复写入本地查询结果。
+
 ## v0.6.0 本地调用传输与信任边界
 
 - `server.rs` 管理 TCP + Unix socket 双 listener，共用 `http::app` 的 axum router 和 shutdown 生命周期。TCP 可通过 `--bind none` 关闭；UDS 通过 `serve --unix-socket [path]` 或配置 `unixSocket` 开启。`Config::data_dir()` 统一解析 `dataDir` / `--data-dir`，默认系统数据目录/sub-bot；默认 socket 为其中的 `sub-bot.sock`。

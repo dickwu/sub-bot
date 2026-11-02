@@ -7,7 +7,7 @@
 - OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.6.0。支持 Unix socket、本地身份认证和 `ask` 客户端，以及问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.6.1。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## 持久化、重启恢复与 issue 路由
 

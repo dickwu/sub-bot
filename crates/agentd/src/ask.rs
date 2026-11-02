@@ -37,6 +37,9 @@ pub struct Client {
 
 impl Client {
     pub fn new(socket: Option<PathBuf>, url: Option<String>, token: Option<&str>) -> anyhow::Result<Self> {
+        if let Some(path) = &socket {
+            crate::config::prepare_temp_data_dir(path, false)?;
+        }
         let token = token
             .map(|token| {
                 let mut header = axum::http::HeaderValue::from_str(&format!("Bearer {}", token.trim())).map_err(|_| anyhow::anyhow!("invalid token"))?;

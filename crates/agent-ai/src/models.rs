@@ -36,7 +36,8 @@ pub enum ReasoningSupport {
 const GPT5: &[ThinkingLevel] = &[Minimal, Low, Medium, High];
 const GPT51: &[ThinkingLevel] = &[Off, Low, Medium, High];
 const GPT52P: &[ThinkingLevel] = &[Off, Low, Medium, High, Xhigh];
-const O3: &[ThinkingLevel] = &[Low, Medium, High, Xhigh];
+/// gpt-5.2-codex / gpt-5.3-codex（文档）。
+const CODEX: &[ThinkingLevel] = &[Low, Medium, High, Xhigh];
 const O_SERIES: &[ThinkingLevel] = &[Low, Medium, High];
 const MEDIUM_ONLY: &[ThinkingLevel] = &[Medium];
 const WITH_MAX: &[ThinkingLevel] = &[Off, Low, Medium, High, Xhigh, Max];
@@ -183,7 +184,7 @@ pub fn is_deprecated(id: &str) -> bool {
     matches!(id, "o1" | "o3-mini" | "o4-mini") || id.ends_with("-chat-latest")
 }
 
-/// 按模型名推断 reasoning_effort 支持情况（2026-10 实测 OpenAI 的结果）。
+/// 按模型名推断 reasoning_effort 支持情况（2026-10 实测，2026-11-02 用 probe-efforts 对全部账号模型复测）。
 pub fn reasoning_support(model: &str) -> ReasoningSupport {
     let m = base(model);
     if m.starts_with("gpt-4") || m.starts_with("gpt-3.5") || m.starts_with("chatgpt-4o") {
@@ -192,9 +193,6 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
     if m == "chat-latest" {
         return ReasoningSupport::Levels(MEDIUM_ONLY);
     }
-    if m == "o3" {
-        return ReasoningSupport::Levels(O3);
-    }
     if m.len() > 1 && m.starts_with('o') && m.as_bytes()[1].is_ascii_digit() {
         return ReasoningSupport::Levels(O_SERIES);
     }
@@ -202,7 +200,7 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
         "gpt-5" | "gpt-5-mini" | "gpt-5-nano" => ReasoningSupport::Levels(GPT5),
         "gpt-5.1" => ReasoningSupport::Levels(GPT51),
         "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" | "gpt-5.5" => ReasoningSupport::Levels(GPT52P),
-        "gpt-5.2-codex" | "gpt-5.3-codex" => ReasoningSupport::Levels(O3),
+        "gpt-5.2-codex" | "gpt-5.3-codex" => ReasoningSupport::Levels(CODEX),
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-terra" => ReasoningSupport::Levels(WITH_MAX),
         "gpt-6-astra" | "gpt-6.1-sol" => ReasoningSupport::Levels(FULL),
         _ => ReasoningSupport::Unknown,
@@ -275,11 +273,12 @@ mod tests {
             ("gpt-5.1", GPT51, Some(Off)),
             ("gpt-5.2 gpt-5.4 gpt-5.4-mini gpt-5.4-nano", GPT52P, Some(Off)),
             ("gpt-5.5", GPT52P, Some(Medium)),
-            ("gpt-5.2-codex gpt-5.3-codex o3", O3, None),
+            ("gpt-5.2-codex gpt-5.3-codex", CODEX, None),
             ("gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-6-sol gpt-6-luna gpt-6.1-terra", WITH_MAX, Some(Medium)),
             ("gpt-6-astra", FULL, None),
             ("gpt-6.1-sol", FULL, Some(Medium)),
-            ("o1 o4-mini", O_SERIES, None),
+            // o3：2026-11-02 实测只接受 low/medium/high（xhigh/max 返回 400）。
+            ("o1 o3 o4-mini", O_SERIES, None),
             ("chat-latest", MEDIUM_ONLY, None),
         ] {
             for model in models.split_whitespace() {
@@ -390,7 +389,7 @@ mod tests {
         assert!(model_matches("gpt-5*", "gpt-5.4-mini") && model_matches("*-mini", "gpt-4.1-mini") && !model_matches("gpt-5*", "gpt-4.1"));
         assert_eq!(Off.nearest_in(GPT5), Some(Minimal));
         assert_eq!(Minimal.nearest_in(GPT51), Some(Low));
-        assert_eq!(Off.nearest_in(O3), Some(Low));
+        assert_eq!(Off.nearest_in(CODEX), Some(Low));
         assert_eq!(Xhigh.nearest_in(GPT5), Some(High));
     }
 }

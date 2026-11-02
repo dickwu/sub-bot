@@ -69,9 +69,18 @@ async fn unix_auth_and_ask_round_trip() {
             }
         }
         if mapped {
-            let response = anonymous.ask("hello local", Some("default"), None, false, 10).await.unwrap();
-            assert!(response["text"].as_str().unwrap().contains("hello local"));
-            let response = anonymous.ask("hello async", None, response["sessionId"].as_str(), true, 10).await.unwrap();
+            let mut text = String::new();
+            anonymous
+                .ask_stream("hello local", Some("default"), None, 10, |_, event| {
+                    if let Some(delta) = event["assistantMessageEvent"]["delta"].as_str() {
+                        text.push_str(delta);
+                    }
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            assert!(text.contains("hello local"));
+            let response = anonymous.ask_async("hello async", None, None, 10).await.unwrap();
             assert_eq!(response["status"], "succeeded");
             assert!(response["result"]["text"].as_str().unwrap().contains("hello async"));
         }

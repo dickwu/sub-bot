@@ -88,6 +88,10 @@ enum Cmd {
         token: Option<String>,
     },
     /// 向已运行的服务提问（默认优先使用本地 Unix socket）
+    ///
+    /// 默认同步流式输出助手文本并在结束时换行；--json 逐事件输出 NDJSON。
+    /// --async 轮询后输出最终文本，--async --json 输出最终 task JSON。
+    /// HTTP/模型错误、取消或超时会向 stderr 报错并返回非零退出码。
     Ask(ask::Ask),
     /// stdio JSONL RPC 模式（父进程即调用方，无需 token）
     Rpc {

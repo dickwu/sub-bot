@@ -38,7 +38,7 @@ enum Command {
 }
 
 fn state(hub: &Hub, session: &SessionHandle) -> Value {
-    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile});
+    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "account": session.account, "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile});
     data.as_object_mut().unwrap().extend(session.effort_fields());
     data
 }
@@ -59,7 +59,17 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
 
 async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect(), ..Default::default() };
-    let session = hub.create_session(&client, req)?;
+    let mut output = output;
+    let session = match hub.create_session(&client, req) {
+        Ok(session) => session,
+        Err(e) => {
+            // 会话创建失败（如 AccountNotAllowed）：先给 JSONL 调用方一条 success:false，再以错误退出
+            let line = json!({"type": "response", "command": "start", "success": false, "error": e.to_string()});
+            let _ = output.write_all(format!("{line}\n").as_bytes()).await;
+            let _ = output.flush().await;
+            return Err(e);
+        }
+    };
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
 
     // 单一 writer，保证每条记录整行写出
@@ -219,6 +229,30 @@ mod tests {
         assert_eq!(response["success"], false);
         assert!(response["error"].as_str().unwrap().contains("before the first prompt"));
         drop(call);
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(3), server).await.unwrap().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_in_state_and_disallowed_account_is_success_false() {
+        let mut cfg = crate::config::Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let (_input, input_rx) = tokio::io::duplex(1024);
+        let (output_tx, output) = tokio::io::duplex(64 * 1024);
+        let req = SessionRequest { account: Some("work".into()), ..Default::default() };
+        let err = run_io(hub.clone(), req, input_rx, output_tx).await.unwrap_err();
+        assert!(err.is::<crate::hub::AccountNotAllowed>());
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let line: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(line, json!({"type": "response", "command": "start", "success": false, "error": "account 'work' is not allowed in profile 'default' (allowedAccounts)"}));
+        let (mut input, input_rx) = tokio::io::duplex(1024);
+        let (output_tx, output) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(run_io(hub, SessionRequest::default(), input_rx, output_tx));
+        input.write_all(b"{\"id\":\"1\",\"type\":\"get_state\"}\n").await.unwrap();
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let state: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(state["data"]["account"], "default");
         drop(input);
         tokio::time::timeout(std::time::Duration::from_secs(3), server).await.unwrap().unwrap().unwrap();
     }

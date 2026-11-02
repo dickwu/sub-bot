@@ -3,7 +3,6 @@ use agent_ai::{Api, AssistantEvent, Message, ProbeThinking, Provider, Request, S
 use clap::{Args, ValueEnum};
 use futures::StreamExt;
 use serde::Serialize;
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Args)]
@@ -15,6 +14,8 @@ pub struct Probe {
     pub thinking: Option<Thinking>,
     #[arg(long)]
     pub json: bool,
+    #[command(flatten)]
+    pub account: crate::AccountArg,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -146,17 +147,18 @@ pub async fn run(cli: &crate::Cli, cfg: &crate::config::Config, args: &Probe) ->
     anyhow::ensure!(matches!(id, "openai" | "anthropic"), "probe-efforts --provider must be openai or anthropic");
     anyhow::ensure!(cli.api != Some(Api::Auto), "probe-efforts --api must be chat or responses");
     let api = cli.api.unwrap_or_else(|| agent_ai::default_api(model));
-    let settings = cfg.providers.get(id);
-    let cli_file = if id == "anthropic" { cli.anthropic_key_file.as_deref() } else { cli.openai_key_file.as_deref() };
-    let config_file = settings.and_then(|p| p.api_key_file.as_deref()).or_else(|| if id == "openai" { cfg.api_key_file.as_deref() } else { None });
-    let (key, _) = agent_ai::secrets::load_provider_key(agent_ai::secrets::provider_key(id).expect("known provider"), cli_file, config_file, |k| std::env::var(k).ok())
-        .map_err(|_| anyhow::anyhow!("cannot load {id} API key (check key-file/configuration)"))?;
-    let base = std::env::var(format!("{}_BASE_URL", id.to_ascii_uppercase())).ok().filter(|s| !s.trim().is_empty()).or_else(|| settings.and_then(|p| p.base_url.clone()));
-    let timeout = Duration::from_secs(cfg.stream_idle_timeout_secs);
-    let provider: Box<dyn Provider> = match id {
-        "anthropic" => Box::new(agent_ai::anthropic::AnthropicProvider::with_stream_idle_timeout(key, base, timeout)),
-        _ => Box::new(agent_ai::openai::OpenAiProvider::with_stream_idle_timeout(key, base, timeout)),
-    };
+    let pk = agent_ai::secrets::provider_key(id).expect("known provider");
+    let account_name = args.account.account.clone().unwrap_or_else(|| cfg.default_account_of(id).to_string());
+    let account = cfg.account_config(id, &account_name).ok_or_else(|| anyhow::anyhow!("account '{account_name}' is not configured for provider {id}"))?;
+    let files = crate::hub::KeyFiles { openai: cli.openai_key_file.as_deref(), anthropic: cli.anthropic_key_file.as_deref() };
+    let spec = crate::hub::account_key_spec(pk, &account_name, &account, files, &agent_ai::secrets::ManagedStore::system());
+    let (key, _) = agent_ai::secrets::load_account_key(&spec, |k| std::env::var(k).ok(), &agent_ai::keychain::SystemKeychain).map_err(|e| match e {
+        // Keychain 错误文案只含 service/account，可直接展示（锁定/拒绝时用户需要知道怎么处理）
+        agent_ai::secrets::KeyLoadError::Keychain(k) => anyhow::anyhow!("cannot load {id} API key for account '{account_name}': {k}"),
+        _ => anyhow::anyhow!("cannot load {id} API key for account '{account_name}' (check key-file/configuration)"),
+    })?;
+    tracing::info!(provider = id, account = %account_name, "probe-efforts using account");
+    let provider = crate::hub::build_provider(cfg, id, &account_name, &account, key, |k| std::env::var(k).ok());
     let mut results = vec![];
     for level in &args.levels {
         let result = probe_level(provider.as_ref(), model, api, *level, args.thinking).await;

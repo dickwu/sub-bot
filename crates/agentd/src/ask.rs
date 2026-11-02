@@ -31,6 +31,9 @@ pub struct Ask {
     /// Model routing for a new session (or one without prompts yet): standard | deep | auto.
     #[arg(long)]
     pub depth: Option<crate::routing::Depth>,
+    /// Account for a new session (session.account); must be allowed by the profile's allowedAccounts (HTTP 403 otherwise).
+    #[command(flatten)]
+    pub account: crate::AccountArg,
     /// Message, or - to read stdin.
     pub message: String,
 }
@@ -44,6 +47,8 @@ pub struct Client {
     /// 粘性推理强度（/v1/chat 顶层 reasoningEffort）
     effort: Option<agent_ai::ThinkingLevel>,
     depth: Option<crate::routing::Depth>,
+    /// 新会话的账号（session.account）
+    account: Option<String>,
 }
 
 impl Client {
@@ -71,7 +76,7 @@ impl Client {
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None })
+        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None, account: None })
     }
 
     async fn response(
@@ -121,6 +126,9 @@ impl Client {
 
     fn chat_body(&self, message: &str, profile: Option<&str>, session: Option<&str>, extra: Value) -> Value {
         let mut body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session});
+        if let Some(account) = &self.account {
+            body["session"]["account"] = json!(account);
+        }
         if let Some(effort) = self.effort {
             body["reasoningEffort"] = json!(effort);
         }
@@ -321,6 +329,7 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
     client.provider = provider.map(str::to_owned);
     client.effort = effort;
     client.depth = if args.deep { Some(crate::routing::Depth::Deep) } else { args.depth };
+    client.account = args.account.account.clone();
     if !args.asynchronous {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
@@ -402,9 +411,12 @@ mod tests {
         let mut client = Client::new(None, Some("http://127.0.0.1:1".into()), None).unwrap();
         let body = client.chat_body("hi", None, Some("s"), json!({"stream": true}));
         assert!(body.get("reasoningEffort").is_none() && body.get("depth").is_none());
+        assert!(body["session"].get("account").is_none());
         client.effort = Some(agent_ai::ThinkingLevel::Max);
         client.depth = Some(crate::routing::Depth::Deep);
+        client.account = Some("work".into());
         let body = client.chat_body("hi", Some("p"), None, json!({"async": true}));
+        assert_eq!(body["session"]["account"], "work");
         assert_eq!((body["reasoningEffort"].clone(), body["depth"].clone(), body["async"].clone(), body["session"]["profile"].clone()), (json!("max"), json!("deep"), json!(true), json!("p")));
     }
 

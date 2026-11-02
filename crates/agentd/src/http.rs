@@ -1,6 +1,6 @@
 use crate::{
     config::{Client, Config, ResolvedTarget, TargetSpec, MAX_TARGETS},
-    hub::{DepthLocked, Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
+    hub::{AccountNotAllowed, DepthLocked, Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
     issues::Severity,
     routing::Depth,
     webhook::WebhookTarget,
@@ -159,6 +159,8 @@ fn apply_overrides(h: &SessionHandle, effort: Option<ThinkingLevel>, depth: Opti
 fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
     if e.is::<TooManySessions>() {
         (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))
+    } else if e.is::<AccountNotAllowed>() {
+        (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
     } else {
         bad_request(e)
     }
@@ -199,7 +201,9 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
             st.hub.config.profiles.get(n).map(|p| {
                 let provider = st.hub.profile_provider(p);
                 let model = st.hub.profile_model(p);
-                json!({"name": n, "provider": provider, "model": model, "allowedModels": p.allowed_models,
+                let account = st.hub.profile_account(p, provider);
+                json!({"name": n, "provider": provider, "account": account, "allowedAccounts": st.hub.allowed_accounts(p),
+                    "fallbackAccounts": st.hub.fallback_accounts(p, provider, account), "model": model, "allowedModels": p.allowed_models,
                     "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort),
                     "allowedEfforts": agent_ai::allowed_efforts(&agent_ai::effort_caps(provider, &model)),
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
@@ -215,6 +219,8 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
 #[derive(Deserialize, Default)]
 struct ModelsQuery {
     provider: Option<String>,
+    /// 只查该账号的目录（需要 provider；必须是该 client 某个 profile 允许的账号）
+    account: Option<String>,
     /// 只返回该 profile 允许的模型
     profile: Option<String>,
     /// 不过滤（包含 embedding、语音、快照等）
@@ -224,10 +230,23 @@ struct ModelsQuery {
 
 /// 实时模型列表（来自 provider 的 /v1/models，缓存 10 分钟），附带推断的推理强度。
 async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Query<ModelsQuery>) -> ApiResult {
-    if let Some(id) = &q.provider {
-        st.hub.provider(id).map_err(|e| bad_request(e.to_string()))?;
+    match (&q.provider, &q.account) {
+        (None, Some(_)) => return Err(bad_request("account filter requires provider")),
+        (Some(id), Some(account)) => {
+            crate::config::validate_provider(id).map_err(bad_request)?;
+            // 只允许查询本 client 某个 profile 可选的账号；不区分“不存在”与“不允许”
+            let allowed = c.profiles.iter().filter_map(|n| st.hub.config.profiles.get(n)).any(|p| st.hub.account_allowed(p, id, account));
+            if !allowed {
+                return Err((StatusCode::FORBIDDEN, Json(json!({"error": format!("account '{account}' is not allowed for this client")}))));
+            }
+            st.hub.provider(id, account).map_err(bad_request)?;
+        }
+        (Some(id), None) => {
+            st.hub.provider(id, st.hub.default_account(id)).map_err(bad_request)?;
+        }
+        (None, None) => {}
     }
-    let mut list = st.hub.list_models_filtered(q.all, q.provider.as_deref()).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
+    let mut list = st.hub.list_models_filtered(q.all, q.provider.as_deref(), q.account.as_deref()).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
     if let Some(name) = &q.profile {
         if !c.profiles.contains(name) {
             return Err(bad_request(format!("profile '{name}' is not allowed for this client")));
@@ -383,6 +402,9 @@ struct ChatBody {
     /// standard | deep | auto：新会话或尚未收到 prompt 的已有会话
     #[serde(default)]
     depth: Option<Depth>,
+    /// 新会话的账号（同 session.account，顶层优先）；已有 sessionId 时忽略（账号是会话属性）
+    #[serde(default)]
+    account: Option<String>,
 }
 
 /// A host entry allows any port; host:port restricts it. The configured URL implicitly
@@ -459,6 +481,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
         None => {
             b.session.reasoning_effort = b.reasoning_effort.or(b.session.reasoning_effort);
             b.session.depth = b.depth.or(b.session.depth);
+            b.session.account = b.account.or(b.session.account);
             st.hub.create_chat_session(&c, b.session).map_err(create_error)?
         }
     };
@@ -597,7 +620,8 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
         if partial_text.is_empty() {
             partial_text = new_messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a.text()) } else { None }).collect::<Vec<_>>().join("");
         }
-        let mut body = json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "model": h.model(), "messages": new_messages});
+        let account = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { a.account.clone() } else { None }).unwrap_or_else(|| h.account.clone());
+        let mut body = json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "model": h.model(), "account": account, "messages": new_messages});
         body.as_object_mut().unwrap().extend(h.effort_fields());
         return ChatOutcome { status: TaskStatus::Timeout, body };
     }
@@ -609,9 +633,12 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
     } else {
         TaskStatus::Succeeded
     };
+    // 实际使用的账号（failover 后可能不同于会话账号）
+    let account = last.as_ref().and_then(|a| a.account.clone()).unwrap_or_else(|| h.account.clone());
     let mut body = json!({
         "sessionId": h.id,
         "model": h.model(),
+        "account": account,
         "text": last.as_ref().map(|a| a.text()).unwrap_or_default(),
         "stopReason": last.as_ref().map(|a| a.stop_reason),
         "error": last.as_ref().and_then(|a| a.error_message.clone()),
@@ -677,9 +704,9 @@ mod tests {
     #[tokio::test]
     async fn unloaded_provider_is_400_and_catalog_and_profiles_include_provider() {
         let mut hub = Hub::new(config(), "faux", None, None).unwrap();
-        Arc::get_mut(&mut hub).unwrap().providers.remove("anthropic");
+        Arc::get_mut(&mut hub).unwrap().providers.remove(&crate::accounts::AccountKey::from("anthropic"));
         let app = test_router(hub);
-        let expected = "provider anthropic is not configured (set --anthropic-key-file / ANTHROPIC_API_KEY_FILE / providers.anthropic.apiKeyFile / ANTHROPIC_API_KEY)";
+        let expected = "provider anthropic is not configured (set --anthropic-key-file / ANTHROPIC_API_KEY_FILE / providers.anthropic.apiKeyFile / apiKeyKeychain / ANTHROPIC_API_KEY, or run `sub-bot keys set --provider anthropic`)";
         for (path, body) in [("/v1/sessions", json!({"provider": "anthropic"})), ("/v1/chat", json!({"message": "hello", "session": {"model": "claude-sonnet-4-5"}}))] {
             let (status, response) = request(&app, "POST", path, Some("test-token"), body).await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1309,6 +1336,7 @@ mod tests {
                         webhook_events: WebhookEvents::default(),
                         reasoning_effort: None,
                         depth: None,
+                        account: None,
                     }),
                 ),
             )
@@ -1326,6 +1354,83 @@ mod tests {
             assert!(!h.agent.is_running());
             assert_eq!(hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(601)), 1);
             assert!(hub.get(&client, &h.id).is_none());
+        }
+    }
+
+    /// default profile：openai，只允许 default；multi profile：allowedAccounts [default, work]。
+    fn multi_account_app() -> (Router, Arc<Hub>) {
+        let (mut hub, _) = crate::hub::tests::multi_hub(|p| p.load_context_files = false);
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        let mut multi = inner.config.profiles["default"].clone();
+        multi.allowed_accounts = Some(vec!["default".into(), "work".into()]);
+        multi.fallback_accounts = Some(vec!["work".into()]);
+        inner.config.profiles.insert("multi".into(), multi);
+        inner.config.clients[0].profiles.push("multi".into());
+        (test_router(hub.clone()), hub)
+    }
+
+    #[tokio::test]
+    async fn account_override_is_403_when_not_allowed_and_reported_when_allowed() {
+        let (app, hub) = multi_account_app();
+        let denied = |name: &str, profile: &str| json!({"error": format!("account '{name}' is not allowed in profile '{profile}' (allowedAccounts)")});
+        for (path, body, name, profile) in [
+            ("/v1/sessions", json!({"account": "work"}), "work", "default"),
+            ("/v1/sessions", json!({"account": "ghost"}), "ghost", "default"),
+            ("/v1/sessions", json!({"profile": "multi", "account": "proxy"}), "proxy", "multi"),
+            ("/v1/chat", json!({"message": "hi", "account": "work"}), "work", "default"),
+            ("/v1/chat", json!({"message": "hi", "session": {"account": "work"}}), "work", "default"),
+            ("/v1/chat", json!({"message": "hi", "async": true, "session": {"profile": "multi", "account": "ghost"}}), "ghost", "multi"),
+        ] {
+            let (status, response) = request(&app, "POST", path, Some("test-token"), body.clone()).await;
+            assert_eq!((status, response), (StatusCode::FORBIDDEN, denied(name, profile)), "{path} {body}");
+        }
+        let (status, view) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"profile": "multi", "account": "work"})).await;
+        assert_eq!((status, view["account"].clone()), (StatusCode::CREATED, json!("work")));
+        let (status, view) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({})).await;
+        assert_eq!((status, view["account"].clone(), view["provider"].clone()), (StatusCode::CREATED, json!("default"), json!("openai")));
+        // /v1/chat：顶层 account 优先于 session.account；响应带实际账号；消息也带账号
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", "account": "work", "session": {"profile": "multi", "account": "default"}})).await;
+        assert_eq!((status, body["account"].clone()), (StatusCode::OK, json!("work")));
+        assert!(body["messages"].as_array().unwrap().iter().any(|m| m["role"] == "assistant" && m["account"] == "work"));
+        // 已有 sessionId：account 被忽略（账号是会话属性）
+        let (status, again) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "again", "sessionId": body["sessionId"], "account": "ghost"})).await;
+        assert_eq!((status, again["account"].clone()), (StatusCode::OK, json!("work")));
+        // 异步任务结果带账号
+        let started = start_async(&app, json!({"message": "hi", "async": true, "account": "work", "session": {"profile": "multi"}})).await;
+        let task = wait_task(&app, &started, false).await;
+        assert_eq!((task["status"].clone(), task["result"]["account"].clone()), (json!("succeeded"), json!("work")));
+        // 允许但加载失败的账号：400，不泄露启动错误细节
+        drop(hub);
+        let (mut hub, _) = crate::hub::tests::multi_hub(|p| p.allowed_accounts = Some(vec!["default".into(), "backup".into()]));
+        Arc::get_mut(&mut hub).unwrap().config.profiles.get_mut("default").unwrap().load_context_files = false;
+        let app = test_router(hub);
+        let (status, response) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"account": "backup"})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], "account 'backup' of provider openai is unavailable (it failed to load at startup; see server logs)");
+        assert!(!response.to_string().contains("private"));
+    }
+
+    #[tokio::test]
+    async fn profiles_and_models_report_accounts() {
+        let (app, _hub) = multi_account_app();
+        let (status, body) = request(&app, "GET", "/v1/profiles", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        let find = |name: &str| body["profiles"].as_array().unwrap().iter().find(|p| p["name"] == name).unwrap().clone();
+        let default = find("default");
+        assert_eq!((default["account"].clone(), default["allowedAccounts"].clone(), default["fallbackAccounts"].clone()), (json!("default"), json!(["default"]), json!([])));
+        let multi = find("multi");
+        assert_eq!((multi["account"].clone(), multi["allowedAccounts"].clone(), multi["fallbackAccounts"].clone()), (json!("default"), json!(["default", "work"]), json!(["work"])));
+        let (status, body) = request(&app, "GET", "/v1/models?account=work", Some("test-token"), json!({})).await;
+        assert_eq!((status, body), (StatusCode::BAD_REQUEST, json!({"error": "account filter requires provider"})));
+        let (status, body) = request(&app, "GET", "/v1/models?provider=openai&account=work&all=true", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((body["models"][0]["id"].clone(), body["models"][0]["account"].clone(), body["models"][0]["provider"].clone()), (json!("gpt-deep-2"), json!("work"), json!("openai")));
+        let (_, body) = request(&app, "GET", "/v1/models?provider=openai&all=true", Some("test-token"), json!({})).await;
+        assert_eq!((body["models"][0]["id"].clone(), body["models"][0]["account"].clone()), (json!("gpt-deep-1"), json!("default")));
+        // 已加载但没有任何 profile 允许 / 不存在：同样 403
+        for name in ["proxy", "ghost"] {
+            let (status, body) = request(&app, "GET", &format!("/v1/models?provider=openai&account={name}"), Some("test-token"), json!({})).await;
+            assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({"error": format!("account '{name}' is not allowed for this client")})));
         }
     }
 }

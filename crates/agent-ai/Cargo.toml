@@ -18,6 +18,15 @@ chrono.workspace = true
 tracing.workspace = true
 rand.workspace = true
 httpdate = "1"
+thiserror.workspace = true
+directories.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# Keychain 只在 macOS 构建中链接（Security.framework）；Linux/musl 目标不会编译它。
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
 
 [dev-dependencies]
 axum.workspace = true

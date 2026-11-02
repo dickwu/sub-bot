@@ -5,16 +5,18 @@
 //! - `models`：实时列出 provider 支持的模型
 //! - `hash-token`：生成配置文件里用的 token 哈希
 //!
-//! OpenAI key 只从环境变量读入进程内存，任何接口都不会回传。
+//! provider API key 从文件、macOS Keychain 或环境变量读入进程内存，任何接口都不会回传。
 
 #[cfg(not(unix))]
 compile_error!("sub-bot only supports macOS and Linux");
 
+mod accounts;
 mod ask;
 mod config;
 mod http;
 mod hub;
 pub mod issues;
+mod keys;
 mod local;
 #[cfg(test)]
 mod local_tests;
@@ -70,10 +72,10 @@ struct Cli {
     /// 会话 JSONL 存放目录（按 client 分子目录）；不填则不持久化
     #[arg(long, global = true, env = "SUB_BOT_SESSION_DIR")]
     session_dir: Option<PathBuf>,
-    /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile > OPENAI_API_KEY
+    /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile / providers.openai.apiKeyKeychain（macOS Keychain）> OPENAI_API_KEY > 受管存储（`sub-bot keys set` 写入：macOS Keychain sub-bot/openai/default，Linux ~/.config/sub-bot/keys/openai-default.key）
     #[arg(long, global = true)]
     openai_key_file: Option<PathBuf>,
-    /// Anthropic key: CLI > ANTHROPIC_API_KEY_FILE > providers.anthropic.apiKeyFile > ANTHROPIC_API_KEY
+    /// 从文件读取 Anthropic API key。优先级：本参数 > ANTHROPIC_API_KEY_FILE > 配置 providers.anthropic.apiKeyFile / apiKeyKeychain（macOS Keychain）> ANTHROPIC_API_KEY > 受管存储（`sub-bot keys set` 写入：macOS Keychain sub-bot/anthropic/default，Linux ~/.config/sub-bot/keys/anthropic-default.key）
     #[arg(long, global = true)]
     anthropic_key_file: Option<PathBuf>,
 }
@@ -105,6 +107,8 @@ enum Cmd {
         /// 模型路由：standard | deep | auto（显式 --model 时忽略）
         #[arg(long)]
         depth: Option<routing::Depth>,
+        #[command(flatten)]
+        account: AccountArg,
     },
     /// 一次性执行一个 prompt，打印最终回复后退出
     Run {
@@ -116,6 +120,8 @@ enum Cmd {
         /// 输出 JSON（text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、effortAdjusted、allowedEfforts、routing、usage（最后一次调用）、totalUsage（整次运行，含路由分类调用）、turns、toolCalls、stopReason、error）
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        account: AccountArg,
         prompt: String,
     },
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
@@ -128,6 +134,9 @@ enum Cmd {
         profile: Option<String>,
         #[arg(long)]
         json: bool,
+        /// 只查该账号的模型目录（需要 --provider）；默认每个 provider 查默认账号
+        #[arg(long, env = "SUB_BOT_ACCOUNT")]
+        account: Option<String>,
     },
     /// 实测各 effort 是否被 API 接受（绕过目录/降级；需要 --model）
     ProbeEfforts(probe::Probe),
@@ -138,6 +147,20 @@ enum Cmd {
     },
     /// 打印 token 的 SHA-256，用于填写配置文件 clients[].tokenSha256
     HashToken { token: String },
+    /// 管理 provider API key（macOS: Keychain；Linux: 0600 key 文件），绝不输出 key
+    Keys {
+        #[command(subcommand)]
+        command: keys::KeysCmd,
+    },
+}
+
+/// 会话账号（run / rpc / ask / probe-efforts 各自的参数；不做成全局参数，避免与 `keys --account` 冲突，
+/// 也避免 SUB_BOT_ACCOUNT 影响 `keys set/delete` 的目标账号）。
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct AccountArg {
+    /// 会话使用的账号（provider 下的命名账号）；受 profile 的 allowedAccounts 限制，越权直接报错
+    #[arg(long, env = "SUB_BOT_ACCOUNT")]
+    pub account: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -169,11 +192,17 @@ fn install_reporter(cfg: &config::Config, cli: &Cli) {
 
 fn startup_failure(error: Option<&anyhow::Error>) -> (String, issues::IssueEvent) {
     let mut event = issues::IssueEvent::new(issues::Severity::Fatal, "startup_failed", "config", "configuration or service initialization failed");
-    // Only this typed error is safe to expose; surrounding context may contain credentials.
+    // Only these typed errors are safe to expose; surrounding context may contain credentials.
     if let Some(locked) = error.and_then(|e| e.downcast_ref::<store::DataDirLocked>()) {
         let message = locked.to_string();
         event.message = message.clone();
         event = event.details(serde_json::json!({"reason": "data_dir_locked", "dataDir": locked.path.to_string_lossy()}));
+        (message, event)
+    } else if let Some(keychain) = error.and_then(|e| e.downcast_ref::<agent_ai::keychain::KeychainError>()) {
+        // Display 只含 service/account 名，不含 key
+        let message = keychain.to_string();
+        event.message = message.clone();
+        event = event.details(serde_json::json!({"reason": "keychain"}));
         (message, event)
     } else {
         ("service initialization failed (check provider and key configuration)".into(), event)
@@ -216,6 +245,11 @@ async fn main() -> anyhow::Result<()> {
     if let Cmd::HashToken { ref token } = cli.cmd {
         println!("{}", config::sha256_hex(token));
         return Ok(());
+    }
+    if let Cmd::Keys { ref command } = cli.cmd {
+        // keys 不构造 Hub、不建日志目录；诊断只写 stderr，结果写 stdout
+        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
+        return keys::run(&cli, command);
     }
     if let Cmd::Ask(ref args) = cli.cmd {
         // ask only needs stderr diagnostics; never create a log directory or store.
@@ -322,13 +356,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req = |profile: Option<String>, depth: Option<routing::Depth>| hub::SessionRequest {
+    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg| hub::SessionRequest {
         provider: cli.provider.clone(),
         profile,
         model: cli.model.clone(),
         reasoning_effort: cli.reasoning_effort,
         depth,
         api: cli.api,
+        account: account.account.clone(),
         ..Default::default()
     };
     match cli.cmd {
@@ -353,7 +388,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -362,13 +397,13 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile, depth } => {
+        Cmd::Rpc { ref profile, depth, ref account } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            rpc::run(hub, session_req(profile.clone(), depth)).await?;
+            rpc::run(hub, session_req(profile.clone(), depth, account)).await?;
         }
-        Cmd::Run { ref profile, depth, json, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref account, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone(), depth))?;
+            let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone(), depth, account))?;
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
             let mut last = None;
@@ -402,7 +437,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(u) = &session.routing().usage {
                     add_usage(&mut total, u);
                 }
-                let mut out = serde_json::json!({"sessionId": session.id, "model": session.model(), "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
+                // account：最后一次调用实际使用的账号（failover 后可能不同于会话账号）
+                let account = last.account.clone().unwrap_or_else(|| session.account.clone());
+                let mut out = serde_json::json!({"sessionId": session.id, "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
                 out.as_object_mut().unwrap().extend(session.effort_fields());
                 out["reasoningEffort"] = serde_json::json!(effort);
                 println!("{out}");
@@ -413,9 +450,10 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!(e);
             }
         }
-        Cmd::Models { all, ref profile, json } => {
+        Cmd::Models { all, ref profile, json, ref account } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let mut list = hub.list_models_filtered(all, cli.provider.as_deref()).await?;
+            anyhow::ensure!(account.is_none() || cli.provider.is_some(), "--account requires --provider");
+            let mut list = hub.list_models_filtered(all, cli.provider.as_deref(), account.as_deref()).await?;
             if let Some(name) = profile {
                 let p = hub.config.profiles.get(name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
                 list.retain(|m| config::Config::model_allowed(p, &m.model.id));
@@ -444,7 +482,7 @@ async fn main() -> anyhow::Result<()> {
                     } else {
                         "  "
                     };
-                    println!("{mark}{:<12} {:<32} {} default={}", m.provider, m.model.id, efforts, m.model.default_effort.map(|l| l.as_str()).unwrap_or("?"));
+                    println!("{mark}{:<20} {:<32} {} default={}", format!("{}/{}", m.provider, m.account), m.model.id, efforts, m.model.default_effort.map(|l| l.as_str()).unwrap_or("?"));
                 }
                 let marker = if restricted { ", * = allowed by profiles" } else { "" };
                 eprintln!("{} models (reasoning efforts: [...] = allowed top-three, '-' = unsupported, '?' = unknown, passed through{marker})", list.len());
@@ -560,6 +598,25 @@ mod tests {
     }
 
     #[test]
+    fn account_flags_per_command_without_keys_conflict() {
+        let Cmd::Run { account, .. } = Cli::try_parse_from(["sub-bot", "run", "--account", "work", "hi"]).unwrap().cmd else { panic!("run") };
+        assert_eq!(account.account.as_deref(), Some("work"));
+        let Cmd::Rpc { account, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--account", "proxy"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!(account.account.as_deref(), Some("proxy"));
+        let Cmd::Ask(ask) = Cli::try_parse_from(["sub-bot", "ask", "--account", "work", "hi"]).unwrap().cmd else { panic!("ask") };
+        assert_eq!(ask.account.account.as_deref(), Some("work"));
+        let Cmd::Models { account, .. } = Cli::try_parse_from(["sub-bot", "--provider", "openai", "models", "--account", "work"]).unwrap().cmd else { panic!("models") };
+        assert_eq!(account.as_deref(), Some("work"));
+        let Cmd::ProbeEfforts(probe) = Cli::try_parse_from(["sub-bot", "probe-efforts", "--model", "m", "--account", "work"]).unwrap().cmd else { panic!("probe") };
+        assert_eq!(probe.account.account.as_deref(), Some("work"));
+        // keys 保留自己的 --account（无环境变量），与会话账号互不影响
+        let Cmd::Keys { command: keys::KeysCmd::Set { account, .. } } = Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "openai", "--account", "ci"]).unwrap().cmd else { panic!("keys") };
+        assert_eq!(account, "ci");
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
     fn models_mark_allowed_top_three() {
         assert_eq!(format_efforts(&agent_ai::models::info_for("gpt-6-astra".into(), None, None)), "low,medium,[high,xhigh,max]");
         let model = agent_ai::models::info_for("claude-sonnet-4-6".into(), None, None);
@@ -569,7 +626,7 @@ mod tests {
 
     #[test]
     fn models_allowed_by_profiles_marks_union_per_provider() {
-        let model = |provider: &str, id: &str| hub::ProviderModel { provider: provider.into(), model: agent_ai::models::info_for(id.into(), None, None) };
+        let model = |provider: &str, id: &str| hub::ProviderModel { provider: provider.into(), account: "default".into(), model: agent_ai::models::info_for(id.into(), None, None) };
         let list = vec![model("openai", "gpt-6.1-sol"), model("openai", "gpt-6-astra"), model("openai", "gpt-5.5"), model("anthropic", "claude-opus-5-5")];
         let profile = |allowed: Option<&[&str]>| {
             let mut p = config::Config::fallback("faux".into(), "t", ".".into()).profiles.remove("default").unwrap();
@@ -615,6 +672,53 @@ mod tests {
         assert_eq!(event.kind, "startup_failed");
         assert_eq!(event.severity, issues::Severity::Fatal);
         assert_eq!(event.details, serde_json::json!({"reason": "data_dir_locked", "dataDir": path}));
+    }
+
+    #[test]
+    fn startup_failure_exposes_typed_keychain_error() {
+        let keychain = agent_ai::keychain::KeychainError::InteractionNotAllowed { service: "sub-bot".into(), account: "openai/default".into() };
+        let error = anyhow::Error::new(keychain.clone()).context("sensitive provider context");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, keychain.to_string());
+        assert!(message.contains("service=sub-bot") && message.contains("account=openai/default"));
+        assert_eq!(event.message, message);
+        assert_eq!(event.details, serde_json::json!({"reason": "keychain"}));
+    }
+
+    #[test]
+    fn keys_cli_parses() {
+        let cli = Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "openai", "--account", "work", "--quiet"]).unwrap();
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
+        let Cmd::Keys { command: keys::KeysCmd::Set { account, file, service, quiet } } = cli.cmd else { panic!("keys set") };
+        assert_eq!((account.as_str(), file, service, quiet), ("work", None, None, true));
+        let cli = Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "anthropic", "--file", "k.key", "--service", "s"]).unwrap();
+        let Cmd::Keys { command: keys::KeysCmd::Set { account, file, service, .. } } = cli.cmd else { panic!("keys set") };
+        assert_eq!((account.as_str(), file, service.as_deref()), ("default", Some(PathBuf::from("k.key")), Some("s")));
+        let cli = Cli::try_parse_from(["sub-bot", "--config", "c.json", "keys", "list", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Keys { command: keys::KeysCmd::List { json: true } }));
+        assert!(matches!(Cli::try_parse_from(["sub-bot", "keys", "delete", "--provider", "openai"]).unwrap().cmd, Cmd::Keys { command: keys::KeysCmd::Delete { .. } }));
+        let cli = Cli::try_parse_from(["sub-bot", "keys", "check", "--provider", "anthropic"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Keys { command: keys::KeysCmd::Check }));
+        assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+        assert!(Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "openai", "extra-positional-key"]).is_err());
+    }
+
+    #[test]
+    fn key_file_help_lists_full_precedence() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for (id, file_env, env) in [("openai_key_file", "OPENAI_API_KEY_FILE", "OPENAI_API_KEY"), ("anthropic_key_file", "ANTHROPIC_API_KEY_FILE", "ANTHROPIC_API_KEY")] {
+            let arg = cmd.get_arguments().find(|a| a.get_id() == id).unwrap_or_else(|| panic!("{id}"));
+            let help = arg.get_help().expect("help text").to_string();
+            assert!(help.to_lowercase().contains("keychain"), "{id}: {help}");
+            assert!(help.contains("受管存储") && help.contains("sub-bot keys set"), "{id}: {help}");
+            // 顺序：本参数 > *_API_KEY_FILE > apiKeyFile/apiKeyKeychain > *_API_KEY > 受管存储
+            let at = |needle: &str| help.find(needle).unwrap_or_else(|| panic!("{id}: missing {needle}: {help}"));
+            let order = [at("本参数"), at(file_env), at("apiKeyFile"), at("apiKeyKeychain"), at(&format!("> {env} >")), at("受管存储")];
+            assert!(order.windows(2).all(|w| w[0] < w[1]), "{id}: {help}");
+        }
+        let long = Cli::command().render_long_help().to_string();
+        assert!(long.contains("apiKeyKeychain") && long.contains("受管存储"), "{long}");
     }
 
     #[test]

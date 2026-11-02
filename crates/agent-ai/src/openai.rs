@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 pub struct OpenAiProvider {
     api_key: crate::secrets::Secret,
     base_url: String,
+    /// 账号级请求头（OpenAI-Organization / OpenAI-Project），所有请求都带上
+    extra_headers: reqwest::header::HeaderMap,
     http: reqwest::Client,
     stream_idle_timeout: Duration,
     /// 运行时从 400 错误里学到的推理强度能力
@@ -82,18 +84,50 @@ fn parse_effort_error(body: &str) -> Option<EffortError> {
     Some(if levels.is_empty() { EffortError::Unsupported } else { EffortError::Levels(levels) })
 }
 
+/// OpenAI provider 实例的连接参数（按账号）。
+#[derive(Default, Clone, Debug)]
+pub struct OpenAiOptions {
+    pub base_url: Option<String>,
+    /// → `OpenAI-Organization` 请求头
+    pub organization: Option<String>,
+    /// → `OpenAI-Project` 请求头
+    pub project: Option<String>,
+    /// 默认 300 秒
+    pub stream_idle_timeout: Option<Duration>,
+}
+
+/// organization / project 请求头；不是合法 header 值的条目被忽略（配置校验会提前拒绝）。
+fn account_headers(opts: &OpenAiOptions) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    for (name, value) in [("openai-organization", &opts.organization), ("openai-project", &opts.project)] {
+        match value.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(reqwest::header::HeaderValue::from_str) {
+            Some(Ok(v)) => {
+                headers.insert(name, v);
+            }
+            Some(Err(_)) => tracing::warn!(header = name, "ignoring invalid OpenAI account header value"),
+            None => {}
+        }
+    }
+    headers
+}
+
 impl OpenAiProvider {
     /// key 只在进程内存中，从不通过对外接口返回。
     pub fn new(api_key: crate::secrets::Secret, base_url: Option<String>) -> Self {
-        Self::with_stream_idle_timeout(api_key, base_url, Duration::from_secs(300))
+        Self::with_options(api_key, OpenAiOptions { base_url, ..Default::default() })
     }
 
     pub fn with_stream_idle_timeout(api_key: crate::secrets::Secret, base_url: Option<String>, stream_idle_timeout: Duration) -> Self {
+        Self::with_options(api_key, OpenAiOptions { base_url, stream_idle_timeout: Some(stream_idle_timeout), ..Default::default() })
+    }
+
+    pub fn with_options(api_key: crate::secrets::Secret, opts: OpenAiOptions) -> Self {
         Self {
             api_key,
-            base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
+            extra_headers: account_headers(&opts),
+            base_url: opts.base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
             http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().expect("http client"),
-            stream_idle_timeout,
+            stream_idle_timeout: opts.stream_idle_timeout.unwrap_or(Duration::from_secs(300)),
             effort_cache: Default::default(),
             api_cache: Default::default(),
         }
@@ -163,7 +197,15 @@ impl Provider for OpenAiProvider {
     fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<crate::models::ModelInfo>, String>> {
         Box::pin(async move {
             let started = std::time::Instant::now();
-            let resp = self.http.get(format!("{}/models", self.base_url)).bearer_auth(self.api_key.expose()).timeout(std::time::Duration::from_secs(30)).send().await.map_err(|e| e.to_string())?;
+            let resp = self
+                .http
+                .get(format!("{}/models", self.base_url))
+                .headers(self.extra_headers.clone())
+                .bearer_auth(self.api_key.expose())
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
             let status = resp.status();
             let body = resp.text().await.map_err(|e| e.to_string())?;
             if !status.is_success() {
@@ -186,6 +228,7 @@ impl Provider for OpenAiProvider {
         let ctx = CallCtx {
             http: self.http.clone(),
             base_url: self.base_url.clone(),
+            headers: self.extra_headers.clone(),
             key: self.api_key.clone(),
             effort_cache: self.effort_cache.clone(),
             api_cache: self.api_cache.clone(),
@@ -248,6 +291,7 @@ struct CallCtx {
     stream_idle_timeout: Duration,
     http: reqwest::Client,
     base_url: String,
+    headers: reqwest::header::HeaderMap,
     key: crate::secrets::Secret,
     effort_cache: EffortCache,
     api_cache: Arc<Mutex<HashMap<String, Api>>>,
@@ -281,7 +325,7 @@ async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Ass
             span.record("api", api.as_str());
             span.record("reasoning_effort", effort.map(|l| l.as_str()).unwrap_or("-"));
         };
-        let resp = tokio::time::timeout(Duration::from_secs(120), ctx.http.post(&url).bearer_auth(ctx.key.expose()).json(&body).send())
+        let resp = tokio::time::timeout(Duration::from_secs(120), ctx.http.post(&url).headers(ctx.headers.clone()).bearer_auth(ctx.key.expose()).json(&body).send())
             .await
             .map_err(|_| "response headers timeout after 120s".to_string())?
             .map_err(CallError::transport)?;
@@ -633,6 +677,66 @@ mod tests {
             assert_eq!(provider.effort_cache.lock().unwrap().get(&("gpt-5".into(), api, false)), Some(&Some(vec![ThinkingLevel::Max, ThinkingLevel::Other("ultra"), ThinkingLevel::Other("unknown")])));
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn organization_and_project_headers_are_sent() {
+        use axum::{
+            extract::State,
+            http::HeaderMap,
+            routing::{get, post},
+            Router,
+        };
+        type Seen = Arc<Mutex<Vec<(String, Option<String>, Option<String>)>>>;
+        fn record(seen: &Seen, path: &str, headers: &HeaderMap) {
+            let get = |name: &str| headers.get(name).map(|v| v.to_str().unwrap().to_string());
+            seen.lock().unwrap().push((path.into(), get("openai-organization"), get("openai-project")));
+        }
+        async fn chat(State(seen): State<Seen>, headers: HeaderMap) -> String {
+            record(&seen, "chat", &headers);
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n".into()
+        }
+        async fn responses(State(seen): State<Seen>, headers: HeaderMap) -> String {
+            record(&seen, "responses", &headers);
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".into()
+        }
+        async fn models(State(seen): State<Seen>, headers: HeaderMap) -> String {
+            record(&seen, "models", &headers);
+            r#"{"data":[{"id":"gpt-6.1-sol"}]}"#.into()
+        }
+        for (org, project) in [(Some("org_abc123"), Some("proj_xyz789")), (None, None)] {
+            let seen = Seen::default();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let app = Router::new().route("/chat/completions", post(chat)).route("/responses", post(responses)).route("/models", get(models)).with_state(seen.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = OpenAiProvider::with_options(
+                crate::Secret::new("test"),
+                OpenAiOptions { base_url: Some(base), organization: org.map(String::from), project: project.map(String::from), ..Default::default() },
+            );
+            for api in [Api::Chat, Api::Responses] {
+                let req = Request {
+                    model: "m".into(),
+                    system_prompt: None,
+                    messages: vec![],
+                    tools: vec![],
+                    reasoning: None,
+                    api,
+                    max_tokens: None,
+                    raw_effort: false,
+                    thinking: None,
+                    llm_max_retries: Some(0),
+                };
+                let events = provider.stream(req, CancellationToken::new()).collect::<Vec<_>>().await;
+                assert!(matches!(events.last(), Some(AssistantEvent::Done { .. })), "{events:?}");
+            }
+            assert_eq!(provider.list_models().await.unwrap().len(), 1);
+            let expected: Vec<_> = ["chat", "responses", "models"].iter().map(|p| (p.to_string(), org.map(String::from), project.map(String::from))).collect();
+            assert_eq!(*seen.lock().unwrap(), expected);
+            server.abort();
+        }
+        // 非法 header 值被忽略而不是 panic
+        assert!(account_headers(&OpenAiOptions { organization: Some("bad\nvalue".into()), ..Default::default() }).is_empty());
     }
 
     #[test]

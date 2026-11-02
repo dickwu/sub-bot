@@ -42,6 +42,9 @@ pub struct IssueScope {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// 账号名（多账号；从不包含 key）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -278,6 +281,7 @@ impl Reporter {
             &mut event.scope.profile,
             &mut event.scope.model,
             &mut event.scope.provider,
+            &mut event.scope.account,
             &mut event.tool,
         ]
         .into_iter()

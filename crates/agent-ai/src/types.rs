@@ -80,11 +80,24 @@ pub struct AssistantMessage {
     /// 实际发送给模型的推理强度（None = 未发送）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<ThinkingLevel>,
+    /// 实际使用的账号名（多账号/failover 包装层填写；基础 provider 不填）。只含账号名，绝不含 key。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 impl AssistantMessage {
     pub fn empty(model: &str) -> Self {
-        Self { content: vec![], model: model.into(), stop_reason: StopReason::Stop, usage: Usage::default(), error_message: None, timestamp: now_ms(), api: None, reasoning_effort: None }
+        Self {
+            content: vec![],
+            model: model.into(),
+            stop_reason: StopReason::Stop,
+            usage: Usage::default(),
+            error_message: None,
+            timestamp: now_ms(),
+            api: None,
+            reasoning_effort: None,
+            account: None,
+        }
     }
     pub fn failed(model: &str, reason: StopReason, msg: impl Into<String>) -> Self {
         Self { stop_reason: reason, error_message: Some(msg.into()), ..Self::empty(model) }

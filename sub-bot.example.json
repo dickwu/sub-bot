@@ -7,6 +7,22 @@
   "defaultApi": "auto",
   "apiKeyFile": "/etc/sub-bot/openai.key",
   "providers": {
+    "openai": {
+      "defaultAccount": "default",
+      "failoverCooldownSecs": 60,
+      "accounts": {
+        "work": {
+          "apiKeyFile": "/etc/sub-bot/openai-work.key",
+          "organization": "org_REPLACE_ME",
+          "project": "proj_REPLACE_ME",
+          "fallbackAccounts": ["default"]
+        },
+        "proxy": {
+          "apiKeyEnv": "OPENAI_API_KEY_PROXY",
+          "baseUrl": "http://localhost:9000/v1"
+        }
+      }
+    },
     "anthropic": {
       "apiKeyFile": "/etc/sub-bot/anthropic.key",
       "defaultModel": "claude-opus-5-5"
@@ -43,6 +59,9 @@
     },
     "coder": {
       "model": "gpt-6.1-sol",
+      "account": "work",
+      "allowedAccounts": ["work", "proxy"],
+      "llmMaxRetries": 1,
       "allowedModels": [
         "gpt-6.1-sol",
         "gpt-6-astra"

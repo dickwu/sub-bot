@@ -4,10 +4,10 @@
 
 - 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
-- OpenAI / Anthropic API key 从文件或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
+- OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.8.1。OpenAI 默认模型改为 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.9.0。新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -33,15 +33,15 @@
 
 将 `claude` 加入调用方的 `clients[].profiles`。密钥文件建议 `chmod 600`；所有配置中的 `apiKeyFile` 相对路径都相对于配置文件目录。
 
-- Anthropic key 优先级：`--anthropic-key-file` > `ANTHROPIC_API_KEY_FILE` > `providers.anthropic.apiKeyFile` > `ANTHROPIC_API_KEY`。
-- OpenAI key 优先级保持不变：`--openai-key-file` > `OPENAI_API_KEY_FILE` > `apiKeyFile` / `providers.openai.apiKeyFile` > `OPENAI_API_KEY`。顶层 `apiKeyFile` 仍只代表 OpenAI，两个配置别名若同时设置必须一致。
+- Anthropic key 优先级：`--anthropic-key-file` > `ANTHROPIC_API_KEY_FILE` > `providers.anthropic.apiKeyFile` / `apiKeyKeychain` > `ANTHROPIC_API_KEY` > 受管存储（`sub-bot keys set` 写入的位置）。
+- OpenAI key 优先级：`--openai-key-file` > `OPENAI_API_KEY_FILE` > `apiKeyFile` / `providers.openai.apiKeyFile` / `providers.openai.apiKeyKeychain` > `OPENAI_API_KEY` > 受管存储。顶层 `apiKeyFile` 仍只代表 OpenAI，两个配置别名若同时设置必须一致；`apiKeyFile` 与 `apiKeyKeychain` 只能二选一。详见「API key」与「密钥存储：macOS Keychain 与 `sub-bot keys`」。
 - 可选 `providers.<id>.baseUrl`；`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 环境变量优先于配置。
 - 选择顺序：会话 JSON `provider` > profile `provider` > 有效模型名以 `claude-` 开头时推断 Anthropic > 默认 provider。默认 provider 为显式 `--provider`（或 `SUB_BOT_PROVIDER`）> `defaultProvider` > `openai`。`run` / `rpc` / `ask` 的显式 `--provider` 也作为会话覆盖；已有 sessionId 的 ask 继续原会话。
-- 启动必须能加载默认 provider，以及 profile / 默认模型引用或推断的 provider；缺少 key 即安全失败。其它 provider 有 key 来源则加载，无来源则跳过。后续会话选择未加载 provider 返回 400，并提示配置来源；`faux` 始终可用。
+- 启动必须能加载默认 provider，以及 profile / 默认模型引用或推断的 provider（它们的默认账号与 profile 的 `account`）；缺少 key 即安全失败。其它账号（其它 provider 声明了来源的 default 账号、未被 profile 引用的命名账号）加载失败只 warn 并上报 `account_unavailable`，无来源的 default 账号直接跳过。后续会话选择未加载 provider 返回 400，并提示配置来源；`faux` 始终可用。多账号见「同一 provider 多账号」。
 - 未指定模型的 anthropic 会话默认用 `claude-opus-5-5`；`deepModel`（默认固定 `claude-fable-5-1`）/ `autoRoute` / `routerModel` 控制 standard / deep / auto 路由，见「动态推理强度与模型路由」。
 - `api` / `defaultApi` 仅用于 OpenAI。Anthropic 按模型选择 adaptive effort、effort + extended-thinking budget 或纯 budget，详见「模型与推理强度」。
 
-`sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录，每个模型都有 `provider` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
+`sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录（每个 provider 查其默认账号），每个模型都有 `provider` 与 `account` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
 
 > Anthropic Messages API 已接入：支持 SSE 工具调用、签名 thinking 回放、prompt caching、分页模型目录及共享瞬态重试策略。
 
@@ -224,7 +224,8 @@ sub-bot --config sub-bot.json issues tail -n 20
 ## 快速开始
 
 ```bash
-# 推荐：key 放文件（600 权限），不进入环境变量，详见下文「API key」
+sub-bot keys set --provider openai   # 推荐：无回显输入 key；macOS 存 Keychain，Linux 写 ~/.config/sub-bot/keys/openai-default.key（0600），无需改配置
+# 或者自己管理 key 文件（600 权限），不进入环境变量，详见下文「API key」
 mkdir -p ~/.config/sub-bot && install -m 600 /dev/null ~/.config/sub-bot/openai.key && $EDITOR ~/.config/sub-bot/openai.key
 export OPENAI_API_KEY_FILE=~/.config/sub-bot/openai.key   # 或 --openai-key-file / 配置 apiKeyFile；也仍支持 OPENAI_API_KEY
 sub-bot hash-token "$(openssl rand -hex 24)"   # 记下 token 原文给 bot，把输出的哈希填进配置
@@ -546,14 +547,15 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 
 ## API key
 
-sub-bot 按以下顺序查找 OpenAI key，取第一个非空的：
+sub-bot 按以下顺序查找 OpenAI **default 账号**的 key，取第一个命中的（来源存在但读取失败会直接报错，不会继续往下找）。命名账号只看账号块里声明的来源和受管存储，见「同一 provider 多账号」：
 
 1. `--openai-key-file <路径>`
 2. `OPENAI_API_KEY_FILE` 环境变量（指向文件）
-3. 配置文件里的 `apiKeyFile`
+3. 配置文件里声明的来源：`apiKeyFile`（文件）或 `providers.openai.apiKeyKeychain`（macOS Keychain），二选一
 4. `OPENAI_API_KEY` 环境变量
+5. 受管存储：`sub-bot keys set` 写入的位置——macOS 是 Keychain 条目 `sub-bot` / `openai/default`，Linux 是 `~/.config/sub-bot/keys/openai-default.key`（遵循 `$XDG_CONFIG_HOME`）。只在前 4 级都没有时才探测，所以 `keys set` 之后不写配置也能直接用；仅对启动必需的 provider 探测（不会为了“是否配置”去读 Keychain）。
 
-key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不到、为空或中间含空白时会明确报错，但报错不会包含文件内容。文件权限对 group/other 可读时会打一条警告，建议 `chmod 600`。日志只记录 key 的来源（变量名或路径），不记录 key。`ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` 使用同一套机制，优先级见上方 Claude (Anthropic) 节。
+key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不到、为空或中间含空白时会明确报错，但报错不会包含文件内容。文件权限对 group/other 可读时会打一条警告，建议 `chmod 600`。日志只记录 key 的来源（变量名、路径或 Keychain 的 service/account 名，例如 `key_source=keychain service=sub-bot account=openai/default`），不记录 key；无论来源是什么，加载的 key 都会加入 issue 上报的脱敏列表。`ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` 使用同一套机制，优先级见上方 Claude (Anthropic) 节。
 
 **bash 工具的环境变量**：bash 子进程启动时总会剔除 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`SUB_BOT_TOKEN` 及对应的 `*_FILE` 变量，`allow` 也无法放行。其它变量由 profile 的 `shellEnv` 决定：默认 `inherit` 会继承其余变量；`allowlist` 只保留 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TZ`、`TMPDIR` 等基础变量和 `allow` 里的变量。如果你的环境里还有别的密钥（如 `AWS_*`、`GITHUB_TOKEN`），请写进 `deny`，或者直接用 `allowlist`。
 
@@ -564,6 +566,275 @@ key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不�
 - 内容中含有 key 的其它环境变量（不是上面这些变量名）不会被识别，需要自己加进 `deny` 或用 `allowlist`。
 
 因此**推荐用 key 文件**（不出现在任何进程的环境里），文件放在 `workspaceRoots` 之外。要真正隔离，请让 sub-bot 以单独的系统用户运行，或者把 bash 放进容器/沙箱。
+
+## 密钥存储：macOS Keychain 与 `sub-bot keys`（v0.9.0）
+
+除了手工维护 key 文件，sub-bot 可以自己保存 key：macOS 上存进登录钥匙串（Keychain，generic password），Linux 上写成权限 0600 的 key 文件。所有 `keys` 子命令都**绝不输出 key**：stdout、stderr、`--json` 和错误信息里只有路径、变量名或 Keychain 的 service/account 名。`keys` 不启动服务、不构造会话，也不创建日志目录（诊断只写 stderr）。
+
+`--provider` 与 `--config` 是全局参数，放在 `keys` 前后都可以。
+
+### 用 `sub-bot keys set` 保存 key
+
+```bash
+sub-bot keys set --provider openai                                  # 终端里交互输入，不回显
+pbpaste | sub-bot keys set --provider anthropic                     # 管道：从 stdin 读到 EOF
+sub-bot keys set --provider openai < ~/Downloads/openai.txt         # 重定向同理
+sub-bot keys set --provider openai --file /etc/sub-bot/openai.key   # 写到指定文件（任何平台）
+```
+
+- **TTY 输入**：stdin 是终端时，在 stderr 提示 `Enter OpenAI API key for account 'default' (input hidden): `，关闭回显读取一行（支持退格、Ctrl-U 清空；Ctrl-C 取消，终端设置在任何退出路径上都会恢复）。不依赖 rpassword，直接用 termios。
+- **管道 / 重定向输入**：读取全部 stdin。去掉首尾空白后必须恰好是一段不含空白的文本；多行或中间有空格报 `stdin must contain only the key`，为空报 `no key provided`。两种错误都不回显内容，读入的缓冲区用完即清零。不要把 key 写在命令行参数里（会进 shell 历史和 `ps`），`keys set` 也不接受位置参数。
+- **存储位置**：`--file PATH` > macOS Keychain（service `sub-bot`，account `<provider>/<account>`，已存在则更新）> Linux 受管文件 `~/.config/sub-bot/keys/<provider>-<account>.key`（遵循 `$XDG_CONFIG_HOME`）。
+- **Linux 文件权限**：受管目录以 **0700** 创建；已存在的目录必须属于当前用户、不是符号链接、group/other 无任何权限，否则拒绝写入并提示 `chmod 700`（不会擅自改权限）。key 文件是 **0600**：先在同目录写一个 0600 临时文件并 `fsync`，再 `rename` 覆盖目标（**原子写**，不会留下写了一半的 key）；目标是符号链接时拒绝覆盖。`--file` 的父目录不存在时同样以 0700 创建。
+- `--service NAME` 只在 macOS 可用（Linux 上报 `--service is only supported on macOS`），且不能和 `--file` 同时使用；`--quiet` 只打印第一行、不打印配置片段；`--account NAME` 默认 `default`，命名账号的片段写成 `accounts.<name>`（见「同一 provider 多账号」）。`keys` 的 `--account` 不读 `SUB_BOT_ACCOUNT`。
+- 成功后打印可直接粘贴的配置片段。macOS：
+
+```text
+Saved OpenAI key for account 'default' to keychain (service=sub-bot, account=openai/default).
+Add to your config:
+  "providers": { "openai": { "apiKeyKeychain": {} } }
+(Without this config entry the key is still found automatically as the last-resort source for account 'default'.)
+```
+
+Linux：
+
+```text
+Saved OpenAI key for account 'default' to /home/u/.config/sub-bot/keys/openai-default.key (mode 0600).
+Add to your config:
+  "providers": { "openai": { "apiKeyFile": "/home/u/.config/sub-bot/keys/openai-default.key" } }
+(Without this config entry the key is still found automatically as the last-resort source for account 'default'.)
+```
+
+写入受管位置（默认 service 的 Keychain 条目或受管目录）时，不加配置也能被「API key」一节的第 5 级来源找到；写进配置则来源更明确，并且优先级高于 `OPENAI_API_KEY`。`--file` 或自定义 `--service` 写入的 key 必须按片段写进配置才会被使用。
+
+### 配置 `apiKeyKeychain`（仅 macOS）
+
+```jsonc
+{
+  "providers": {
+    // {} = service "sub-bot"，account "openai/default"（即 `sub-bot keys set --provider openai` 写入的条目）
+    "openai": { "apiKeyKeychain": {} },
+    // 指向自己创建的任意条目；service / account 都可以单独省略
+    "anthropic": { "apiKeyKeychain": { "service": "my-keys", "account": "claude-prod" } }
+  }
+}
+```
+
+- 命名约定：service 默认 `sub-bot`，account 默认 `<provider>/<account>`（当前即 `openai/default`、`anthropic/default`）。`security find-generic-password -s sub-bot`（不加 `-w`，只看属性）或在“钥匙串访问”里搜索 `sub-bot` 就能看到全部条目。`service` / `account` 给出时不能为空白；不认识的字段会被拒绝。
+- `apiKeyKeychain` 与 `apiKeyFile`（含顶层 `apiKeyFile`）只能设置一个：`providers.openai: set only one of apiKeyFile / apiKeyKeychain`。`faux` 不支持。
+- 读取通过 Security.framework（`security-framework` crate）直接进行，不调用 `security` 命令行：key 不经过子进程管道，ACL 归属也是 sub-bot 本身而不是 `/usr/bin/security`。条目内容同样做 trim 与“只含 key”校验（否则报 `keychain item is not valid UTF-8 or is empty (...)`）。
+- 配置声明的条目不存在会直接报 `keychain item not found (service=..., account=...)` 并启动失败，**不会**悄悄回落到 `OPENAI_API_KEY` 或受管存储。
+- 非 macOS 构建里配置 `apiKeyKeychain`，加载配置时就会报错：``providers.openai: apiKeyKeychain is only supported on macOS (this build targets linux); use apiKeyFile or `sub-bot keys set` (writes a 0600 key file)``。
+- **Linux 不支持 libsecret / Secret Service**：它需要 glib/dbus 动态链接，与 musl 静态发布冲突，而且无头服务器通常没有 Secret Service 守护进程。Linux 上请用 `sub-bot keys set` 生成的 0600 key 文件。
+
+### `keys list` / `keys delete` / `keys check`
+
+```bash
+sub-bot --config sub-bot.json keys list               # --json 输出 JSON；--provider openai 只看一个 provider
+sub-bot keys delete --provider openai                 # macOS 删 Keychain 条目，Linux 删受管文件
+sub-bot keys delete --provider openai --file k.key    # 删指定文件
+sub-bot --config sub-bot.json keys check              # 按配置实际加载一次 key（触发 Keychain 授权）
+```
+
+**`list`** 汇总这些来源：`--openai-key-file` / `--anthropic-key-file`、`*_API_KEY_FILE`、配置里每个账号声明的 `apiKeyFile` / `apiKeyKeychain` / `apiKeyEnv`（含 `accounts.*`）、`*_API_KEY`，以及受管存储里发现的条目（Keychain service `sub-bot` 下形如 `<provider>/<account>` 的条目，或受管目录里的 `<provider>-<account>.key`）。判断状态时**不读取 key**：文件只看 metadata（`present (mode 0600)` / `missing` / `unreadable`），Keychain 只做属性搜索（`present` / `missing`；非 macOS 为 `unsupported`），环境变量只看是否设置（`set`）。`list` 只解析配置里与 key 有关的字段，不做完整的配置加载。
+
+macOS 示例（列宽随内容变化）：
+
+```text
+PROVIDER   ACCOUNT  SOURCE                                           STATUS
+openai     default  keychain service=sub-bot account=openai/default  present
+openai     work     keychain service=sub-bot account=openai/work     present
+anthropic  default  keychain service=my-keys account=claude-prod     missing
+anthropic  default  env ANTHROPIC_API_KEY                            set
+```
+
+Linux 示例：
+
+```text
+PROVIDER   ACCOUNT  SOURCE                                                            STATUS
+openai     default  managed key file /home/u/.config/sub-bot/keys/openai-default.key  present (mode 0600)
+anthropic  default  config apiKeyFile /etc/sub-bot/anthropic.key                      present (mode 0600)
+anthropic  default  env ANTHROPIC_API_KEY                                             set
+```
+
+`--json` 输出数组，`inConfig` 表示该来源是否写在配置里：
+
+```json
+[
+  {
+    "provider": "openai",
+    "account": "default",
+    "source": "managed key file /home/u/.config/sub-bot/keys/openai-default.key",
+    "status": "present (mode 0600)",
+    "inConfig": false
+  }
+]
+```
+
+什么都没找到时 stdout 为空，stderr 提示 ``no keys found (use `sub-bot keys set --provider <id>`)``。
+
+**`delete`** 只删除受管位置（macOS Keychain 条目，可配合 `--service`；Linux 受管文件）或显式 `--file`，不会去删配置里 `apiKeyFile` 指向的任意文件：
+
+```text
+Deleted OpenAI key for account 'default' from keychain (service=sub-bot, account=openai/default).
+```
+
+条目不存在时报 `no key stored for openai/default` 并以非零状态退出。
+
+**`check`** 先完整加载配置（无 `--config` 时用内置默认配置），再对每个将在启动时加载的账号（启动必需的账号、所有 `accounts.*` 命名账号，以及显式声明了 key 来源的 default 账号）按完整优先级加载一次 key，只打印成功/失败和来源；用 `--provider` 时只检查该 provider（即使配置不需要它）。任一失败退出码为 1：
+
+```text
+openai/default: ok (keychain service=sub-bot account=openai/default)
+anthropic/default: skipped (not used by this configuration)
+```
+
+```text
+anthropic/default: FAILED: keychain access denied (service=sub-bot, account=anthropic/default): approve sub-bot in the Keychain prompt or re-run `sub-bot keys set` after upgrading the binary
+Error: one or more API keys failed to load
+```
+
+### Keychain 错误码对照
+
+sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号里的 service/account 是实际条目名；错误信息从不包含条目内容）：
+
+| OSStatus | 系统常量 | sub-bot 报错 | 常见原因与处理 |
+|---|---|---|---|
+| `-25300` | `errSecItemNotFound` | `keychain item not found (service=…, account=…)` | 条目不存在。配置里 `apiKeyKeychain` 指向的条目不存在 ⇒ 启动失败；第 5 级受管存储探测时视为“未命中”，继续报 key not found；`keys delete` 报 `no key stored for …`。用 `sub-bot keys set` 创建，或修正 service/account。 |
+| `-25308` | `errSecInteractionNotAllowed` | `keychain interaction not allowed (…): the login keychain is locked and no UI is available; …` | 登录钥匙串已锁定且当前会话不能弹窗（ssh、无 GUI 的后台进程）。在同一会话先 `security unlock-keychain`，或从 GUI 登录会话 / LaunchAgent 启动。 |
+| `-25293` | `errSecAuthFailed` | ``keychain access denied (…): approve sub-bot in the Keychain prompt or re-run `sub-bot keys set` after upgrading the binary`` | ACL 不信任当前二进制（典型：brew upgrade 之后），或授权失败。见下文“升级后重新授权”。 |
+| `-128` | `errSecUserCanceled` | 同上（`keychain access denied (…)`） | 在授权弹窗里点了“拒绝”或取消。重新运行并选择“始终允许”。 |
+| 其它 | — | `keychain error <code> (service=…, account=…)` | 用 `security error <code>` 查看含义。 |
+
+### 首次访问弹窗、升级与后台运行
+
+- **首次 Keychain 访问弹窗**：由 sub-bot 自己 `keys set` 创建的条目，ACL 的“始终允许”列表里就是创建它的这个 sub-bot 二进制，之后同一个二进制读取**不会弹窗**。用“钥匙串访问”或 `security add-generic-password` 创建的条目，sub-bot 第一次读取时会弹出“sub-bot 想要使用钥匙串中的机密信息”：输入登录密码并点 **“始终允许”**，以后不再弹；点“拒绝”得到 `-128`。只做属性搜索的 `keys list` 不读条目内容，不会触发弹窗；`keys check` 和服务启动会读取内容。
+- **brew 升级后 ACL 失效，需要重新授权**：Homebrew 把每个版本装在不同的 Cellar 路径下，新二进制的路径和签名/hash 都和旧的不同，Keychain 视之为另一个应用，原来的“始终允许”对它不再生效（手动替换二进制同理）。GUI 会话里会再弹一次授权；没有 GUI（ssh、后台进程）时读取失败，报 `keychain access denied (...)`（`-25293`）或 `keychain interaction not allowed (...)`（`-25308`）。升级后、重启服务之前，在**图形界面登录会话的终端**里执行一次：
+  - `sub-bot --config sub-bot.json keys check`，在弹窗里点“始终允许”；或
+  - `sub-bot keys delete --provider openai && sub-bot keys set --provider openai`，让新二进制重新创建条目（ACL 随之归属新二进制）。
+- **ssh 会话下钥匙串锁定**：ssh 登录不会解锁登录钥匙串，也无法弹窗，读取返回 `-25308`。在同一个 ssh 会话里先解锁再运行：
+
+  ```bash
+  security unlock-keychain ~/Library/Keychains/login.keychain-db   # 交互输入登录密码
+  sub-bot --config sub-bot.json keys check
+  ```
+
+  解锁不会给新二进制授权：如果条目 ACL 不信任当前二进制（例如刚升级），ssh 下仍会失败，需要按上一条在 GUI 会话里授权一次。
+- **LaunchAgent（可用）vs LaunchDaemon（不可用）**：要让后台常驻的 `sub-bot serve` 使用 Keychain，请用 **LaunchAgent**：plist 放在 `~/Library/LaunchAgents/`，以登录用户身份在其会话中运行，能访问该用户（已解锁的）登录钥匙串，例如 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.sub-bot.plist`。**LaunchDaemon**（`/Library/LaunchDaemons/`，系统级、通常以 root 运行、不属于任何用户登录会话）没有登录钥匙串可用，Keychain 来源会失败——这种部署请改用 `apiKeyFile` 或 `keys set --file` 写出的 0600 key 文件。Homebrew tap 的 formula 没有提供服务定义，launchd plist 需要自己编写。
+- **启动失败即退出**：Keychain 读取只发生在启动阶段（不做运行期懒加载，避免服务运行中突然弹窗或挂起）。失败时 sub-bot 直接退出并上报 `startup_failed` issue，消息为上表中的 Keychain 错误文本（只含 service/account 名，不含 key）。部署 LaunchAgent 前先在 GUI 终端里跑一次 `sub-bot keys check`。
+
+## 同一 provider 多账号（v0.9.0）
+
+同一个 provider 可以配置多份凭据（“账号”），例如公司 / 个人两个 OpenAI 组织、一个经代理转发的 key。每个账号在启动时各自建立一个 provider 实例（按 `(provider, account)` 区分），profile 决定默认账号和调用方能选哪些账号。账号名只能是 `[A-Za-z0-9_.-]{1,64}`；**账号名会出现在响应、日志和 issue 里，key 永远不会**。
+
+### 配置 `accounts` / `defaultAccount`
+
+```json
+{
+  "defaultProvider": "openai",
+  "defaultModel": "gpt-6.1-sol",
+  "apiKeyFile": "/etc/sub-bot/openai.key",
+  "providers": {
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "defaultAccount": "default",
+      "failoverCooldownSecs": 120,
+      "accounts": {
+        "work": {
+          "apiKeyFile": "/etc/sub-bot/openai-work.key",
+          "organization": "org_abc123",
+          "project": "proj_xyz789",
+          "fallbackAccounts": ["default"]
+        },
+        "proxy": {
+          "apiKeyEnv": "OPENAI_API_KEY_PROXY",
+          "baseUrl": "http://localhost:9000/v1"
+        },
+        "personal": {}
+      }
+    },
+    "anthropic": {
+      "apiKeyFile": "/etc/sub-bot/anthropic.key",
+      "accounts": {
+        "ci": { "apiKeyFile": "keys/anthropic-ci.key" }
+      }
+    }
+  },
+  "profiles": {
+    "coder": {
+      "model": "gpt-6.1-sol",
+      "account": "work",
+      "allowedAccounts": ["work", "proxy"],
+      "llmMaxRetries": 1,
+      "workspaceRoots": ["./work"]
+    },
+    "reviewer": {
+      "model": "gpt-6-astra",
+      "tools": ["preset:readonly"],
+      "workspaceRoots": ["./work"]
+    },
+    "claude-ci": {
+      "provider": "anthropic",
+      "account": "ci",
+      "allowedAccounts": ["*"],
+      "workspaceRoots": ["./work"]
+    }
+  },
+  "clients": [
+    { "name": "dev-bot", "tokenSha256": "REPLACE_ME", "profiles": ["coder", "reviewer", "claude-ci"] }
+  ]
+}
+```
+
+- **账号块** `providers.<id>.accounts.<name>`：key 来源 `apiKeyFile`（相对路径相对于配置文件目录）| `apiKeyKeychain`（仅 macOS，`{}` = service `sub-bot` / account `<provider>/<name>`）| `apiKeyEnv`（变量名须匹配 `^[A-Z_][A-Z0-9_]*$`，会自动加入 bash 子进程剔除列表）三选一；三者都省略（如上例 `personal: {}`）时使用受管存储，即 `sub-bot keys set --provider openai --account personal` 写入的位置。可选 `baseUrl`（覆盖 provider 级 `baseUrl`）、`organization` / `project`（仅 openai，作为 `OpenAI-Organization` / `OpenAI-Project` 请求头发送到对话、Responses 和 `/models` 请求）、`fallbackAccounts`（见下文 failover）。不认识的字段会被拒绝。
+- **向后兼容**：旧写法全部属于账号 `default`——顶层 `apiKeyFile`、`providers.<id>.apiKeyFile` / `apiKeyKeychain`、`--openai-key-file` / `--anthropic-key-file`、`OPENAI_API_KEY[_FILE]` / `ANTHROPIC_API_KEY[_FILE]`、`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL`。也可以显式写 `accounts.default`，但与旧字段同时出现会启动报错：`providers.openai: apiKeyFile/apiKeyKeychain and accounts.default are both set; keep one`。命名账号**不会**读取 CLI key 文件和 `*_API_KEY*` 环境变量。
+- `defaultAccount`：没有指定账号时使用的账号（默认 `default`），必须是 `default` 或 `accounts` 里的名字。`faux` 只有 `default`，不支持 `accounts` / `defaultAccount`。
+- **启动加载**：所有配置的账号都在启动时一次性加载（不懒加载）。被 profile 作为 `account` 引用的账号（含未写 `account` 时的默认账号）以及默认 provider 的默认账号是**必需**的，失败即启动失败；其余账号失败只 `warn`（日志 `account unavailable`）并上报 `account_unavailable` issue（scope 含 `provider` / `account`，details 只有失败类别），之后选择它的请求返回 400 `account 'x' of provider openai is unavailable (...)`（不含启动错误细节）。
+- 每个加载成功的 key 都会加入 issue 脱敏列表；日志 `api key loaded` 带 `provider`、`account`、`key_source`（路径 / 变量名 / Keychain 条目名）。
+- 校验错误示例：`providers.openai.accounts.work: set only one of apiKeyFile / apiKeyKeychain / apiKeyEnv`、`providers.anthropic.accounts.ci: organization/project are only supported for openai`、`providers.openai: defaultAccount 'x' is not defined in accounts`、`profile 'coder': account 'work' is not configured for provider openai`、`profile 'coder': allowedAccounts must include its own account 'work'`。
+
+准备 key（macOS 存 Keychain，Linux 存 `~/.config/sub-bot/keys/<provider>-<account>.key`）：
+
+```bash
+sub-bot keys set --provider openai                      # default 账号
+sub-bot keys set --provider openai --account personal   # 不写来源的命名账号直接用受管存储
+sub-bot --config sub-bot.json keys list
+sub-bot --config sub-bot.json keys check                # 按配置加载所有账号一次
+```
+
+### profile 的 `account` / `allowedAccounts` / `fallbackAccounts`
+
+- `account`：会话默认账号，缺省为该 provider 的 `defaultAccount`。只对 profile 自己解析出的 provider 生效；请求把 provider 换成别的 provider 时，用那个 provider 的默认账号。
+- `allowedAccounts`：调用方可以选择的账号。缺省只允许自身 `account`；`["*"]` 允许该 provider 所有已加载账号；显式列表必须包含自身账号。
+- `fallbackAccounts`：覆盖账号级 `fallbackAccounts`（见 failover）。
+
+### 会话 / 请求指定账号
+
+| 入口 | 写法 |
+|---|---|
+| `POST /v1/sessions` | `{"profile": "coder", "account": "proxy"}` |
+| `POST /v1/chat`（含 `async: true` 任务） | 顶层 `"account"` 或 `"session": {"account": ...}`（顶层优先）；带 `sessionId` 时忽略——账号是会话属性，不能中途修改 |
+| CLI | `sub-bot run --account proxy "hi"`、`rpc --account`、`ask --account`、`probe-efforts --account`；环境变量 `SUB_BOT_ACCOUNT` |
+
+不在 `allowedAccounts` 里的账号（包括根本不存在的账号，二者不区分，避免泄露账号是否存在）⇒ `AccountNotAllowed`：HTTP **403** `{"error": "account 'work' is not allowed in profile 'reviewer' (allowedAccounts)"}`；`run` 直接报错退出；`rpc` 先输出一行 `{"type":"response","command":"start","success":false,"error":"..."}` 再以非零状态退出。
+
+CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各自的参数（写在子命令之后），不是全局参数：`keys set|delete` 自己的 `--account` 表示要写入/删除的账号，且不受 `SUB_BOT_ACCOUNT` 影响。
+
+### 响应与可观测性
+
+- 会话视图（`POST/GET/PATCH /v1/sessions`，也即 `ask --json` 结尾的 `session_state` 行）、RPC `get_state`：`account` = 会话账号。
+- `/v1/chat` 响应、`async` 任务的 `result`、`run --json`：`account` = 最近一次模型调用**实际使用**的账号（failover 后可能与会话账号不同）；每条 assistant 消息也带 `account`。
+- `/v1/profiles`：每个 profile 多了 `account`、`allowedAccounts`（缺省展开为 `[account]`，`*` 展开为已加载账号）、`fallbackAccounts`。
+- `/v1/models?provider=openai&account=work` / `sub-bot --provider openai models --account work`：只查该账号的模型目录；`account` 必须同时给 `provider`（否则 400 `account filter requires provider`），且必须是该 client 某个 profile 允许的账号（否则 403）。模型目录缓存按 provider+account 分开（10 分钟），`latest:` 深度模型别名按会话账号的目录解析。
+- issue 的 scope 带 `account`；日志 `session created` 与 `session_run` span 带 `account`。
+
+### 账号 failover（`fallbackAccounts`）
+
+主账号遇到 **429 限流或额度耗尽（`insufficient_quota` / “exceeded your current quota”）**、且这次调用还没有输出任何内容时，自动用同一请求切换到 `fallbackAccounts` 中下一个已加载的账号（profile 的 `fallbackAccounts` 优先，否则用主账号的账号级 `fallbackAccounts`）。fallback 账号来自配置的显式列表，不需要出现在 `allowedAccounts` 里；未加载成功的 fallback 账号会被跳过。
+
+- 认证错误（401/403）、Anthropic `overloaded_error`、其它 5xx 不切换；已经输出了内容之后的错误也不切换。
+- 切换前先用完 provider 自身的重试（`llmMaxRetries`，默认 3 次指数退避）。配置了 fallback 的 profile 建议把 `llmMaxRetries` 调低（如 1）以便更快切换。
+- 被切走的账号冷却 `providers.<id>.failoverCooldownSecs` 秒（默认 60）：冷却期内新的调用把它排到链尾；所有账号都在冷却时仍按原顺序尝试。
+- 每次切换上报一条 warn issue `account_failover`（details `{from, to, reason: "rate_limit"|"quota", attempt}`，scope.account 更新为新账号），事件流里是一次 `message_retry`（reason `account failover: work -> default (quota)`），客户端应丢弃此前的部分输出。
 
 ## 工具资源上限
 
@@ -576,4 +847,5 @@ key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不�
 ## 安全提示
 
 - 默认只监听 `127.0.0.1`。如果要跨机器访问，请放在带 TLS 的反向代理后面。
+- 受管 key 目录（Linux `~/.config/sub-bot/keys`）必须是当前用户所有、权限 0700 的真实目录，key 文件为 0600；`sub-bot keys set` 遇到不满足的已有目录会拒绝写入而不是修改权限。
 - `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。

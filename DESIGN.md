@@ -35,7 +35,7 @@
 
 - Hub 持有按 id 索引的 provider registry；每个 Agent 的 LoopConfig 持有选定 provider 的 Arc，不依赖服务全局单一 provider。选择顺序为 session.provider > profile.provider > 有效模型 `claude-` 推断 > CLI/config 默认（最终 openai）。已建会话不会因后续请求而换 provider。
 - 启动计算 needed 集合：默认 provider + 默认模型推断 + 每个 profile 的显式/推断选择。needed 缺 key 即失败；其它 provider 有来源才加载，无来源静默跳过（debug）。faux 无需 key、始终注册。显式配置但无效的 key 文件仍是错误，不降级到低优先级来源。
-- `providers.<id>` 保存 apiKeyFile/baseUrl；顶层 apiKeyFile 是 OpenAI 别名，两者冲突拒绝。key 文件按配置目录解析，CLI 文件 > provider FILE 环境变量 > 配置文件 > provider key 环境变量。base URL 环境变量优先于配置。Hub 加载时只记录 key_source，并将所有 key 注册到共享 Reporter 的脱敏列表。
+- `providers.<id>` 保存 apiKeyFile/baseUrl；顶层 apiKeyFile 是 OpenAI 别名，两者冲突拒绝。key 文件按配置目录解析。加载优先级（v0.9.0 起，`secrets::load_account_key`）：CLI `--<provider>-key-file` > `<P>_API_KEY_FILE` > 配置声明的来源（`apiKeyFile` / `apiKeyKeychain` 二选一）> `<P>_API_KEY` > 受管存储（`sub-bot keys set` 写入：macOS Keychain `sub-bot` / `<provider>/default`，Linux `~/.config/sub-bot/keys/<provider>-default.key`）。来源存在但读取失败即报错，不降级。base URL 环境变量优先于配置。Hub 加载时只记录 key_source，并将所有 key 注册到共享 Reporter 的脱敏列表。
 - 模型目录按 provider 独立缓存 10 分钟，输出扁平模型信息 + provider；筛选只请求选定 provider，OpenAI 对话/快照过滤不影响其它 provider。目录请求失败整体返回错误（不返回不完整目录）。profiles 暴露解析后的 provider；LLM issue scope 带 provider，用于归因和去重。
 - 非 OpenAI 忽略 API 选择，reasoning 按 provider/model 的 effort catalog 解析。Hub 使用 `AnthropicProvider::with_stream_idle_timeout(Secret, Option<String>, Duration)` 连接真实 Messages API，传入已加载的 key、base URL 和 idle timeout。支持 tool_result 合并、签名 thinking 回放、最多三个缓存断点及分页模型目录；message_start / message_delta 的 usage 按字段保留最新非 null 值。
 - ask 的同步 SSE 错误、异步提交/轮询 HTTP 错误包含服务端 JSON error；非 JSON 错误保留 HTTP 状态摘要。
@@ -143,7 +143,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `ai/src/models.ts` + `api/*` | `agent-ai/src/provider.rs`：`Provider` trait（`stream(req, cancel) -> EventStream`，**不返回错误**）和 `ProviderRegistry` | ✅ |
 | `api/openai-completions.ts` | `agent-ai/src/openai.rs`：Chat Completions 流式调用（按字节缓冲 SSE，累积 tool call 增量，读取 usage 和 cached_tokens，处理流中途的 error，流没有 finish_reason 就提前结束时判为错误，错误信息里的 key 会被打码，支持取消） | ✅ 已用 gpt-4.1-mini 实测 |
 | `api/openai-responses.ts` | `agent-ai/src/responses.rs`：Responses API 流式调用（`POST /v1/responses`，`store:false`；输入项 message / `function_call` / `function_call_output`；处理 `output_text.delta`、`function_call_arguments.delta/done`、`output_item.added/done`、`response.completed/incomplete/failed`、`error`；usage 读取 cached_tokens 和 reasoning_tokens）。`openai.rs` 按 `api: auto\|chat\|responses` 分派 | ✅ v0.3，已用 gpt-5.4、gpt-6-astra 实测 |
-| `api/anthropic-messages.ts` | `agent-ai/src/anthropic.rs`：Claude（Anthropic Messages API 流式：`message_start`、`content_block_start/delta/stop`、`message_delta`、`message_stop`，其中 `input_json_delta` 用来累积工具参数，`thinking` 块对应 Thinking），实现同一个 `Provider` trait。每个 profile 用 `"provider": "openai" \| "anthropic"` 加 `model` 选择；key 只从 `ANTHROPIC_API_KEY` 环境变量读取。目前没有 Anthropic key，只做 faux 和单测（离线校验请求体构建与 SSE 解析） | 计划（M1.5） |
+| `api/anthropic-messages.ts` | `agent-ai/src/anthropic.rs`：Claude（Anthropic Messages API 流式：`message_start`、`content_block_start/delta/stop`、`message_delta`、`message_stop`，其中 `input_json_delta` 用来累积工具参数，`thinking` 块对应 Thinking），实现同一个 `Provider` trait。每个 profile 用 `"provider": "openai" \| "anthropic"` 加 `model` 选择；key 与 OpenAI 共用 `agent_ai::secrets` 的加载优先级（见下文「鉴权与隔离」中的 OpenAI Key 一条）。目前没有 Anthropic key，只做 faux 和单测（离线校验请求体构建与 SSE 解析） | 计划（M1.5） |
 | `providers/faux.ts` | `agent-ai/src/faux.rs`：离线回显；输入 `/tool <name> <json>` 会触发一次工具调用 | ✅ |
 | `agent/src/agent-loop.ts` | `agent-core/src/agent_loop.rs`：`run_loop` 双层循环、steering 和 follow-up 队列、串行或并行执行工具、`length` 截断处理 | ✅（已有单测） |
 | `agent/src/agent.ts` | `agent-core/src/agent.rs`：`Agent`（broadcast 订阅，`prompt`、`steer`、`follow_up`、`abort`） | ✅ |
@@ -179,7 +179,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 - 工具内部还会做一次 `resolve_in_root` 校验（拒绝绝对路径和 `..`）。
 - 请求里的 `tools` 只能在 profile 白名单范围内**收窄**，不能扩大。
 - `systemPrompt`/`appendSystemPrompt` 覆盖需要 profile 设置 `allowSystemPromptOverride`；调用方回调工具需要 `allowCallerTools`。
-- **OpenAI Key（v0.3.1）**：`agent_ai::secrets` 负责加载，顺序为 `--openai-key-file` > `OPENAI_API_KEY_FILE` > 配置 `apiKeyFile` > `OPENAI_API_KEY`。读文件时去掉首尾空白；出错时只报路径和原因，不带内容。key 在内存里用 `Secret` 包装：`Debug`/`Display` 输出 `[redacted]`，drop 时清零，只在设置 `Authorization` 头时 `expose()`。任何响应、事件和日志里都不会出现 key，日志只记录来源。
+- **OpenAI Key（v0.3.1）**：`agent_ai::secrets` 负责加载，顺序为 `--openai-key-file` > `OPENAI_API_KEY_FILE` > 配置 `apiKeyFile` / `apiKeyKeychain`（v0.9.0，macOS Keychain，二选一）> `OPENAI_API_KEY` > 受管存储（v0.9.0，`sub-bot keys set` 写入的 Keychain 条目或 0600 key 文件；只在前几级都未命中时探测）。Anthropic 同理（`ANTHROPIC_*`）。读文件时去掉首尾空白；出错时只报路径和原因，不带内容。key 在内存里用 `Secret` 包装：`Debug`/`Display` 输出 `[redacted]`，drop 时清零，只在设置 `Authorization` 头时 `expose()`。任何响应、事件和日志里都不会出现 key，日志只记录来源。
 - **bash 子进程环境**：spawn 的地方只有一个（`builtin/fs.rs` 的 `BashTool`），这里会应用 `agent_tools::ShellEnv`。
   - 内置密钥变量表 `secrets::secret_env_vars()` 包括各 provider 的 `*_API_KEY`/`*_API_KEY_FILE`（登记在 `PROVIDER_KEYS`，以后加 provider 时在这里加一行），以及 `SUB_BOT_TOKEN(_FILE)`。运行时还能用 `register_secret_var` 追加。这些变量总会被 `env_remove`。
   - profile 的 `shellEnv {mode: inherit|allowlist, deny, allow}` 再做一层过滤：`inherit` 剔除 `deny` 中且不在 `allow` 中的变量；`allowlist` 先 `env_clear`，再只放回 `BASE_ALLOWLIST` 加 `allow`，最后减去 `deny`。

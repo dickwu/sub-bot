@@ -1,10 +1,18 @@
+use crate::accounts::{AccountKey, AccountSlot, Cooldowns, FailoverProvider};
 use crate::routing::{Depth, Routing};
 use crate::{
-    config::{Client, Config, Profile, ResolvedTarget},
+    config::{AccountConfig, Client, Config, Profile, ResolvedTarget},
     issues::{IssueEvent, IssueScope, Reporter, Severity},
     webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
-use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, openai::OpenAiProvider, EffortResolution, Message, ModelInfo, Provider, ThinkingLevel};
+use agent_ai::keychain::{KeychainReader, SystemKeychain};
+use agent_ai::secrets::{load_account_key, AccountKeySpec, KeyLoadError, ManagedStore, ProviderKey, DEFAULT_ACCOUNT};
+use agent_ai::{
+    anthropic::AnthropicProvider,
+    faux::FauxProvider,
+    openai::{OpenAiOptions, OpenAiProvider},
+    EffortResolution, Message, ModelInfo, Provider, ThinkingLevel,
+};
 use agent_core::{Agent, AgentEvent, AgentTool, Emit, LoopConfig, Shared};
 use agent_session::Session;
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
@@ -24,6 +32,8 @@ pub struct SessionHandle {
     pub id: String,
     pub owner: String,
     pub profile: String,
+    /// 会话账号（请求或 profile 解析出的主账号；failover 实际使用的账号见消息的 `account`）
+    pub account: String,
     pub cwd: PathBuf,
     pub agent: Arc<Agent>,
     pub issues: Arc<Reporter>,
@@ -41,17 +51,17 @@ pub struct SessionHandle {
 
 pub use agent_core::Disposition;
 
-type ModelsCache = tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<ModelInfo>)>>;
+type ModelsCache = tokio::sync::Mutex<BTreeMap<AccountKey, (Instant, Vec<ModelInfo>)>>;
 const MODELS_CACHE_TTL: Duration = Duration::from_secs(600);
 
-/// provider 模型目录（缓存 10 分钟），供 /v1/models 与 `latest:` 别名解析共用。
-async fn cached_models(cache: &ModelsCache, id: &str, provider: &dyn Provider) -> Result<Vec<ModelInfo>> {
+/// provider 模型目录（按 provider+account 缓存 10 分钟），供 /v1/models 与 `latest:` 别名解析共用。
+async fn cached_models(cache: &ModelsCache, key: &AccountKey, provider: &dyn Provider) -> Result<Vec<ModelInfo>> {
     let mut cache = cache.lock().await;
-    if let Some((_, models)) = cache.get(id).filter(|(t, _)| t.elapsed() < MODELS_CACHE_TTL) {
+    if let Some((_, models)) = cache.get(key).filter(|(t, _)| t.elapsed() < MODELS_CACHE_TTL) {
         return Ok(models.clone());
     }
-    let models = provider.list_models().await.map_err(|e| anyhow::anyhow!("provider {id}: {e}"))?;
-    cache.insert(id.into(), (Instant::now(), models.clone()));
+    let models = provider.list_models().await.map_err(|e| anyhow::anyhow!("provider {}: {e}", key.label()))?;
+    cache.insert(key.clone(), (Instant::now(), models.clone()));
     Ok(models)
 }
 
@@ -73,6 +83,8 @@ impl EffortChange {
 pub(crate) struct SessionDynamic {
     session_id: String,
     provider_id: String,
+    /// 会话主账号（模型目录缓存键）
+    account_key: AccountKey,
     provider: Arc<dyn Provider>,
     model: Shared<String>,
     reasoning: Shared<Option<ThinkingLevel>>,
@@ -152,7 +164,7 @@ impl SessionDynamic {
     async fn deep_model(&self) -> std::result::Result<String, String> {
         let spec = self.deep_spec.as_deref().ok_or_else(|| "no deepModel configured".to_string())?;
         let Some(prefix) = spec.strip_prefix("latest:") else { return Ok(spec.to_string()) };
-        let models = cached_models(&self.catalog, &self.provider_id, &*self.provider).await.map_err(|e| format!("cannot list models: {e}"))?;
+        let models = cached_models(&self.catalog, &self.account_key, &*self.provider).await.map_err(|e| format!("cannot list models: {e}"))?;
         let resolved = crate::routing::resolve_latest(prefix, models.iter().map(|m| m.id.as_str())).ok_or_else(|| format!("no model matches {spec}"))?;
         tracing::info!(alias = spec, resolved = %resolved, "deep model alias resolved");
         Ok(resolved)
@@ -290,7 +302,7 @@ impl SessionHandle {
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
         let effort = self.agent.config.reasoning.get().map(|l| l.as_str()).unwrap_or("-");
-        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), model = %self.agent.config.model.get(), reasoning_effort = effort);
+        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), account = %self.account, model = %self.agent.config.model.get(), reasoning_effort = effort);
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let disposition = self.agent.submit_with(msg, mode, move |new| {
@@ -418,12 +430,20 @@ impl SessionHandle {
 
     fn report_event(&self, event: &AgentEvent) {
         match event {
-            AgentEvent::MessageRetry { attempt, .. } => {
-                self.report_issue(Severity::Warn, "llm_retry", "llm", "Retrying LLM call; partial message discarded", serde_json::json!({"attempt": attempt}));
-            }
+            AgentEvent::MessageRetry { attempt, reason } => match crate::accounts::parse_failover(reason) {
+                Some((from, to, class)) => {
+                    self.dynamic.issue_scope.lock().unwrap().account = Some(to.to_string());
+                    let message = format!("Switched account {from} -> {to} ({class})");
+                    self.report_issue(Severity::Warn, "account_failover", "llm", &message, serde_json::json!({"from": from, "to": to, "reason": class, "attempt": attempt}));
+                }
+                None => self.report_issue(Severity::Warn, "llm_retry", "llm", "Retrying LLM call; partial message discarded", serde_json::json!({"attempt": attempt})),
+            },
             AgentEvent::MessageEnd { message: Message::Assistant(a) }
                 if a.stop_reason == agent_ai::StopReason::Error || (a.error_message.is_some() && a.stop_reason != agent_ai::StopReason::Aborted) =>
             {
+                if let Some(account) = &a.account {
+                    self.dynamic.issue_scope.lock().unwrap().account = Some(account.clone());
+                }
                 let error = a.error_message.as_deref().unwrap_or("");
                 let (kind, status) = classify_llm_error(error);
                 let summary = llm_error_summary(error, &self.issues);
@@ -447,6 +467,11 @@ impl SessionHandle {
                         .tool(tool_name)
                         .details(serde_json::json!({"toolCallId": tool_call_id, "exitCode": exit_code})),
                 );
+            }
+            AgentEvent::MessageEnd { message: Message::Assistant(a) } => {
+                if let Some(account) = &a.account {
+                    self.dynamic.issue_scope.lock().unwrap().account = Some(account.clone());
+                }
             }
             AgentEvent::RunOutcome { kind } => self.report_issue(if kind == "task_panic" { Severity::Fatal } else { Severity::Warn }, kind, "runtime", kind, serde_json::json!({})),
             AgentEvent::AgentSettled { aborted: true } => self.report_issue(Severity::Warn, "run_aborted", "runtime", "Run aborted", serde_json::json!({})),
@@ -477,6 +502,8 @@ pub struct SessionRequest {
     pub depth: Option<Depth>,
     /// OpenAI API：auto | chat | responses（覆盖 profile.api）
     pub api: Option<agent_ai::Api>,
+    /// 会话账号；受 profile.allowedAccounts 限制（越权 ⇒ [`AccountNotAllowed`]，HTTP 403）
+    pub account: Option<String>,
     /// 只能从 profile 已启用的工具里再收窄
     pub tools: Option<Vec<String>>,
     #[serde(default)]
@@ -494,6 +521,21 @@ impl std::fmt::Display for DepthLocked {
 }
 
 impl std::error::Error for DepthLocked {}
+
+/// 请求的账号不在 profile 的 allowedAccounts 里（包括未知账号：不区分“不存在”和“不允许”）。
+#[derive(Debug)]
+pub struct AccountNotAllowed {
+    pub account: String,
+    pub profile: String,
+}
+
+impl std::fmt::Display for AccountNotAllowed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "account '{}' is not allowed in profile '{}' (allowedAccounts)", self.account, self.profile)
+    }
+}
+
+impl std::error::Error for AccountNotAllowed {}
 
 #[derive(Debug)]
 pub struct TooManySessions;
@@ -619,7 +661,12 @@ pub enum StoreMode {
 pub struct Hub {
     pub config: Config,
     pub issues: Arc<Reporter>,
-    pub(crate) providers: BTreeMap<String, Arc<dyn Provider>>,
+    /// 已加载的 provider 实例，按 (provider, account)
+    pub(crate) providers: BTreeMap<AccountKey, Arc<dyn Provider>>,
+    /// 配置了但启动时加载失败的账号 → 失败原因（只进日志，不进 HTTP 响应）
+    unavailable: BTreeMap<AccountKey, String>,
+    /// 账号冷却表（failover）
+    cooldowns: Arc<Cooldowns>,
     default_provider: String,
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
@@ -663,11 +710,12 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ProviderModel {
     pub provider: String,
+    pub account: String,
     #[serde(flatten)]
     pub model: ModelInfo,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub struct KeyFiles<'a> {
     pub openai: Option<&'a std::path::Path>,
     pub anthropic: Option<&'a std::path::Path>,
@@ -679,46 +727,137 @@ pub fn select_provider<'a>(requested: Option<&'a str>, profile: Option<&'a str>,
 
 fn not_configured(id: &str) -> String {
     let upper = id.to_ascii_uppercase();
-    format!("provider {id} is not configured (set --{id}-key-file / {upper}_API_KEY_FILE / providers.{id}.apiKeyFile / {upper}_API_KEY)")
+    format!("provider {id} is not configured (set --{id}-key-file / {upper}_API_KEY_FILE / providers.{id}.apiKeyFile / apiKeyKeychain / {upper}_API_KEY, or run `sub-bot keys set --provider {id}`)")
 }
 
-fn load_providers(config: &Config, default: &str, files: KeyFiles<'_>, issues: &Reporter, getenv: impl Fn(&str) -> Option<String>) -> Result<BTreeMap<String, Arc<dyn Provider>>> {
-    crate::config::validate_provider(default)?;
+/// 一个账号的 key 来源声明（hub / probe / `keys check` 共用）：CLI 文件（仅 default）、账号块声明的来源、受管存储。
+/// `account` 是 [`Config::provider_accounts`] 折叠后的账号块（default 已含旧字段）。
+pub(crate) fn account_key_spec<'a>(pk: &'a ProviderKey, name: &'a str, account: &'a AccountConfig, files: KeyFiles<'a>, managed: &ManagedStore) -> AccountKeySpec<'a> {
+    let id = pk.provider;
+    let mut spec = AccountKeySpec::new(pk, name, managed.clone());
+    if name == DEFAULT_ACCOUNT {
+        spec.cli_file = if id == "openai" { files.openai } else { files.anthropic };
+    }
+    spec.config_file = account.api_key_file.as_deref();
+    spec.keychain = account.api_key_keychain.as_ref().map(|k| k.resolve(id, name));
+    spec.account_env = account.api_key_env.as_deref();
+    spec
+}
+
+/// 账号实际使用的 baseUrl：`<P>_BASE_URL`（仅 default 账号）> 账号 baseUrl > provider baseUrl。
+pub(crate) fn account_base_url(config: &Config, id: &str, name: &str, account: &AccountConfig, getenv: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let env = if name == DEFAULT_ACCOUNT { getenv(&format!("{}_BASE_URL", id.to_ascii_uppercase())).filter(|s| !s.trim().is_empty()) } else { None };
+    env.or_else(|| account.base_url.clone()).or_else(|| config.providers.get(id).and_then(|p| p.base_url.clone()))
+}
+
+/// 按账号构造 provider 实例（openai：账号级 baseUrl + organization/project 请求头）。
+pub(crate) fn build_provider(config: &Config, id: &str, name: &str, account: &AccountConfig, key: agent_ai::Secret, getenv: impl Fn(&str) -> Option<String>) -> Arc<dyn Provider> {
+    let base_url = account_base_url(config, id, name, account, getenv);
+    let timeout = Duration::from_secs(config.stream_idle_timeout_secs);
+    match id {
+        "openai" => {
+            Arc::new(OpenAiProvider::with_options(key, OpenAiOptions { base_url, organization: account.organization.clone(), project: account.project.clone(), stream_idle_timeout: Some(timeout) }))
+        }
+        "anthropic" => Arc::new(AnthropicProvider::with_stream_idle_timeout(key, base_url, timeout)),
+        _ => unreachable!("known provider key"),
+    }
+}
+
+/// 保留 `KeychainError` 类型（其 Display 不含 key，可进入 startup_failed issue）；其它错误转成纯文本。
+pub(crate) fn key_load_error(e: KeyLoadError) -> anyhow::Error {
+    match e {
+        KeyLoadError::Keychain(k) => anyhow::Error::new(k),
+        e => anyhow::Error::msg(e.to_string()),
+    }
+}
+
+/// 启动时必须可用的 provider：默认 provider、全局默认模型推断的 provider、每个 profile 解析出的 provider。
+pub(crate) fn needed_providers<'a>(config: &'a Config, default: &'a str) -> BTreeSet<&'a str> {
     let mut needed = BTreeSet::from([default, select_provider(None, None, &config.default_model, default)]);
     for p in config.profiles.values() {
         needed.insert(select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&config.default_model), default));
     }
-    let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
-    providers.insert("faux".into(), Arc::new(FauxProvider));
+    needed
+}
+
+/// 启动时必须加载成功的账号：needed provider 的默认账号 + 每个 profile 的 account（显式或默认）。其它账号可选。
+pub(crate) fn required_accounts(config: &Config, default: &str) -> BTreeSet<AccountKey> {
+    let mut required: BTreeSet<AccountKey> = needed_providers(config, default).into_iter().map(|id| AccountKey::new(id, config.default_account_of(id))).collect();
+    for p in config.profiles.values() {
+        let id = select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&config.default_model), default);
+        required.insert(AccountKey::new(id, p.account.as_deref().unwrap_or_else(|| config.default_account_of(id))));
+    }
+    required.retain(|k| k.provider != "faux");
+    required
+}
+
+/// 加载结果：成功的 provider 实例 + 失败的可选账号。
+pub(crate) struct LoadedProviders {
+    pub providers: BTreeMap<AccountKey, Arc<dyn Provider>>,
+    pub unavailable: BTreeMap<AccountKey, String>,
+}
+
+fn load_providers(
+    config: &Config,
+    default: &str,
+    files: KeyFiles<'_>,
+    issues: &Reporter,
+    getenv: impl Fn(&str) -> Option<String>,
+    keychain: &dyn KeychainReader,
+    managed: &ManagedStore,
+) -> Result<LoadedProviders> {
+    crate::config::validate_provider(default)?;
+    let required = required_accounts(config, default);
+    // 例如 CLI --provider 改变了 profile 解析出的 provider，而 profile.account 只在原 provider 下定义
+    if let Some(missing) = required.iter().find(|k| !config.provider_accounts(&k.provider).contains_key(&k.account)) {
+        bail!("account '{}' is not configured for provider {}", missing.account, missing.provider);
+    }
+    let mut providers: BTreeMap<AccountKey, Arc<dyn Provider>> = BTreeMap::new();
+    let mut unavailable = BTreeMap::new();
+    providers.insert(AccountKey::from("faux"), Arc::new(FauxProvider));
     for pk in agent_ai::secrets::PROVIDER_KEYS {
         let id = pk.provider;
-        let cli_file = if id == "openai" { files.openai } else { files.anthropic };
-        let settings = config.providers.get(id);
-        let config_file = settings.and_then(|p| p.api_key_file.as_deref()).or_else(|| if id == "openai" { config.api_key_file.as_deref() } else { None });
-        let present = cli_file.is_some() || config_file.is_some() || [pk.env, pk.file_env].iter().any(|var| getenv(var).is_some_and(|s| !s.trim().is_empty()));
-        if !present && !needed.contains(id) {
-            tracing::debug!(provider = id, "provider not configured; skipping");
-            continue;
+        // 启动时一次性加载所有配置的账号（不懒加载）
+        for (name, account) in config.provider_accounts(id) {
+            let key_id = AccountKey::new(id, &name);
+            let is_required = required.contains(&key_id);
+            let spec = account_key_spec(pk, &name, &account, files, managed);
+            // 不为判定“是否配置”去探测受管存储/Keychain：default 账号只有 required 或声明了来源时才加载
+            if name == DEFAULT_ACCOUNT && !is_required && !spec.has_explicit_source(&getenv) {
+                tracing::debug!(provider = id, account = %name, "account not configured; skipping");
+                continue;
+            }
+            match load_account_key(&spec, &getenv, keychain) {
+                Ok((key, source)) => {
+                    issues.add_secret(key.expose().to_owned());
+                    tracing::info!(provider = id, account = %name, key_source = %source, "api key loaded");
+                    providers.insert(key_id, build_provider(config, id, &name, &account, key, &getenv));
+                }
+                Err(KeyLoadError::NotFound(_)) if is_required && name == DEFAULT_ACCOUNT => bail!(not_configured(id)),
+                Err(e) if is_required => return Err(key_load_error(e)),
+                Err(e) => {
+                    let reason = match &e {
+                        KeyLoadError::NotFound(_) => "not_found",
+                        KeyLoadError::Source(_) => "source_error",
+                        KeyLoadError::Keychain(_) => "keychain",
+                    };
+                    tracing::warn!(provider = id, account = %name, error = %e, "account unavailable");
+                    issues.report(
+                        IssueEvent::new(Severity::Warn, "account_unavailable", "config", format!("Account {} could not be loaded; requests selecting it will fail", key_id.label()))
+                            .scope(IssueScope { provider: Some(id.into()), account: Some(name.clone()), ..Default::default() })
+                            .details(serde_json::json!({"provider": id, "account": name, "reason": reason})),
+                    );
+                    unavailable.insert(key_id, e.to_string());
+                }
+            }
         }
-        anyhow::ensure!(present, "{}", not_configured(id));
-        let (key, source) = agent_ai::secrets::load_provider_key(pk, cli_file, config_file, &getenv).map_err(anyhow::Error::msg)?;
-        issues.add_secret(key.expose().to_owned());
-        tracing::info!(provider = id, key_source = %source, "api key loaded");
-        let base_url = getenv(&format!("{}_BASE_URL", id.to_ascii_uppercase())).filter(|s| !s.trim().is_empty()).or_else(|| settings.and_then(|p| p.base_url.clone()));
-        let timeout = Duration::from_secs(config.stream_idle_timeout_secs);
-        let provider: Arc<dyn Provider> = match id {
-            "openai" => Arc::new(OpenAiProvider::with_stream_idle_timeout(key, base_url, timeout)),
-            "anthropic" => Arc::new(AnthropicProvider::with_stream_idle_timeout(key, base_url, timeout)),
-            _ => unreachable!("known provider key"),
-        };
-        providers.insert(id.into(), provider);
     }
-    Ok(providers)
+    Ok(LoadedProviders { providers, unavailable })
 }
 
 impl Hub {
     /// In-memory journals for standalone commands; session history remains independently configurable.
-    /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
+    /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_account_key`。
     pub fn new(config: Config, provider_name: &str, session_dir: Option<PathBuf>, openai_key_file: Option<&std::path::Path>) -> Result<Arc<Self>> {
         Self::with_reporter(config, provider_name, session_dir, openai_key_file, crate::issues::global().unwrap_or_else(Reporter::noop), StoreMode::Memory)
     }
@@ -736,7 +875,7 @@ impl Hub {
 
     pub fn with_provider_keys(config: Config, provider_name: &str, session_dir: Option<PathBuf>, files: KeyFiles<'_>, issues: Arc<Reporter>, store_mode: StoreMode) -> Result<Arc<Self>> {
         config.validate()?;
-        let providers = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok())?;
+        let LoadedProviders { providers, unavailable } = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok(), &SystemKeychain, &ManagedStore::system())?;
         let registry = ToolRegistry::with_builtins();
         let store = match store_mode {
             StoreMode::Memory => crate::store::Store::memory(),
@@ -778,6 +917,8 @@ impl Hub {
             store,
             config,
             providers,
+            unavailable,
+            cooldowns: Default::default(),
             default_provider: provider_name.into(),
             registry,
             session_dir,
@@ -961,13 +1102,19 @@ impl Hub {
             bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
         }
         let provider_id = provider_id.as_str();
-        let provider = self.provider(provider_id)?;
+        let account = match req.account {
+            Some(a) if !self.account_allowed(p, provider_id, &a) => bail!(AccountNotAllowed { account: a, profile: profile_name }),
+            Some(a) => a,
+            None => self.profile_account(p, provider_id).to_string(),
+        };
+        let provider = self.session_provider(p, provider_id, &account)?;
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
         let deep_spec = self.deep_model_spec(p, provider_id);
         let depth = req.depth.unwrap_or(if p.auto_route { Depth::Auto } else { Depth::Standard });
         let dynamic = Arc::new(SessionDynamic {
             session_id: id.clone(),
             provider_id: provider_id.into(),
+            account_key: AccountKey::new(provider_id, &account),
             provider: provider.clone(),
             model: Shared::new(model.clone()),
             reasoning: Shared::new(None),
@@ -993,6 +1140,7 @@ impl Hub {
                 profile: Some(profile_name.clone()),
                 model: Some(model.clone()),
                 provider: Some(provider_id.into()),
+                account: Some(account.clone()),
                 ..Default::default()
             }),
             last_call: Mutex::new(None),
@@ -1025,7 +1173,7 @@ impl Hub {
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
             before_run: Some(Arc::new(move |messages, emit| Box::pin(hook.clone().route_first_run(messages, emit)))),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -1035,6 +1183,7 @@ impl Hub {
             id: id.clone(),
             owner: client.name.clone(),
             profile: profile_name,
+            account,
             cwd,
             agent: Agent::new(config, vec![]),
             dynamic,
@@ -1132,21 +1281,36 @@ impl Hub {
 
     /// 实时模型列表（缓存 10 分钟）。`all=false` 时只保留可用于对话的模型并去掉日期快照。
     pub async fn list_models(&self, all: bool) -> Result<Vec<ProviderModel>> {
-        self.list_models_filtered(all, None).await
+        self.list_models_filtered(all, None, None).await
     }
 
-    pub async fn list_models_filtered(&self, all: bool, filter: Option<&str>) -> Result<Vec<ProviderModel>> {
-        if let Some(id) = filter {
-            self.provider(id)?;
+    /// `account` 需要同时给出 `provider`；不指定账号时每个 provider 只查默认账号（目录通常一致，避免 N 倍请求）。
+    pub async fn list_models_filtered(&self, all: bool, provider: Option<&str>, account: Option<&str>) -> Result<Vec<ProviderModel>> {
+        anyhow::ensure!(account.is_none() || provider.is_some(), "account filter requires provider");
+        let mut targets: Vec<AccountKey> = vec![];
+        match (provider, account) {
+            (Some(id), Some(a)) => {
+                self.provider(id, a)?;
+                targets.push(AccountKey::new(id, a));
+            }
+            _ => {
+                if let Some(id) = provider {
+                    self.provider(id, self.default_account(id))?;
+                }
+                let ids: BTreeSet<&str> = self.providers.keys().map(|k| k.provider.as_str()).filter(|id| provider.is_none_or(|f| f == *id)).collect();
+                for id in ids {
+                    let default = AccountKey::new(id, self.default_account(id));
+                    let key = if self.providers.contains_key(&default) { default } else { self.providers.keys().find(|k| k.provider == id).cloned().expect("loaded provider") };
+                    targets.push(key);
+                }
+            }
         }
         let mut result = vec![];
-        for (id, provider) in &self.providers {
-            if filter.is_some_and(|f| f != id) {
-                continue;
-            }
-            for model in &cached_models(&self.models_cache, id, &**provider).await? {
-                if all || id != "openai" || (agent_ai::models::is_chat_model(&model.id) && !agent_ai::models::is_snapshot(&model.id)) {
-                    result.push(ProviderModel { provider: id.clone(), model: model.clone() });
+        for key in targets {
+            let provider = &self.providers[&key];
+            for model in &cached_models(&self.models_cache, &key, &**provider).await? {
+                if all || key.provider != "openai" || (agent_ai::models::is_chat_model(&model.id) && !agent_ai::models::is_snapshot(&model.id)) {
+                    result.push(ProviderModel { provider: key.provider.clone(), account: key.account.clone(), model: model.clone() });
                 }
             }
         }
@@ -1164,9 +1328,100 @@ impl Hub {
         }
     }
 
-    pub fn provider(&self, id: &str) -> Result<Arc<dyn Provider>> {
+    /// 已加载的 (provider, account) 实例。错误信息只说明请求的账号本身，不列出其它账号、不含启动错误细节。
+    pub fn provider(&self, id: &str, account: &str) -> Result<Arc<dyn Provider>> {
         crate::config::validate_provider(id)?;
-        self.providers.get(id).cloned().ok_or_else(|| anyhow::anyhow!(not_configured(id)))
+        let key = AccountKey::new(id, account);
+        if let Some(p) = self.providers.get(&key) {
+            return Ok(p.clone());
+        }
+        if self.unavailable.contains_key(&key) {
+            bail!("account '{account}' of provider {id} is unavailable (it failed to load at startup; see server logs)");
+        }
+        if account == self.default_account(id) && !self.providers.keys().any(|k| k.provider == id) {
+            bail!(not_configured(id));
+        }
+        bail!("account '{account}' is not configured for provider {id}")
+    }
+
+    /// provider 的默认账号（providers.<id>.defaultAccount，缺省 "default"）。
+    pub fn default_account(&self, id: &str) -> &str {
+        self.config.default_account_of(id)
+    }
+
+    /// 该 provider 已加载的账号名（排序）。
+    pub fn accounts_of(&self, id: &str) -> Vec<String> {
+        self.providers.keys().filter(|k| k.provider == id).map(|k| k.account.clone()).collect()
+    }
+
+    /// profile 在该 provider 下的默认账号：profile.account 只对 profile 自己的 provider 生效，其它 provider 用其默认账号。
+    pub fn profile_account<'a>(&'a self, p: &'a Profile, provider_id: &str) -> &'a str {
+        match &p.account {
+            Some(a) if self.profile_provider(p) == provider_id => a,
+            _ => self.default_account(provider_id),
+        }
+    }
+
+    /// 调用方能否为该 profile 选择此账号：自身账号总是允许；allowedAccounts 只对 profile 自己的 provider 生效；
+    /// `*` = 该 provider 所有已加载账号。未知账号与不允许的账号同样返回 false（不泄露账号是否存在）。
+    pub fn account_allowed(&self, p: &Profile, provider_id: &str, account: &str) -> bool {
+        if account == self.profile_account(p, provider_id) {
+            return true;
+        }
+        if self.profile_provider(p) != provider_id {
+            return false;
+        }
+        match &p.allowed_accounts {
+            Some(list) if list.iter().any(|a| a == "*") => self.providers.contains_key(&AccountKey::new(provider_id, account)),
+            Some(list) => list.iter().any(|a| a == account),
+            None => false,
+        }
+    }
+
+    /// /v1/profiles 展示用：`None` 展开为 `[account]`，`*` 展开为该 provider 已加载的账号。
+    pub fn allowed_accounts(&self, p: &Profile) -> Vec<String> {
+        let id = self.profile_provider(p);
+        let own = self.profile_account(p, id).to_string();
+        match &p.allowed_accounts {
+            None => vec![own],
+            Some(list) if list.iter().any(|a| a == "*") => {
+                let mut all = self.accounts_of(id);
+                if !all.contains(&own) {
+                    all.insert(0, own);
+                }
+                all
+            }
+            Some(list) => list.clone(),
+        }
+    }
+
+    /// failover 链（不含主账号）：profile.fallbackAccounts（profile 自己的 provider）> 账号级 fallbackAccounts。
+    pub fn fallback_accounts(&self, p: &Profile, provider_id: &str, account: &str) -> Vec<String> {
+        let configured = match &p.fallback_accounts {
+            Some(list) if self.profile_provider(p) == provider_id => list.clone(),
+            _ => self.config.account_config(provider_id, account).map(|a| a.fallback_accounts).unwrap_or_default(),
+        };
+        let mut chain: Vec<String> = vec![];
+        for a in configured {
+            if a != account && !chain.contains(&a) {
+                chain.push(a);
+            }
+        }
+        chain
+    }
+
+    /// 会话使用的 provider：主账号 + 已加载的 fallback 账号，包成 [`FailoverProvider`]（链长 1 时只负责给消息标注账号）。
+    fn session_provider(&self, p: &Profile, provider_id: &str, account: &str) -> Result<Arc<dyn Provider>> {
+        let mut chain = vec![AccountSlot { key: AccountKey::new(provider_id, account), provider: self.provider(provider_id, account)? }];
+        for name in self.fallback_accounts(p, provider_id, account) {
+            let key = AccountKey::new(provider_id, &name);
+            match self.providers.get(&key) {
+                Some(provider) => chain.push(AccountSlot { key, provider: provider.clone() }),
+                None => tracing::debug!(provider = provider_id, account = %name, "fallback account not loaded; skipped"),
+            }
+        }
+        let cooldown = self.config.providers.get(provider_id).and_then(|c| c.failover_cooldown_secs).unwrap_or(crate::config::DEFAULT_FAILOVER_COOLDOWN_SECS);
+        Ok(Arc::new(FailoverProvider::new(chain, self.cooldowns.clone(), Duration::from_secs(cooldown))))
     }
 
     pub fn profile_provider<'a>(&'a self, p: &'a Profile) -> &'a str {
@@ -1197,7 +1452,7 @@ impl Hub {
     /// 会话视图（POST/GET/PATCH /v1/sessions）。
     pub fn session_view(&self, h: &SessionHandle) -> serde_json::Value {
         let mut view = serde_json::json!({
-            "sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "provider": h.provider_id(), "model": h.model(),
+            "sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "provider": h.provider_id(), "account": h.account, "model": h.model(),
             "api": h.effective_api().map(|a| a.as_str()).unwrap_or_else(|| self.effective_api(&h.agent.config)),
             "isStreaming": h.agent.is_running(),
             "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
@@ -1214,6 +1469,7 @@ impl Hub {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use agent_ai::keychain::{mock::MockKeychain, KeychainError};
 
     fn config() -> Config {
         let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
@@ -1235,12 +1491,17 @@ pub(crate) mod tests {
         }
     }
 
+    fn names(loaded: &LoadedProviders) -> Vec<String> {
+        loaded.providers.keys().map(AccountKey::label).collect()
+    }
+
     #[test]
     fn needed_keys_fail_and_unneeded_providers_are_skipped() {
         let mut cfg = config();
-        let load = |cfg: &Config, default| load_providers(cfg, default, KeyFiles::default(), &Reporter::noop(), |_| None);
+        let kc = MockKeychain::default();
+        let load = |cfg: &Config, default| load_providers(cfg, default, KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None);
         assert!(load(&cfg, "openai").err().unwrap().to_string().contains("provider openai is not configured"));
-        assert_eq!(load(&cfg, "faux").unwrap().keys().cloned().collect::<Vec<_>>(), ["faux"]);
+        assert_eq!(names(&load(&cfg, "faux").unwrap()), ["faux/default"]);
         cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
         assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
         cfg.profiles.get_mut("default").unwrap().provider = None;
@@ -1255,18 +1516,70 @@ pub(crate) mod tests {
     async fn optional_keys_load_and_all_loaded_keys_are_redacted() {
         let cfg = config();
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
-        let providers = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, |var| match var {
-            "OPENAI_API_KEY" => Some("test-openai-value".into()),
-            "ANTHROPIC_API_KEY" => Some("test-anthropic-value".into()),
-            _ => None,
-        })
+        let providers = load_providers(
+            &cfg,
+            "faux",
+            KeyFiles::default(),
+            &reporter,
+            |var| match var {
+                "OPENAI_API_KEY" => Some("test-openai-value".into()),
+                "ANTHROPIC_API_KEY" => Some("test-anthropic-value".into()),
+                _ => None,
+            },
+            &MockKeychain::default(),
+            &ManagedStore::None,
+        )
         .unwrap();
-        assert_eq!(providers.len(), 3);
+        assert_eq!(names(&providers), ["anthropic/default", "faux/default", "openai/default"]);
         reporter.report(IssueEvent::new(Severity::Error, "llm_auth", "llm", "test-anthropic-value test-openai-value").details(serde_json::json!({"diagnostic": "test-anthropic-value"})));
         reporter.flush(Duration::from_secs(1)).await;
         let events = reporter.recent(None, 0, 100);
         assert_eq!(events[0].message, "[redacted] [redacted]");
         assert_eq!(events[0].details["diagnostic"], "[redacted]");
+    }
+
+    #[tokio::test]
+    async fn keychain_and_managed_sources_load_and_are_redacted() {
+        let mut cfg = config();
+        cfg.providers.insert("anthropic".into(), crate::config::ProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let kc = MockKeychain::with([(("sub-bot", "anthropic/default"), Ok("test-keychain-value")), (("sub-bot", "openai/default"), Ok("test-managed-value"))]);
+        // anthropic：配置声明的 keychain；openai：needed（默认 provider）且只有受管 Keychain 条目
+        let providers = load_providers(&cfg, "openai", KeyFiles::default(), &reporter, |_| None, &kc, &ManagedStore::Keychain { service: "sub-bot".into() }).unwrap();
+        assert_eq!(names(&providers), ["anthropic/default", "faux/default", "openai/default"]);
+        reporter.report(IssueEvent::new(Severity::Error, "llm_auth", "llm", "test-keychain-value test-managed-value"));
+        reporter.flush(Duration::from_secs(1)).await;
+        assert_eq!(reporter.recent(None, 0, 100)[0].message, "[redacted] [redacted]");
+        // 未 needed 且只有受管条目的 provider 不会被探测
+        let providers = load_providers(&config(), "faux", KeyFiles::default(), &reporter, |_| None, &kc, &ManagedStore::Keychain { service: "sub-bot".into() }).unwrap();
+        assert_eq!(names(&providers), ["faux/default"]);
+    }
+
+    #[test]
+    fn keychain_failures_fail_startup_with_typed_error() {
+        let mut cfg = config();
+        cfg.providers.insert("anthropic".into(), crate::config::ProviderConfig { api_key_keychain: Some(Default::default()), ..Default::default() });
+        // anthropic 被 profile 使用 ⇒ 其默认账号是 required
+        cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        let locked = KeychainError::InteractionNotAllowed { service: "sub-bot".into(), account: "anthropic/default".into() };
+        let kc = MockKeychain::with([(("sub-bot", "anthropic/default"), Err(locked.clone()))]);
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None).err().unwrap();
+        assert_eq!(e.downcast_ref::<KeychainError>(), Some(&locked));
+        // 配置声明的条目不存在 ⇒ 报 keychain not found，而不是回落
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), |_| None, &MockKeychain::default(), &ManagedStore::None).err().unwrap();
+        assert_eq!(e.to_string(), "keychain item not found (service=sub-bot, account=anthropic/default)");
+        // 没有 profile 使用 anthropic ⇒ 可选：不阻止启动，标记 unavailable
+        cfg.profiles.get_mut("default").unwrap().provider = None;
+        let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &ManagedStore::None).unwrap();
+        assert_eq!(names(&loaded), ["faux/default"]);
+        assert!(loaded.unavailable.contains_key(&AccountKey::from("anthropic")));
+        // needed provider 的受管存储锁定 ⇒ 报 keychain 错误；未找到 ⇒ not configured
+        let kc = MockKeychain::with([(("sub-bot", "openai/default"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "openai/default".into() }))]);
+        let managed = ManagedStore::Keychain { service: "sub-bot".into() };
+        let e = load_providers(&config(), "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &kc, &managed).err().unwrap();
+        assert!(matches!(e.downcast_ref::<KeychainError>(), Some(KeychainError::Denied { .. })));
+        let e = load_providers(&config(), "openai", KeyFiles::default(), &Reporter::noop(), |_| None, &MockKeychain::default(), &managed).err().unwrap();
+        assert_eq!(e.to_string(), not_configured("openai"));
     }
 
     struct CatalogProvider(&'static str);
@@ -1296,8 +1609,8 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&models).unwrap();
         assert_eq!(json[0]["provider"], "anthropic");
         assert_eq!(json[0]["id"], "gpt-4.1");
-        assert_eq!(hub.list_models_filtered(true, Some("openai")).await.unwrap().len(), 3);
-        assert_eq!(hub.list_models_filtered(false, Some("faux")).await.unwrap().len(), 1);
+        assert_eq!(hub.list_models_filtered(true, Some("openai"), None).await.unwrap().len(), 3);
+        assert_eq!(hub.list_models_filtered(false, Some("faux"), None).await.unwrap().len(), 1);
         let h = hub.create_session(&hub.config.clients[0], SessionRequest { provider: Some("anthropic".into()), model: Some("gpt-4.1".into()), ..Default::default() }).unwrap();
         assert_eq!(h.agent.config.provider.id(), "anthropic");
         assert_eq!(h.agent.config.reasoning.get(), Some(ThinkingLevel::High));
@@ -1339,7 +1652,7 @@ pub(crate) mod tests {
         }
     }
 
-    type Seen = Arc<Mutex<Vec<agent_ai::Request>>>;
+    pub(crate) type Seen = Arc<Mutex<Vec<agent_ai::Request>>>;
 
     /// default profile 走 anthropic（记录请求的 faux 实现），issues 可查询。
     fn claude_hub(models: Vec<&'static str>, edit: impl FnOnce(&mut Profile)) -> (Arc<Hub>, Seen) {
@@ -2211,5 +2524,265 @@ pub(crate) mod tests {
         assert!(finished > old);
         assert_eq!(hub.evict_idle(finished + Duration::from_secs(10)), 0);
         assert_eq!(hub.evict_idle(finished + Duration::from_secs(11)), 1);
+    }
+
+    /// 记录所有 span 创建字段与事件字段（含 INFO），用于检查日志里有账号名、没有 key。
+    #[derive(Clone, Default)]
+    struct AllFields(Arc<Mutex<Vec<String>>>);
+
+    struct Collect(String);
+    impl tracing::field::Visit for Collect {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {}={value}", field.name()));
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {}={value:?}", field.name()));
+        }
+    }
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> tracing_subscriber::Layer<S> for AllFields {
+        fn on_new_span(&self, attrs: &tracing::span::Attributes<'_>, _: &tracing::span::Id, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut c = Collect(format!("span:{}", attrs.metadata().name()));
+            attrs.record(&mut c);
+            self.0.lock().unwrap().push(c.0);
+        }
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut c = Collect("event:".into());
+            event.record(&mut c);
+            self.0.lock().unwrap().push(c.0);
+        }
+    }
+
+    fn capture_all() -> (AllFields, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = AllFields::default();
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        (capture, guard)
+    }
+
+    fn account(fields: serde_json::Value) -> crate::config::AccountConfig {
+        serde_json::from_value(fields).unwrap()
+    }
+
+    fn openai_accounts(accounts: &[(&str, serde_json::Value)]) -> crate::config::ProviderConfig {
+        crate::config::ProviderConfig { accounts: accounts.iter().map(|(n, v)| (n.to_string(), account(v.clone()))).collect(), ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn loads_all_declared_accounts_with_required_and_optional_rules() {
+        let mut cfg = config();
+        cfg.providers.insert(
+            "openai".into(),
+            openai_accounts(&[
+                ("work", serde_json::json!({"apiKeyEnv": "TEST_OPENAI_KEY_WORK", "organization": "org_1"})),
+                ("proxy", serde_json::json!({"apiKeyEnv": "TEST_OPENAI_KEY_PROXY", "baseUrl": "http://localhost:9/v1"})),
+                ("broken", serde_json::json!({"apiKeyEnv": "TEST_OPENAI_KEY_BROKEN"})),
+            ]),
+        );
+        let env = |var: &str| match var {
+            "OPENAI_API_KEY" => Some("test-default-secret".into()),
+            "TEST_OPENAI_KEY_WORK" => Some("test-work-secret".into()),
+            "TEST_OPENAI_KEY_PROXY" => Some("test-proxy-secret".into()),
+            _ => None,
+        };
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let (logs, guard) = capture_all();
+        let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, env, &MockKeychain::default(), &ManagedStore::None).unwrap();
+        drop(guard);
+        // 一次性加载全部声明的账号；失败的可选账号只 warn
+        assert_eq!(names(&loaded), ["faux/default", "openai/default", "openai/proxy", "openai/work"]);
+        assert_eq!(loaded.unavailable.keys().map(AccountKey::label).collect::<Vec<_>>(), ["openai/broken"]);
+        let logs = logs.0.lock().unwrap().clone();
+        let loaded_logs: Vec<_> = logs.iter().filter(|l| l.contains("api key loaded")).collect();
+        assert_eq!(loaded_logs.len(), 3, "{logs:?}");
+        assert!(loaded_logs.iter().any(|l| l.contains("account=work") && l.contains("key_source=env TEST_OPENAI_KEY_WORK")), "{loaded_logs:?}");
+        assert!(logs.iter().any(|l| l.contains("account unavailable") && l.contains("account=broken")), "{logs:?}");
+        assert!(!logs.iter().any(|l| l.contains("-secret")), "{logs:?}");
+        reporter.report(IssueEvent::new(Severity::Error, "llm_auth", "llm", "test-default-secret test-work-secret test-proxy-secret"));
+        reporter.flush(Duration::from_secs(1)).await;
+        let events = reporter.recent(None, 0, 100);
+        assert_eq!(events.iter().find(|e| e.kind == "llm_auth").unwrap().message, "[redacted] [redacted] [redacted]");
+        let unavailable = events.iter().find(|e| e.kind == "account_unavailable").expect("account_unavailable issue");
+        assert_eq!(unavailable.severity, Severity::Warn);
+        assert_eq!((unavailable.scope.provider.as_deref(), unavailable.scope.account.as_deref()), (Some("openai"), Some("broken")));
+        assert_eq!(unavailable.details, serde_json::json!({"provider": "openai", "account": "broken", "reason": "source_error"}));
+        let json = serde_json::to_string(&events).unwrap();
+        assert!(json.contains(r#""account":"broken""#) && !json.contains("-secret"), "{json}");
+        // 被 profile 作为 account 引用 ⇒ required：失败即启动失败
+        let profile = cfg.profiles.get_mut("default").unwrap();
+        profile.provider = Some("openai".into());
+        profile.account = Some("broken".into());
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), env, &MockKeychain::default(), &ManagedStore::None).err().unwrap();
+        assert_eq!(e.to_string(), "OpenAI API key env TEST_OPENAI_KEY_BROKEN is not set");
+        // required 账号在该 provider 下根本没有配置（profile 解析到了别的 provider）
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), env, &MockKeychain::default(), &ManagedStore::None);
+        assert!(e.is_err());
+        let mut other = cfg.clone();
+        other.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        let e = load_providers(&other, "faux", KeyFiles::default(), &Reporter::noop(), env, &MockKeychain::default(), &ManagedStore::None).err().unwrap();
+        assert_eq!(e.to_string(), "account 'broken' is not configured for provider anthropic");
+        // 命名账号不看 OPENAI_API_KEY / CLI 文件：未声明来源 + 无受管条目 ⇒ not found
+        cfg.providers.insert("openai".into(), openai_accounts(&[("work", serde_json::json!({}))]));
+        cfg.profiles.get_mut("default").unwrap().account = Some("work".into());
+        let e = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), env, &MockKeychain::default(), &ManagedStore::None).err().unwrap();
+        assert!(e.to_string().starts_with("OpenAI API key not found for account 'work'"), "{e}");
+        // 受管 Keychain 条目 sub-bot / openai/work
+        let kc = MockKeychain::with([(("sub-bot", "openai/work"), Ok("test-managed-work"))]);
+        let loaded = load_providers(&cfg, "faux", KeyFiles::default(), &Reporter::noop(), env, &kc, &ManagedStore::Keychain { service: "sub-bot".into() }).unwrap();
+        assert_eq!(names(&loaded), ["faux/default", "openai/default", "openai/work"]);
+        // defaultAccount 指向命名账号时它是 needed provider 的必需账号
+        let mut cfg = config();
+        cfg.providers.insert("openai".into(), crate::config::ProviderConfig { default_account: Some("work".into()), ..openai_accounts(&[("work", serde_json::json!({}))]) });
+        assert_eq!(required_accounts(&cfg, "openai").into_iter().map(|k| k.label()).collect::<Vec<_>>(), ["openai/work"]);
+    }
+
+    /// openai 多账号 hub：账号 default / work / proxy 已加载（RecordingProvider），backup 配置了但“加载失败”。
+    pub(crate) fn multi_hub(edit: impl FnOnce(&mut Profile)) -> (Arc<Hub>, BTreeMap<&'static str, Seen>) {
+        let mut hub = Hub::new(config(), "faux", None, None).unwrap();
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        inner.issues = Reporter::new(&inner.config.alerts, None, vec![]);
+        // 隔离测试环境：Hub::new 可能从真实环境变量（如 ANTHROPIC_API_KEY）加载了其它 provider
+        inner.providers.retain(|k, _| k.provider == "faux");
+        inner.config.providers.insert("openai".into(), openai_accounts(&[("work", serde_json::json!({})), ("proxy", serde_json::json!({})), ("backup", serde_json::json!({}))]));
+        let mut seen = BTreeMap::new();
+        for (name, models) in [("default", vec!["gpt-deep-1"]), ("work", vec!["gpt-deep-2"]), ("proxy", vec!["gpt-deep-3"])] {
+            let s = Seen::default();
+            inner.providers.insert(AccountKey::new("openai", name), Arc::new(RecordingProvider { id: "openai", seen: s.clone(), models }));
+            seen.insert(name, s);
+        }
+        inner.unavailable.insert(AccountKey::new("openai", "backup"), "cannot read /private/startup-detail".into());
+        let profile = inner.config.profiles.get_mut("default").unwrap();
+        profile.provider = Some("openai".into());
+        profile.model = Some("gpt-4.1".into());
+        edit(profile);
+        (hub, seen)
+    }
+
+    #[tokio::test]
+    async fn session_account_selection_and_allowed_accounts() {
+        let req = |account: &str| SessionRequest { account: Some(account.into()), ..Default::default() };
+        let (hub, seen) = multi_hub(|_| {});
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        assert_eq!(h.account, "default");
+        assert_eq!(hub.session_view(&h)["account"], "default");
+        assert_eq!(h.scope().account.as_deref(), Some("default"));
+        // 缺省只允许自身账号；未知账号与不允许的账号同样是 AccountNotAllowed
+        for name in ["work", "ghost"] {
+            let e = hub.create_session(client, req(name)).err().unwrap();
+            assert!(e.is::<AccountNotAllowed>());
+            assert_eq!(e.to_string(), format!("account '{name}' is not allowed in profile 'default' (allowedAccounts)"));
+        }
+        assert_eq!(hub.allowed_accounts(&hub.config.profiles["default"]), ["default"]);
+
+        let (hub, seen_work) = multi_hub(|p| {
+            p.account = Some("work".into());
+            p.allowed_accounts = Some(vec!["work".into(), "default".into(), "backup".into()]);
+        });
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        assert_eq!(h.account, "work");
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(seen_work["work"].lock().unwrap().len(), 1);
+        let last = h.agent.messages().await.into_iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).unwrap();
+        assert_eq!(last.account.as_deref(), Some("work"));
+        assert_eq!(hub.create_session(client, req("default")).unwrap().account, "default");
+        assert!(hub.create_session(client, req("proxy")).err().unwrap().is::<AccountNotAllowed>());
+        // 允许但启动时加载失败：普通 400 错误，不含启动错误细节
+        let e = hub.create_session(client, req("backup")).err().unwrap();
+        assert!(!e.is::<AccountNotAllowed>());
+        assert_eq!(e.to_string(), "account 'backup' of provider openai is unavailable (it failed to load at startup; see server logs)");
+        // 其它 provider：profile.account 不适用，只允许该 provider 的默认账号
+        assert!(hub.create_session(client, SessionRequest { provider: Some("faux".into()), account: Some("work".into()), ..Default::default() }).err().unwrap().is::<AccountNotAllowed>());
+        assert_eq!(hub.create_session(client, SessionRequest { provider: Some("faux".into()), ..Default::default() }).unwrap().account, "default");
+
+        let (hub, _) = multi_hub(|p| p.allowed_accounts = Some(vec!["*".into()]));
+        let client = &hub.config.clients[0];
+        assert_eq!(hub.create_session(client, req("proxy")).unwrap().account, "proxy");
+        for name in ["ghost", "backup"] {
+            assert!(hub.create_session(client, req(name)).err().unwrap().is::<AccountNotAllowed>(), "{name}");
+        }
+        assert_eq!(hub.allowed_accounts(&hub.config.profiles["default"]), ["default", "proxy", "work"]);
+        drop(seen);
+    }
+
+    #[tokio::test]
+    async fn models_cache_is_per_account() {
+        let (hub, _) = multi_hub(|_| {});
+        let ids = |list: Vec<ProviderModel>| list.into_iter().map(|m| format!("{}/{}:{}", m.provider, m.account, m.model.id)).collect::<Vec<_>>();
+        assert_eq!(ids(hub.list_models_filtered(true, Some("openai"), Some("work")).await.unwrap()), ["openai/work:gpt-deep-2"]);
+        assert_eq!(ids(hub.list_models_filtered(true, Some("openai"), None).await.unwrap()), ["openai/default:gpt-deep-1"]);
+        // 不指定账号：每个 provider 只查默认账号
+        assert_eq!(ids(hub.list_models_filtered(true, None, None).await.unwrap()), ["faux/default:faux", "openai/default:gpt-deep-1"]);
+        let keys: Vec<_> = hub.models_cache.lock().await.keys().map(AccountKey::label).collect();
+        assert_eq!(keys, ["faux/default", "openai/default", "openai/work"]);
+        assert_eq!(hub.list_models_filtered(true, None, Some("work")).await.unwrap_err().to_string(), "account filter requires provider");
+        assert_eq!(hub.list_models_filtered(true, Some("openai"), Some("ghost")).await.unwrap_err().to_string(), "account 'ghost' is not configured for provider openai");
+        // 会话的 latest: 别名按会话账号的目录解析
+        let (hub, _) = multi_hub(|p| {
+            p.account = Some("work".into());
+            p.deep_model = Some("latest:gpt-deep".into());
+        });
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { model: None, depth: Some(Depth::Deep), ..Default::default() }).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(h.routing().model, "gpt-deep-2");
+    }
+
+    /// 总是以 429 insufficient_quota 结束的 provider。
+    struct QuotaProvider(Arc<Mutex<usize>>);
+    impl Provider for QuotaProvider {
+        fn id(&self) -> &str {
+            "openai"
+        }
+        fn stream(&self, req: agent_ai::Request, _: tokio_util::sync::CancellationToken) -> agent_ai::EventStream {
+            *self.0.lock().unwrap() += 1;
+            let error = r#"OpenAI HTTP 429 Too Many Requests (chat API): {"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#;
+            Box::pin(futures::stream::iter([agent_ai::AssistantEvent::Error { message: agent_ai::AssistantMessage::failed(&req.model, agent_ai::StopReason::Error, error) }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn failover_switches_account_reports_issue_and_tags_messages() {
+        let (mut hub, seen) = multi_hub(|p| p.account = Some("work".into()));
+        let calls = Arc::new(Mutex::new(0));
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        inner.providers.insert(AccountKey::new("openai", "work"), Arc::new(QuotaProvider(calls.clone())));
+        // 账号级 fallbackAccounts（profile 未设置 fallbackAccounts）；backup 未加载被跳过
+        inner.config.providers.get_mut("openai").unwrap().accounts.get_mut("work").unwrap().fallback_accounts = vec!["backup".into(), "default".into()];
+        inner.config.providers.get_mut("openai").unwrap().failover_cooldown_secs = Some(3600);
+        let client = hub.config.clients[0].clone();
+        let (logs, guard) = capture_all();
+        let h = hub.create_session(&client, SessionRequest::default()).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        drop(guard);
+        let last = h.agent.messages().await.into_iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).unwrap();
+        assert_eq!((last.account.as_deref(), last.text().as_str(), last.error_message.as_deref()), (Some("default"), "echo: hello", None));
+        assert_eq!((*calls.lock().unwrap(), seen["default"].lock().unwrap().len()), (1, 1));
+        assert_eq!(h.account, "work");
+        hub.issues.flush(Duration::from_secs(2)).await;
+        let issues = hub.issues.recent(Some("default"), 0, 100);
+        let failover: Vec<_> = issues.iter().filter(|e| e.kind == "account_failover").collect();
+        assert_eq!(failover.len(), 1, "{issues:?}");
+        assert_eq!(failover[0].severity, Severity::Warn);
+        assert_eq!(failover[0].details, serde_json::json!({"from": "work", "to": "default", "reason": "quota", "attempt": 1}));
+        assert_eq!(failover[0].scope.account.as_deref(), Some("default"));
+        assert!(!issues.iter().any(|e| e.kind == "llm_retry"));
+        let logs = logs.0.lock().unwrap().clone();
+        assert!(logs.iter().any(|l| l.starts_with("span:session_run") && l.contains("account=work")), "{logs:?}");
+        assert!(logs.iter().any(|l| l.contains("session created") && l.contains("account=work")), "{logs:?}");
+        // 冷却期内的新会话直接从 default 开始，不再打 work
+        let h2 = hub.create_session(&client, SessionRequest::default()).unwrap();
+        prompt_and_wait(&h2, "again").await;
+        assert_eq!(*calls.lock().unwrap(), 1);
+        // 没有 fallback 的账号：错误照常上报，scope 带账号
+        let (mut hub, _) = multi_hub(|p| p.account = Some("work".into()));
+        Arc::get_mut(&mut hub).unwrap().providers.insert(AccountKey::new("openai", "work"), Arc::new(QuotaProvider(Default::default())));
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        hub.issues.flush(Duration::from_secs(2)).await;
+        let issues = hub.issues.recent(Some("default"), 0, 100);
+        let error = issues.iter().find(|e| e.kind == "llm_rate_limit").expect("rate limit issue");
+        assert_eq!(error.scope.account.as_deref(), Some("work"));
+        assert!(!issues.iter().any(|e| e.kind == "account_failover"));
     }
 }

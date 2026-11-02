@@ -73,6 +73,15 @@ pub struct Profile {
     /// 自动路由分类用的模型；默认是 profile 的基础模型。
     #[serde(default)]
     pub router_model: Option<String>,
+    /// 会话默认账号（profile 解析出的 provider 下）；缺省 = providers.<id>.defaultAccount 或 "default"
+    #[serde(default)]
+    pub account: Option<String>,
+    /// 调用方可以选择的账号；缺省只允许自身 account；`["*"]` = 该 provider 所有已加载账号
+    #[serde(default)]
+    pub allowed_accounts: Option<Vec<String>>,
+    /// 主账号 429 / 额度耗尽时依次切换的账号（覆盖账号级 fallbackAccounts）
+    #[serde(default)]
+    pub fallback_accounts: Option<Vec<String>>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -294,10 +303,89 @@ pub struct Config {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub api_key_file: Option<PathBuf>,
+    /// macOS Keychain generic password（与 apiKeyFile 二选一）；`{}` = service `sub-bot`、account `<provider>/default`
+    #[serde(default)]
+    pub api_key_keychain: Option<KeychainRef>,
+    /// provider 级 baseUrl：账号未设置 baseUrl 时使用
     pub base_url: Option<String>,
     /// 该 provider 在没有配置/请求模型时的默认模型（anthropic 默认 `claude-opus-5-5`）
     #[serde(default)]
     pub default_model: Option<String>,
+    /// 没有指定账号时使用的账号；默认 "default"
+    #[serde(default)]
+    pub default_account: Option<String>,
+    /// 命名账号；旧的 apiKeyFile / apiKeyKeychain（以及 openai 的顶层 apiKeyFile）等价于账号 "default"
+    #[serde(default)]
+    pub accounts: BTreeMap<String, AccountConfig>,
+    /// failover 后主账号的冷却时间（秒），默认 60
+    #[serde(default)]
+    pub failover_cooldown_secs: Option<u64>,
+}
+
+/// 同一 provider 下的一个账号：一份凭据 + 可选连接参数。key 来源三选一，都省略时使用受管存储（`sub-bot keys set`）。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AccountConfig {
+    pub api_key_file: Option<PathBuf>,
+    pub api_key_keychain: Option<KeychainRef>,
+    /// 账号级环境变量名（会登记到子进程剔除列表）
+    pub api_key_env: Option<String>,
+    /// 覆盖 provider 级 baseUrl
+    pub base_url: Option<String>,
+    /// 仅 openai：OpenAI-Organization 请求头
+    pub organization: Option<String>,
+    /// 仅 openai：OpenAI-Project 请求头
+    pub project: Option<String>,
+    /// 本账号 429 / 额度耗尽时依次切换的账号
+    #[serde(default)]
+    pub fallback_accounts: Vec<String>,
+}
+
+pub const DEFAULT_FAILOVER_COOLDOWN_SECS: u64 = 60;
+
+impl ProviderConfig {
+    pub fn default_account(&self) -> &str {
+        self.default_account.as_deref().unwrap_or(agent_ai::secrets::DEFAULT_ACCOUNT)
+    }
+}
+
+/// 配置里的 Keychain 条目引用；省略的字段用约定值（service `sub-bot`，account `<provider>/<account>`）。
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeychainRef {
+    pub service: Option<String>,
+    pub account: Option<String>,
+}
+
+impl KeychainRef {
+    pub const DEFAULT_SERVICE: &'static str = agent_ai::keychain::DEFAULT_SERVICE;
+
+    /// 解析为实际的 (service, account)；缺省 account = "<provider>/<account_name>"
+    pub fn resolve(&self, provider: &str, account_name: &str) -> (String, String) {
+        (self.service.clone().unwrap_or_else(|| Self::DEFAULT_SERVICE.into()), self.account.clone().unwrap_or_else(|| agent_ai::keychain::managed_account(provider, account_name)))
+    }
+
+    fn validate(&self, at: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            agent_ai::keychain::supported(),
+            "{at}: apiKeyKeychain is only supported on macOS (this build targets {}); use apiKeyFile or `sub-bot keys set` (writes a 0600 key file)",
+            std::env::consts::OS
+        );
+        for (name, value) in [("service", &self.service), ("account", &self.account)] {
+            anyhow::ensure!(value.as_ref().is_none_or(|v| !v.trim().is_empty()), "{at}: apiKeyKeychain.{name} must not be blank");
+        }
+        Ok(())
+    }
+}
+
+/// fallbackAccounts：每项必须存在于该 provider、不等于自身、不重复。
+fn check_fallbacks(at: &str, own: &str, list: &[String], accounts: &BTreeMap<String, AccountConfig>) -> anyhow::Result<()> {
+    for (i, a) in list.iter().enumerate() {
+        anyhow::ensure!(accounts.contains_key(a), "{at}: fallbackAccounts entry '{a}' is not defined in accounts");
+        anyhow::ensure!(a != own, "{at}: fallbackAccounts must not include the account itself ('{own}')");
+        anyhow::ensure!(!list[..i].contains(a), "{at}: fallbackAccounts has duplicate entry '{a}'");
+    }
+    Ok(())
 }
 
 pub fn validate_provider(id: &str) -> anyhow::Result<()> {
@@ -476,7 +564,8 @@ impl Config {
             }
         }
         for provider in cfg.providers.values_mut() {
-            if let Some(file) = &mut provider.api_key_file {
+            let files = provider.api_key_file.iter_mut().chain(provider.accounts.values_mut().filter_map(|a| a.api_key_file.as_mut()));
+            for file in files {
                 if file.is_relative() {
                     *file = path.parent().unwrap_or_else(|| Path::new(".")).join(&*file);
                 }
@@ -515,6 +604,16 @@ impl Config {
         if let (Some(top), Some(alias)) = (&self.api_key_file, self.providers.get("openai").and_then(|p| p.api_key_file.as_ref())) {
             anyhow::ensure!(top == alias, "apiKeyFile and providers.openai.apiKeyFile must match");
         }
+        for (id, provider) in &self.providers {
+            let at = format!("providers.{id}");
+            if let Some(keychain) = &provider.api_key_keychain {
+                anyhow::ensure!(id != "faux", "{at}: apiKeyKeychain is not supported for faux");
+                let file = provider.api_key_file.is_some() || (id == "openai" && self.api_key_file.is_some());
+                anyhow::ensure!(!file, "{at}: set only one of apiKeyFile / apiKeyKeychain");
+                keychain.validate(&at)?;
+            }
+            self.validate_accounts(id, provider)?;
+        }
         for mapping in &self.local_clients {
             anyhow::ensure!(
                 usize::from(mapping.uid.is_some()) + usize::from(mapping.username.is_some()) + usize::from(mapping.any) == 1,
@@ -528,6 +627,7 @@ impl Config {
         let registry = agent_tools::ToolRegistry::with_builtins();
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            self.validate_profile_accounts(name, profile)?;
             if let Some(deep) = &profile.deep_model {
                 anyhow::ensure!(!deep.trim().is_empty() && deep.strip_prefix("latest:").is_none_or(|p| !p.trim().is_empty()), "profile '{name}': deepModel must be a model id or latest:<prefix>");
             }
@@ -548,6 +648,98 @@ impl Config {
             for profile in &client.profiles {
                 anyhow::ensure!(self.profiles.contains_key(profile), "client '{}': unknown profile '{profile}'", client.name);
             }
+        }
+        Ok(())
+    }
+
+    /// provider 的完整账号表：旧字段（`providers.<id>.apiKeyFile` / `apiKeyKeychain`，openai 还有顶层 `apiKeyFile`）折叠为账号 "default"；
+    /// 总是包含 "default"（可能是空块 = 只看 CLI / 环境变量 / 受管存储）。
+    pub fn provider_accounts(&self, id: &str) -> BTreeMap<String, AccountConfig> {
+        let settings = self.providers.get(id);
+        let mut accounts = settings.map(|p| p.accounts.clone()).unwrap_or_default();
+        let default = accounts.entry(agent_ai::secrets::DEFAULT_ACCOUNT.to_string()).or_default();
+        if default.api_key_file.is_none() && default.api_key_keychain.is_none() && default.api_key_env.is_none() {
+            default.api_key_file = settings.and_then(|p| p.api_key_file.clone()).or_else(|| if id == "openai" { self.api_key_file.clone() } else { None });
+            default.api_key_keychain = settings.and_then(|p| p.api_key_keychain.clone());
+        }
+        accounts
+    }
+
+    /// 单个账号的配置（含折叠后的 default）。
+    pub fn account_config(&self, id: &str, account: &str) -> Option<AccountConfig> {
+        self.provider_accounts(id).remove(account)
+    }
+
+    /// provider 的默认账号名（未配置时 "default"）。
+    pub fn default_account_of(&self, id: &str) -> &str {
+        self.providers.get(id).map_or(agent_ai::secrets::DEFAULT_ACCOUNT, |p| p.default_account())
+    }
+
+    /// profile 解析出的 provider（按配置的 defaultProvider；与启动时 needed provider 的判定一致）。
+    pub fn profile_provider_id<'a>(&'a self, p: &'a Profile) -> &'a str {
+        crate::hub::select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&self.default_model), self.default_provider.as_deref().unwrap_or("openai"))
+    }
+
+    fn validate_accounts(&self, id: &str, provider: &ProviderConfig) -> anyhow::Result<()> {
+        let at = format!("providers.{id}");
+        if id == "faux" {
+            anyhow::ensure!(provider.accounts.is_empty() && provider.default_account.is_none(), "{at}: accounts/defaultAccount are not supported for faux");
+            return Ok(());
+        }
+        let legacy = provider.api_key_file.is_some() || provider.api_key_keychain.is_some() || (id == "openai" && self.api_key_file.is_some());
+        anyhow::ensure!(!(legacy && provider.accounts.contains_key(agent_ai::secrets::DEFAULT_ACCOUNT)), "{at}: apiKeyFile/apiKeyKeychain and accounts.default are both set; keep one");
+        for (name, account) in &provider.accounts {
+            anyhow::ensure!(agent_ai::secrets::valid_account_name(name), "{at}: invalid account name '{name}' (allowed: [A-Za-z0-9_.-]{{1,64}})");
+            let at = format!("{at}.accounts.{name}");
+            let sources = [account.api_key_file.is_some(), account.api_key_keychain.is_some(), account.api_key_env.is_some()];
+            anyhow::ensure!(sources.iter().filter(|s| **s).count() <= 1, "{at}: set only one of apiKeyFile / apiKeyKeychain / apiKeyEnv");
+            if let Some(keychain) = &account.api_key_keychain {
+                keychain.validate(&at)?;
+            }
+            if let Some(var) = &account.api_key_env {
+                let mut bytes = var.bytes();
+                let valid = bytes.next().is_some_and(|b| b.is_ascii_uppercase() || b == b'_') && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+                anyhow::ensure!(valid, "{at}: apiKeyEnv must match ^[A-Z_][A-Z0-9_]*$");
+            }
+            if account.organization.is_some() || account.project.is_some() {
+                anyhow::ensure!(id == "openai", "{at}: organization/project are only supported for openai");
+            }
+            for (field, value) in [("organization", &account.organization), ("project", &account.project), ("baseUrl", &account.base_url)] {
+                if let Some(v) = value {
+                    anyhow::ensure!(!v.trim().is_empty() && v.bytes().all(|b| b.is_ascii_graphic()), "{at}: {field} must be a non-empty string without spaces or control characters");
+                }
+            }
+        }
+        let accounts = self.provider_accounts(id);
+        let default = provider.default_account();
+        anyhow::ensure!(accounts.contains_key(default), "{at}: defaultAccount '{default}' is not defined in accounts");
+        for (name, account) in &accounts {
+            check_fallbacks(&format!("{at}.accounts.{name}"), name, &account.fallback_accounts, &accounts)?;
+        }
+        Ok(())
+    }
+
+    fn validate_profile_accounts(&self, name: &str, p: &Profile) -> anyhow::Result<()> {
+        if p.account.is_none() && p.allowed_accounts.is_none() && p.fallback_accounts.is_none() {
+            return Ok(());
+        }
+        let id = self.profile_provider_id(p);
+        let accounts = self.provider_accounts(id);
+        let at = format!("profile '{name}'");
+        let known = |a: &str| -> anyhow::Result<()> {
+            anyhow::ensure!(accounts.contains_key(a), "{at}: account '{a}' is not configured for provider {id}");
+            Ok(())
+        };
+        let own = p.account.as_deref().unwrap_or_else(|| self.default_account_of(id));
+        known(own)?;
+        if let Some(list) = &p.allowed_accounts {
+            for a in list.iter().filter(|a| *a != "*") {
+                known(a)?;
+            }
+            anyhow::ensure!(list.iter().any(|a| a == "*" || a == own), "{at}: allowedAccounts must include its own account '{own}'");
+        }
+        if let Some(list) = &p.fallback_accounts {
+            check_fallbacks(&at, own, list, &accounts)?;
         }
         Ok(())
     }
@@ -601,6 +793,9 @@ impl Config {
                 deep_model: None,
                 auto_route: false,
                 router_model: None,
+                account: None,
+                allowed_accounts: None,
+                fallback_accounts: None,
             },
         );
         Config {
@@ -946,6 +1141,55 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    fn keychain_config(providers: serde_json::Value) -> Config {
+        serde_json::from_value(serde_json::json!({"providers": providers, "profiles": {}})).unwrap()
+    }
+
+    #[test]
+    fn keychain_ref_parses_and_resolves() {
+        let cfg = keychain_config(serde_json::json!({"openai": {"apiKeyKeychain": {}}, "anthropic": {"apiKeyKeychain": {"service": "my-keys", "account": "claude-prod"}}}));
+        let openai = cfg.providers["openai"].api_key_keychain.as_ref().unwrap();
+        assert_eq!(openai.resolve("openai", "default"), ("sub-bot".to_string(), "openai/default".to_string()));
+        assert_eq!(openai.resolve("openai", "work"), ("sub-bot".to_string(), "openai/work".to_string()));
+        let anthropic = cfg.providers["anthropic"].api_key_keychain.as_ref().unwrap();
+        assert_eq!(anthropic.resolve("anthropic", "default"), ("my-keys".to_string(), "claude-prod".to_string()));
+        let unknown: Result<Config, _> = serde_json::from_value(serde_json::json!({"providers": {"openai": {"apiKeyKeychain": {"svc": "x"}}}, "profiles": {}}));
+        assert!(unknown.unwrap_err().to_string().contains("unknown field `svc`"));
+    }
+
+    #[test]
+    fn keychain_validation_conflicts() {
+        for (providers, top, expected) in [
+            (serde_json::json!({"openai": {"apiKeyKeychain": {}, "apiKeyFile": "/k"}}), None, "providers.openai: set only one of apiKeyFile / apiKeyKeychain"),
+            (serde_json::json!({"openai": {"apiKeyKeychain": {}}}), Some("/k"), "providers.openai: set only one of apiKeyFile / apiKeyKeychain"),
+            (serde_json::json!({"faux": {"apiKeyKeychain": {}}}), None, "providers.faux: apiKeyKeychain is not supported for faux"),
+        ] {
+            let mut cfg = keychain_config(providers);
+            cfg.api_key_file = top.map(PathBuf::from);
+            assert_eq!(cfg.validate().unwrap_err().to_string(), expected);
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keychain_rejected_on_non_macos() {
+        let cfg = keychain_config(serde_json::json!({"anthropic": {"apiKeyKeychain": {}}}));
+        assert_eq!(
+            cfg.validate().unwrap_err().to_string(),
+            format!("providers.anthropic: apiKeyKeychain is only supported on macOS (this build targets {}); use apiKeyFile or `sub-bot keys set` (writes a 0600 key file)", std::env::consts::OS)
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_accepted_on_macos() {
+        keychain_config(serde_json::json!({"openai": {"apiKeyKeychain": {}}, "anthropic": {"apiKeyKeychain": {"service": "s", "account": "a"}}})).validate().unwrap();
+        for field in ["service", "account"] {
+            let cfg = keychain_config(serde_json::json!({"openai": {"apiKeyKeychain": {field: " "}}}));
+            assert_eq!(cfg.validate().unwrap_err().to_string(), format!("providers.openai: apiKeyKeychain.{field} must not be blank"));
+        }
+    }
+
     #[test]
     fn api_key_file_is_relative_to_config_and_shell_env_parses() {
         let dir = std::env::temp_dir().join(format!("sub-bot-cfg-{}", std::process::id()));
@@ -965,5 +1209,171 @@ mod tests {
         assert_eq!(se.mode, agent_tools::EnvMode::Allowlist);
         assert_eq!(se.allow, vec!["CARGO_*".to_string()]);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    fn accounts_config(value: serde_json::Value) -> Config {
+        let mut value = value;
+        if value.get("profiles").is_none() {
+            value["profiles"] = serde_json::json!({});
+        }
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn accounts_parse_and_legacy_fields_fold_into_default() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-accounts-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sub-bot.json");
+        let value = serde_json::json!({
+            "apiKeyFile": "keys/openai.key",
+            "providers": {
+                "openai": {
+                    "baseUrl": "https://api.openai.com/v1",
+                    "defaultAccount": "work",
+                    "failoverCooldownSecs": 120,
+                    "accounts": {
+                        "work": {"apiKeyFile": "keys/openai-work.key", "organization": "org_abc", "project": "proj_xyz", "fallbackAccounts": ["default"]},
+                        "proxy": {"apiKeyEnv": "OPENAI_API_KEY_PROXY", "baseUrl": "http://localhost:9000/v1"},
+                        "managed": {}
+                    }
+                },
+                "anthropic": {"apiKeyFile": "/abs/anthropic.key", "accounts": {"ci": {"apiKeyFile": "keys/anthropic-ci.key"}}}
+            },
+            "profiles": {
+                "coder": {"model": "gpt-6.1-sol", "account": "work", "allowedAccounts": ["work", "proxy"], "fallbackAccounts": ["proxy"], "workspaceRoots": ["."]},
+                "any": {"provider": "anthropic", "account": "ci", "allowedAccounts": ["*"], "workspaceRoots": ["."]},
+                "plain": {"workspaceRoots": ["."]}
+            }
+        });
+        std::fs::write(&path, value.to_string()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        let openai = cfg.provider_accounts("openai");
+        assert_eq!(openai.keys().map(String::as_str).collect::<Vec<_>>(), ["default", "managed", "proxy", "work"]);
+        // 顶层 apiKeyFile ⇒ default 账号；相对路径相对于配置文件目录（账号级 apiKeyFile 同样）
+        assert_eq!(openai["default"].api_key_file.as_deref(), Some(dir.join("keys/openai.key").as_path()));
+        assert_eq!(openai["work"].api_key_file.as_deref(), Some(dir.join("keys/openai-work.key").as_path()));
+        assert_eq!((openai["work"].organization.as_deref(), openai["work"].project.as_deref()), (Some("org_abc"), Some("proj_xyz")));
+        assert_eq!(openai["work"].fallback_accounts, ["default"]);
+        assert_eq!(openai["proxy"].api_key_env.as_deref(), Some("OPENAI_API_KEY_PROXY"));
+        assert_eq!(openai["managed"], AccountConfig::default());
+        assert_eq!((cfg.default_account_of("openai"), cfg.default_account_of("anthropic"), cfg.default_account_of("faux")), ("work", "default", "default"));
+        assert_eq!(cfg.providers["openai"].failover_cooldown_secs, Some(120));
+        let anthropic = cfg.provider_accounts("anthropic");
+        assert_eq!(anthropic["default"].api_key_file.as_deref(), Some(Path::new("/abs/anthropic.key")));
+        assert_eq!(anthropic["ci"].api_key_file.as_deref(), Some(dir.join("keys/anthropic-ci.key").as_path()));
+        let coder = &cfg.profiles["coder"];
+        assert_eq!(
+            (coder.account.as_deref(), coder.allowed_accounts.as_deref(), coder.fallback_accounts.as_deref()),
+            (Some("work"), Some(&["work".to_string(), "proxy".into()][..]), Some(&["proxy".to_string()][..]))
+        );
+        assert_eq!((cfg.profiles["plain"].account.as_deref(), cfg.profiles["plain"].allowed_accounts.as_ref()), (None, None));
+        // 没有任何 provider 配置时也总有 default 账号
+        assert_eq!(accounts_config(serde_json::json!({})).provider_accounts("anthropic").keys().collect::<Vec<_>>(), ["default"]);
+        // 显式 accounts.default 与旧字段等价（只要不同时出现）
+        let explicit = accounts_config(serde_json::json!({"providers": {"openai": {"accounts": {"default": {"apiKeyFile": "/k"}}}}}));
+        explicit.validate().unwrap();
+        assert_eq!(explicit.provider_accounts("openai")["default"].api_key_file.as_deref(), Some(Path::new("/k")));
+        // 未知字段被拒绝
+        let unknown: Result<Config, _> = serde_json::from_value(serde_json::json!({"providers": {"openai": {"accounts": {"w": {"apiKey": "sk-x"}}}}, "profiles": {}}));
+        assert!(unknown.unwrap_err().to_string().contains("unknown field `apiKey`"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn validate_rejects_invalid_account_configuration() {
+        let ws = serde_json::json!(["."]);
+        for (value, expected) in [
+            (serde_json::json!({"providers": {"openai": {"accounts": {"a/b": {}}}}}), "providers.openai: invalid account name 'a/b' (allowed: [A-Za-z0-9_.-]{1,64})"),
+            (
+                serde_json::json!({"providers": {"openai": {"apiKeyFile": "/k", "accounts": {"default": {}}}}}),
+                "providers.openai: apiKeyFile/apiKeyKeychain and accounts.default are both set; keep one",
+            ),
+            (
+                serde_json::json!({"apiKeyFile": "/k", "providers": {"openai": {"accounts": {"default": {"apiKeyFile": "/k"}}}}}),
+                "providers.openai: apiKeyFile/apiKeyKeychain and accounts.default are both set; keep one",
+            ),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"work": {"apiKeyFile": "/k", "apiKeyEnv": "K"}}}}}),
+                "providers.openai.accounts.work: set only one of apiKeyFile / apiKeyKeychain / apiKeyEnv",
+            ),
+            (serde_json::json!({"providers": {"anthropic": {"accounts": {"ci": {"organization": "org"}}}}}), "providers.anthropic.accounts.ci: organization/project are only supported for openai"),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"w": {"project": "a b"}}}}}),
+                "providers.openai.accounts.w: project must be a non-empty string without spaces or control characters",
+            ),
+            (serde_json::json!({"providers": {"openai": {"accounts": {"proxy": {"apiKeyEnv": "openai_key"}}}}}), "providers.openai.accounts.proxy: apiKeyEnv must match ^[A-Z_][A-Z0-9_]*$"),
+            (serde_json::json!({"providers": {"openai": {"accounts": {"proxy": {"apiKeyEnv": "1KEY"}}}}}), "providers.openai.accounts.proxy: apiKeyEnv must match ^[A-Z_][A-Z0-9_]*$"),
+            (serde_json::json!({"providers": {"openai": {"defaultAccount": "x"}}}), "providers.openai: defaultAccount 'x' is not defined in accounts"),
+            (serde_json::json!({"providers": {"openai": {"accounts": {"w": {"fallbackAccounts": ["w"]}}}}}), "providers.openai.accounts.w: fallbackAccounts must not include the account itself ('w')"),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"w": {"fallbackAccounts": ["nope"]}}}}}),
+                "providers.openai.accounts.w: fallbackAccounts entry 'nope' is not defined in accounts",
+            ),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"w": {"fallbackAccounts": ["default", "default"]}}}}}),
+                "providers.openai.accounts.w: fallbackAccounts has duplicate entry 'default'",
+            ),
+            (serde_json::json!({"providers": {"faux": {"accounts": {"w": {}}}}}), "providers.faux: accounts/defaultAccount are not supported for faux"),
+            (serde_json::json!({"providers": {"faux": {"defaultAccount": "default"}}}), "providers.faux: accounts/defaultAccount are not supported for faux"),
+            (serde_json::json!({"profiles": {"coder": {"account": "work", "workspaceRoots": ws}}}), "profile 'coder': account 'work' is not configured for provider openai"),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"work": {}}}}, "profiles": {"coder": {"provider": "anthropic", "account": "work", "workspaceRoots": ws}}}),
+                "profile 'coder': account 'work' is not configured for provider anthropic",
+            ),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"work": {}, "proxy": {}}}}, "profiles": {"coder": {"account": "work", "allowedAccounts": ["proxy"], "workspaceRoots": ws}}}),
+                "profile 'coder': allowedAccounts must include its own account 'work'",
+            ),
+            (
+                serde_json::json!({"providers": {"openai": {"accounts": {"work": {}}}}, "profiles": {"coder": {"allowedAccounts": ["default", "ghost"], "workspaceRoots": ws}}}),
+                "profile 'coder': account 'ghost' is not configured for provider openai",
+            ),
+            (serde_json::json!({"profiles": {"coder": {"fallbackAccounts": ["default"], "workspaceRoots": ws}}}), "profile 'coder': fallbackAccounts must not include the account itself ('default')"),
+            (serde_json::json!({"profiles": {"f": {"provider": "faux", "account": "x", "workspaceRoots": ws}}}), "profile 'f': account 'x' is not configured for provider faux"),
+        ] {
+            assert_eq!(accounts_config(value.clone()).validate().unwrap_err().to_string(), expected, "{value}");
+        }
+        // 合法：* 通配、defaultAccount 指向命名账号、profile 不写 account 时用 defaultAccount
+        accounts_config(serde_json::json!({"providers": {"openai": {"defaultAccount": "work", "accounts": {"work": {"fallbackAccounts": ["default"]}}}},
+            "profiles": {"a": {"allowedAccounts": ["*"], "workspaceRoots": ws}, "b": {"allowedAccounts": ["work"], "fallbackAccounts": ["default"], "workspaceRoots": ws}}}))
+        .validate()
+        .unwrap();
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn account_keychain_rejected_on_non_macos() {
+        let cfg = accounts_config(serde_json::json!({"providers": {"openai": {"accounts": {"work": {"apiKeyKeychain": {}}}}}}));
+        assert!(cfg.validate().unwrap_err().to_string().starts_with("providers.openai.accounts.work: apiKeyKeychain is only supported on macOS"));
+    }
+
+    #[test]
+    fn example_config_has_linux_valid_multi_account_openai() {
+        let mut example: Config = serde_json::from_str(include_str!("../../../sub-bot.example.json")).unwrap();
+        // 示例里的 tokenSha256 是占位符
+        for client in &mut example.clients {
+            client.token_sha256 = sha256_hex(&client.name);
+        }
+        example.validate().unwrap();
+        let openai = example.provider_accounts("openai");
+        assert!(openai.len() >= 3, "{:?}", openai.keys().collect::<Vec<_>>());
+        assert!(openai.values().all(|a| a.api_key_keychain.is_none()), "example must stay Linux-valid");
+        assert!(openai.values().any(|a| a.api_key_env.is_some()) && openai.values().filter(|a| a.api_key_file.is_some()).count() >= 2);
+        assert!(example.profiles.values().any(|p| p.allowed_accounts.is_some() && p.account.is_some()));
+    }
+
+    #[test]
+    fn readme_multi_account_example_validates() {
+        let readme = include_str!("../../../README.md");
+        let section = &readme[readme.find("## 同一 provider 多账号").expect("README section")..];
+        let start = section.find("```json\n").unwrap() + "```json\n".len();
+        let json = &section[start..start + section[start..].find("```").unwrap()];
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        for client in &mut cfg.clients {
+            client.token_sha256 = sha256_hex(&client.name);
+        }
+        cfg.validate().unwrap();
+        assert_eq!(cfg.provider_accounts("openai").keys().map(String::as_str).collect::<Vec<_>>(), ["default", "personal", "proxy", "work"]);
+        assert_eq!(cfg.profiles["claude-ci"].account.as_deref(), Some("ci"));
     }
 }

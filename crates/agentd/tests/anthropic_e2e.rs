@@ -140,6 +140,8 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
             {
                 let requests = mock.requests.lock().await;
                 assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0]["thinking"], json!({"type":"adaptive"}));
+                assert_eq!(requests[0]["output_config"]["effort"], "minimal");
                 assert!(requests[0]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "bash"));
                 let messages = requests[1]["messages"].as_array().unwrap();
                 let last = messages.last().unwrap();
@@ -171,7 +173,7 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
             assert_eq!(reply["text"], "Final reply: hi");
             assert_eq!(reply["totalUsage"]["cacheWrite"], 62);
             assert_eq!(reply["usage"]["cacheWrite"], 32);
-            assert_eq!(reply["reasoningEffort"], Value::Null);
+            assert_eq!(reply["reasoningEffort"], "minimal"); // Unknown Claude levels pass through using adaptive thinking.
             assert_eq!(reply["requestedReasoningEffort"], "minimal");
         }
     })

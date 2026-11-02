@@ -142,6 +142,8 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
         messages: context.lock().unwrap().clone(),
         tools: if with_tools { cfg.tools.iter().map(|t| t.spec()).collect() } else { vec![] },
         reasoning: cfg.reasoning,
+        raw_effort: false,
+        thinking: None,
         api: cfg.api,
         max_tokens: cfg.max_tokens,
         llm_max_retries: cfg.llm_max_retries,

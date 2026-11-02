@@ -276,6 +276,8 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             api: Api::Responses,
             max_tokens: Some(1000),
+            raw_effort: false,
+            thinking: None,
             llm_max_retries: None,
         }
     }

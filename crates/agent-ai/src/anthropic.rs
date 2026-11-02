@@ -83,7 +83,8 @@ impl AnthropicProvider {
             let text = tokio::time::timeout(self.stream_idle_timeout, response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
             let lower = text.to_ascii_lowercase();
             if status == reqwest::StatusCode::BAD_REQUEST
-                && thinking_budget(req.reasoning).is_some()
+                && !req.raw_effort
+                && req.reasoning.is_some()
                 && lower.contains("thinking")
                 && (lower.contains("not supported") || lower.contains("does not support") || lower.contains("unsupported"))
             {
@@ -94,7 +95,7 @@ impl AnthropicProvider {
             return Err(CallError { reason: format!("Anthropic HTTP {status}: {text}"), transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after });
         };
         let mut message = parse_stream(response, &req.model, &tx, self).await?;
-        message.reasoning_effort = req.reasoning.filter(|_| thinking_budget(req.reasoning).is_some());
+        message.reasoning_effort = req.reasoning;
         Ok(message)
     }
 }
@@ -104,7 +105,10 @@ impl Provider for AnthropicProvider {
         "anthropic"
     }
 
-    fn stream(&self, req: Request, cancel: CancellationToken) -> EventStream {
+    fn stream(&self, mut req: Request, cancel: CancellationToken) -> EventStream {
+        if !req.raw_effort {
+            req.reasoning = crate::models::resolve_effort("anthropic", &req.model, req.reasoning).effective;
+        }
         let (tx, rx) = mpsc::channel(64);
         let provider = self.clone();
         let span = tracing::info_span!("llm", provider = "anthropic", model = %req.model);
@@ -112,7 +116,7 @@ impl Provider for AnthropicProvider {
             async move {
                 let started = std::time::Instant::now();
                 let model = req.model.clone();
-                let max_retries = req.llm_max_retries.unwrap_or(3);
+                let max_retries = if req.raw_effort { 0 } else { req.llm_max_retries.unwrap_or(3) };
                 tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
                 let mut state = (provider, req);
                 let result = tokio::select! {
@@ -124,7 +128,7 @@ impl Provider for AnthropicProvider {
                     Some(Ok(message)) => AssistantEvent::Done { message },
                     Some(Err(error)) => {
                         let mut message = AssistantMessage::failed(&model, StopReason::Error, error);
-                        message.reasoning_effort = state.1.reasoning.filter(|_| thinking_budget(state.1.reasoning).is_some());
+                        message.reasoning_effort = state.1.reasoning;
                         AssistantEvent::Error { message }
                     }
                     None => AssistantEvent::Error { message: AssistantMessage::failed(&model, StopReason::Aborted, "aborted") },
@@ -192,10 +196,9 @@ impl Provider for AnthropicProvider {
 
 fn thinking_budget(level: Option<ThinkingLevel>) -> Option<u32> {
     match level {
-        Some(ThinkingLevel::Low) => Some(2048),
-        Some(ThinkingLevel::Medium) => Some(8192),
-        Some(ThinkingLevel::High) => Some(24576),
-        Some(ThinkingLevel::Xhigh) => Some(32768),
+        Some(ThinkingLevel::Low) => Some(8192),
+        Some(ThinkingLevel::Medium) => Some(16384),
+        Some(ThinkingLevel::High) => Some(32000),
         _ => None,
     }
 }
@@ -239,11 +242,24 @@ pub fn build_body(req: &Request) -> Value {
     if let Some(last) = messages.iter_mut().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_array_mut()).and_then(|blocks| blocks.last_mut()) {
         last["cache_control"] = json!({"type":"ephemeral"});
     }
-    let modern = req.model.split('-').find_map(|part| part.parse::<u32>().ok()).is_some_and(|n| (4..100).contains(&n));
-    let mut max_tokens = req.max_tokens.unwrap_or(if modern { 16384 } else { 8192 }).max(1);
-    if let Some(budget) = thinking_budget(req.reasoning) {
-        max_tokens = max_tokens.max(budget + 1);
+    use crate::models::{effort_caps, resolve_effort, EffortMechanism::*};
+    let caps = effort_caps("anthropic", &req.model);
+    let level = if req.raw_effort { req.reasoning } else { resolve_effort("anthropic", &req.model, req.reasoning).effective };
+    let budget = if matches!(caps.mechanism, AnthropicEffortWithBudget | AnthropicBudgetOnly) && !req.raw_effort { thinking_budget(level) } else { None };
+    let default_tokens = match level {
+        Some(ThinkingLevel::High) => 32000,
+        Some(ThinkingLevel::Xhigh) => 64000,
+        Some(ThinkingLevel::Max) => caps.max_output.unwrap_or(64000),
+        Some(_) => 16000,
+        // 未设 effort：沿用 v0.7 默认，避免老模型（claude-3.x 输出上限 8192）被拒。
+        None if req.model.split('-').find_map(|part| part.parse::<u32>().ok()).is_some_and(|n| (4..100).contains(&n)) => 16000,
+        None => 8192,
+    };
+    let mut max_tokens = req.max_tokens.unwrap_or(default_tokens).max(1);
+    if let Some(budget) = budget {
+        max_tokens = max_tokens.max(budget + 4096);
     }
+    max_tokens = max_tokens.min(caps.max_output.unwrap_or(64000));
     let mut body = json!({"model":req.model, "messages":messages, "stream":true, "max_tokens":max_tokens});
     if let Some(system) = &req.system_prompt {
         body["system"] = json!([{"type":"text", "text":system, "cache_control":{"type":"ephemeral"}}]);
@@ -255,8 +271,24 @@ pub fn build_body(req: &Request) -> Value {
         }
         body["tools"] = json!(tools);
     }
-    if let Some(budget) = thinking_budget(req.reasoning) {
-        body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
+    if let Some(level) = level {
+        if req.raw_effort {
+            body["output_config"] = json!({"effort":level});
+            match req.thinking.unwrap_or(ProbeThinking::Adaptive) {
+                ProbeThinking::Adaptive => body["thinking"] = json!({"type":"adaptive"}),
+                ProbeThinking::Enabled => body["thinking"] = json!({"type":"enabled", "budget_tokens":1024}),
+                ProbeThinking::Omit => {}
+            }
+        } else {
+            if let Some(budget) = budget {
+                body["thinking"] = json!({"type":"enabled", "budget_tokens":budget});
+            } else {
+                body["thinking"] = json!({"type":"adaptive"});
+            }
+            if caps.mechanism != AnthropicBudgetOnly {
+                body["output_config"] = json!({"effort":level});
+            }
+        }
     }
     body
 }

@@ -19,6 +19,7 @@ mod local;
 #[cfg(test)]
 mod local_tests;
 mod logging;
+mod probe;
 mod prompt;
 mod rpc;
 mod server;
@@ -41,7 +42,7 @@ struct Cli {
     /// 模型。serve：覆盖全局默认模型（profile 自己的 model 仍优先）；rpc/run：本会话使用的模型（受 allowedModels 限制）
     #[arg(long, global = true, env = "SUB_BOT_MODEL")]
     model: Option<String>,
-    /// 推理强度 none|minimal|low|medium|high|xhigh。serve：全局默认；rpc/run：本会话。模型不支持时忽略并记 warn
+    /// 推理强度 none|minimal|low|medium|high|xhigh|max 或 provider 的小写名称；已知模型限制为最高三档
     #[arg(long, global = true, env = "SUB_BOT_REASONING_EFFORT")]
     reasoning_effort: Option<ThinkingLevel>,
     /// OpenAI API：auto（默认：gpt-5.4+/gpt-6.x/o 系列走 Responses，其余走 Chat Completions）| chat | responses。serve：全局默认；rpc/run：本会话
@@ -121,6 +122,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 实测各 effort 是否被 API 接受（绕过目录/降级；需要 --model）
+    ProbeEfforts(probe::Probe),
     /// 问题上报诊断
     Issues {
         #[command(subcommand)]
@@ -265,6 +268,9 @@ async fn main() -> anyhow::Result<()> {
     if let Cmd::Serve { unix_socket: Some(path), .. } = &cli.cmd {
         loaded.unix_socket = Some(path.clone().unwrap_or_else(|| loaded.data_dir().join("sub-bot.sock")));
     }
+    if let Cmd::ProbeEfforts(ref args) = cli.cmd {
+        return probe::run(&cli, &loaded, args).await;
+    }
     install_reporter(&loaded, &cli);
     let new_hub = |cfg: config::Config| {
         let provider = cli.provider.clone().or_else(|| cfg.default_provider.clone()).unwrap_or_else(|| "openai".into());
@@ -333,7 +339,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -406,23 +412,84 @@ async fn main() -> anyhow::Result<()> {
                 println!("{}", serde_json::to_string_pretty(&list)?);
             } else {
                 for m in &list {
-                    let efforts = match (m.model.reasoning, m.model.reasoning_efforts.is_empty()) {
-                        (Some(false), _) => "-".to_string(),
-                        (_, false) => m.model.reasoning_efforts.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(","),
-                        _ => "?".to_string(),
-                    };
-                    println!("{:<12} {:<32} {}", m.provider, m.model.id, efforts);
+                    let efforts = format_efforts(&m.model);
+                    println!("{:<12} {:<32} {} default={}", m.provider, m.model.id, efforts, m.model.default_effort.map(|l| l.as_str()).unwrap_or("?"));
                 }
-                eprintln!("{} models (reasoning efforts: '-' = unsupported, '?' = unknown, passed through)", list.len());
+                eprintln!("{} models (reasoning efforts: [...] = allowed top-three, '-' = unsupported, '?' = unknown, passed through)", list.len());
             }
         }
     }
     Ok(())
 }
 
+fn format_efforts(model: &agent_ai::ModelInfo) -> String {
+    if model.reasoning == Some(false) {
+        return "-".into();
+    }
+    if model.reasoning_efforts.is_empty() {
+        return "?".into();
+    }
+    let mut parts = vec![];
+    for level in &model.reasoning_efforts {
+        let mut name = level.to_string();
+        if model.allowed_efforts.first() == Some(level) {
+            name.insert(0, '[');
+        }
+        if model.allowed_efforts.last() == Some(level) {
+            name.push(']');
+        }
+        parts.push(name);
+    }
+    parts.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_and_extensible_effort_cli() {
+        for name in ["max", "ultra", "future_1-level"] {
+            let cli = Cli::try_parse_from(["sub-bot", "run", "--reasoning-effort", name, "hi"]).unwrap();
+            assert_eq!(cli.reasoning_effort.unwrap().as_str(), name);
+        }
+        let cli = Cli::try_parse_from([
+            "sub-bot",
+            "probe-efforts",
+            "--model",
+            "claude-sonnet-5-5",
+            "--provider",
+            "anthropic",
+            "--levels",
+            "max,ultra",
+            "--thinking",
+            "omit",
+            "--api",
+            "responses",
+            "--json",
+            "--anthropic-key-file",
+            "claude.key",
+        ])
+        .unwrap();
+        let Cmd::ProbeEfforts(args) = cli.cmd else { panic!("probe command") };
+        assert!(args.json && matches!(args.thinking, Some(probe::Thinking::Omit)));
+        assert_eq!(args.levels, [ThinkingLevel::Max, ThinkingLevel::Other("ultra")]);
+        assert_eq!(cli.model.as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(cli.api, Some(agent_ai::Api::Responses));
+        let cli = Cli::try_parse_from(["sub-bot", "probe-efforts", "--model", "gpt-6-astra"]).unwrap();
+        let Cmd::ProbeEfforts(args) = cli.cmd else { panic!("probe command") };
+        assert_eq!(args.levels.len(), 8);
+        assert!(Cli::try_parse_from(["sub-bot", "probe-efforts", "--levels", "INVALID"]).is_err());
+        assert!(Cli::try_parse_from(["sub-bot", "probe-efforts", "--thinking", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn models_mark_allowed_top_three() {
+        assert_eq!(format_efforts(&agent_ai::models::info_for("gpt-6-astra".into(), None, None)), "low,medium,[high,xhigh,max]");
+        let model = agent_ai::models::info_for("claude-sonnet-4-6".into(), None, None);
+        assert_eq!(format_efforts(&model), "low,[medium,high,max]");
+        assert_eq!(model.default_effort, Some(ThinkingLevel::High));
+    }
 
     #[test]
     fn provider_cli_options_are_optional_and_global() {

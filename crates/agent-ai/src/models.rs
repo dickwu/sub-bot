@@ -16,6 +16,11 @@ pub struct ModelInfo {
     /// 推断出的可选推理强度（未知时为空）
     #[serde(default)]
     pub reasoning_efforts: Vec<ThinkingLevel>,
+    /// 应用策略：完整目录中最高的三档
+    #[serde(default)]
+    pub allowed_efforts: Vec<ThinkingLevel>,
+    #[serde(default)]
+    pub default_effort: Option<ThinkingLevel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +39,111 @@ const GPT52P: &[ThinkingLevel] = &[Off, Low, Medium, High, Xhigh];
 const O3: &[ThinkingLevel] = &[Low, Medium, High, Xhigh];
 const O_SERIES: &[ThinkingLevel] = &[Low, Medium, High];
 const MEDIUM_ONLY: &[ThinkingLevel] = &[Medium];
+const WITH_MAX: &[ThinkingLevel] = &[Off, Low, Medium, High, Xhigh, Max];
+const FULL: &[ThinkingLevel] = &[Low, Medium, High, Xhigh, Max];
+const NO_XHIGH: &[ThinkingLevel] = &[Low, Medium, High, Max];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffortMechanism {
+    OpenAiEffort,
+    AnthropicAdaptiveEffort,
+    AnthropicEffortWithBudget,
+    AnthropicBudgetOnly,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortCaps {
+    /// Provider 的 low → high 顺序，不能对 Other 做字典序排序。
+    pub levels: Vec<ThinkingLevel>,
+    pub mechanism: EffortMechanism,
+    pub default: Option<ThinkingLevel>,
+    pub max_output: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffortResolution {
+    pub requested: Option<ThinkingLevel>,
+    pub effective: Option<ThinkingLevel>,
+    pub adjusted: Option<String>,
+}
+
+/// 官方目录：https://developers.openai.com/api/docs/models/<id>
+/// Claude：https://platform.claude.com/docs/en/build-with-claude/effort
+/// https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
+/// https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+pub fn effort_caps(provider_id: &str, model: &str) -> EffortCaps {
+    use EffortMechanism::*;
+    let m = base(model);
+    if provider_id == "anthropic" {
+        let m = m.rsplit_once('-').filter(|(_, date)| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit())).map_or(m, |(name, _)| name);
+        let (levels, mechanism, max_output) = match m {
+            "claude-fable-5-1" | "claude-mythos-5-1" | "claude-fable-5" | "claude-mythos-5" | "claude-opus-5-5" | "claude-opus-5" | "claude-opus-4-8" | "claude-opus-4-7" | "claude-sonnet-5-5"
+            | "claude-sonnet-5" | "claude-haiku-5-5" => (FULL, AnthropicAdaptiveEffort, 128000),
+            "claude-opus-4-6" | "claude-sonnet-4-6" | "claude-mythos-preview" => (NO_XHIGH, AnthropicAdaptiveEffort, 128000),
+            "claude-opus-4-5" => (O_SERIES, AnthropicEffortWithBudget, 64000),
+            "claude-sonnet-4-5" | "claude-haiku-4-5" => (O_SERIES, AnthropicBudgetOnly, 64000),
+            _ => (&[][..], Unknown, 64000),
+        };
+        let default = if levels.is_empty() {
+            None
+        } else if matches!(m, "claude-opus-5-5" | "claude-haiku-5-5") {
+            Some(Medium)
+        } else {
+            Some(High)
+        };
+        return EffortCaps { levels: levels.to_vec(), mechanism, default, max_output: Some(max_output) };
+    }
+    let (levels, mechanism) = if provider_id == "openai" {
+        match reasoning_support(m) {
+            ReasoningSupport::Levels(levels) => (levels, OpenAiEffort),
+            ReasoningSupport::Unsupported => (&[][..], Unsupported),
+            ReasoningSupport::Unknown => (&[][..], Unknown),
+        }
+    } else {
+        (&[][..], Unknown)
+    };
+    let default = if mechanism != OpenAiEffort {
+        None
+    } else {
+        match m {
+            "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-luna" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" => Some(Medium),
+            "gpt-5.1" | "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" => Some(Off),
+            _ => None,
+        }
+    };
+    EffortCaps { levels: levels.to_vec(), mechanism, default, max_output: None }
+}
+
+pub fn allowed_efforts(caps: &EffortCaps) -> Vec<ThinkingLevel> {
+    caps.levels[caps.levels.len().saturating_sub(3)..].to_vec()
+}
+
+pub fn resolve_effort(provider_id: &str, model: &str, requested: Option<ThinkingLevel>) -> EffortResolution {
+    let caps = effort_caps(provider_id, model);
+    let mut result = EffortResolution { requested, effective: requested, adjusted: None };
+    if let Some(level) = requested {
+        let allowed = allowed_efforts(&caps);
+        match caps.mechanism {
+            EffortMechanism::Unknown => {}
+            EffortMechanism::Unsupported => {
+                result.effective = None;
+                result.adjusted = Some("model does not support reasoning effort".into());
+            }
+            _ if !allowed.contains(&level) => {
+                // 在完整列表中的位置是未知名称唯一的排序依据。
+                result.effective = if level.rank_in(&caps.levels).is_some() { allowed.first().copied() } else { level.nearest_in(&allowed).or_else(|| allowed.last().copied()) };
+                result.adjusted = Some(if matches!(level, Other(_)) && level.rank_in(&caps.levels).is_none() { "unknown level" } else { "clamped to allowed top-three levels" }.into());
+            }
+            _ => {}
+        }
+    }
+    if let Some(reason) = &result.adjusted {
+        tracing::warn!(provider = provider_id, model, requested = ?requested, effective = ?result.effective, reason, "reasoning effort adjusted");
+    }
+    result
+}
 
 /// 去掉日期快照后缀（`-2025-08-07`）。
 fn base(id: &str) -> &str {
@@ -88,15 +198,15 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
     if m.len() > 1 && m.starts_with('o') && m.as_bytes()[1].is_ascii_digit() {
         return ReasoningSupport::Levels(O_SERIES);
     }
-    if let Some(rest) = m.strip_prefix("gpt-5") {
-        return match rest {
-            "" | "-mini" | "-nano" => ReasoningSupport::Levels(GPT5),
-            _ if rest.starts_with(".1") => ReasoningSupport::Levels(GPT51),
-            _ if rest.starts_with('.') => ReasoningSupport::Levels(GPT52P),
-            _ => ReasoningSupport::Unknown,
-        };
+    match m {
+        "gpt-5" | "gpt-5-mini" | "gpt-5-nano" => ReasoningSupport::Levels(GPT5),
+        "gpt-5.1" => ReasoningSupport::Levels(GPT51),
+        "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" | "gpt-5.5" => ReasoningSupport::Levels(GPT52P),
+        "gpt-5.2-codex" | "gpt-5.3-codex" => ReasoningSupport::Levels(O3),
+        "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-terra" => ReasoningSupport::Levels(WITH_MAX),
+        "gpt-6-astra" | "gpt-6.1-sol" => ReasoningSupport::Levels(FULL),
+        _ => ReasoningSupport::Unknown,
     }
-    ReasoningSupport::Unknown
 }
 
 /// 能否用 Chat Completions 对话（排除 embedding / 语音 / 图像 / realtime / 仅 Responses API 的 codex、pro、deep-research 等）。
@@ -129,12 +239,13 @@ pub fn is_chat_model(id: &str) -> bool {
 }
 
 pub fn info_for(id: String, owned_by: Option<String>, created: Option<i64>) -> ModelInfo {
-    let (reasoning, reasoning_efforts) = match reasoning_support(&id) {
-        ReasoningSupport::Unsupported => (Some(false), vec![]),
-        ReasoningSupport::Levels(l) => (Some(true), l.to_vec()),
-        ReasoningSupport::Unknown => (None, vec![]),
+    let caps = effort_caps(if id.starts_with("claude-") || owned_by.as_deref() == Some("anthropic") { "anthropic" } else { "openai" }, &id);
+    let reasoning = match caps.mechanism {
+        EffortMechanism::Unsupported => Some(false),
+        EffortMechanism::Unknown => None,
+        _ => Some(true),
     };
-    ModelInfo { id, owned_by, created, reasoning, reasoning_efforts }
+    ModelInfo { id, owned_by, created, reasoning, allowed_efforts: allowed_efforts(&caps), default_effort: caps.default, reasoning_efforts: caps.levels }
 }
 
 /// 模型白名单匹配：精确匹配，或 `*` 通配（如 `gpt-5*`、`*-mini`）。
@@ -158,13 +269,112 @@ mod tests {
     }
 
     #[test]
+    fn catalog_and_defaults() {
+        for (models, levels, default) in [
+            ("gpt-5 gpt-5-mini gpt-5-nano", GPT5, None),
+            ("gpt-5.1", GPT51, Some(Off)),
+            ("gpt-5.2 gpt-5.4 gpt-5.4-mini gpt-5.4-nano", GPT52P, Some(Off)),
+            ("gpt-5.5", GPT52P, Some(Medium)),
+            ("gpt-5.2-codex gpt-5.3-codex o3", O3, None),
+            ("gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-6-sol gpt-6-luna gpt-6.1-terra", WITH_MAX, Some(Medium)),
+            ("gpt-6-astra", FULL, None),
+            ("gpt-6.1-sol", FULL, Some(Medium)),
+            ("o1 o4-mini", O_SERIES, None),
+            ("chat-latest", MEDIUM_ONLY, None),
+        ] {
+            for model in models.split_whitespace() {
+                for model in [model.to_string(), format!("{model}-2026-10-01")] {
+                    let caps = effort_caps("openai", &model);
+                    assert_eq!(caps.levels, levels, "{model}");
+                    assert_eq!(caps.default, default, "{model}");
+                    assert_eq!(caps.mechanism, EffortMechanism::OpenAiEffort);
+                }
+            }
+        }
+        for (models, levels, mechanism, max_output) in [
+            (
+                "claude-fable-5-1 claude-mythos-5-1 claude-fable-5 claude-mythos-5 claude-opus-5-5 claude-opus-5 claude-opus-4-8 claude-opus-4-7 claude-sonnet-5-5 claude-sonnet-5 claude-haiku-5-5",
+                FULL,
+                EffortMechanism::AnthropicAdaptiveEffort,
+                128000,
+            ),
+            ("claude-opus-4-6 claude-sonnet-4-6 claude-mythos-preview", NO_XHIGH, EffortMechanism::AnthropicAdaptiveEffort, 128000),
+            ("claude-opus-4-5", O_SERIES, EffortMechanism::AnthropicEffortWithBudget, 64000),
+            ("claude-sonnet-4-5 claude-haiku-4-5", O_SERIES, EffortMechanism::AnthropicBudgetOnly, 64000),
+        ] {
+            for model in models.split_whitespace() {
+                for id in [model.to_string(), format!("{model}-20251101")] {
+                    let caps = effort_caps("anthropic", &id);
+                    assert_eq!(caps.levels, levels, "{id}");
+                    assert_eq!(caps.mechanism, mechanism);
+                    assert_eq!(caps.max_output, Some(max_output));
+                    assert_eq!(caps.default, Some(if matches!(model, "claude-opus-5-5" | "claude-haiku-5-5") { Medium } else { High }));
+                    let info = info_for(id, Some("anthropic".into()), None);
+                    assert_eq!(info.reasoning_efforts, levels);
+                    assert_eq!(info.allowed_efforts, allowed_efforts(&caps));
+                    assert_eq!(info.default_effort, caps.default);
+                }
+            }
+        }
+        for model in ["gpt-5.9", "gpt-6-future", "llama"] {
+            assert_eq!(effort_caps("openai", model).mechanism, EffortMechanism::Unknown);
+        }
+        assert_eq!(effort_caps("anthropic", "claude-future").max_output, Some(64000));
+        assert_eq!(effort_caps("anthropic", "claude-future").mechanism, EffortMechanism::Unknown);
+    }
+
+    #[test]
+    fn top_three_resolution() {
+        for (provider, model, requested, effective) in [
+            ("openai", "gpt-5", Minimal, Low),
+            ("openai", "gpt-5", Off, Low),
+            ("openai", "gpt-6-astra", Low, High),
+            ("openai", "gpt-5.4", Low, Medium),
+            ("anthropic", "claude-sonnet-4-6", Low, Medium),
+            ("anthropic", "claude-sonnet-4-6", Xhigh, Max),
+            ("anthropic", "claude-haiku-4-5-20251001", Max, High),
+            ("openai", "chat-latest", Max, Medium),
+            ("openai", "gpt-5", Other("ultra"), High),
+        ] {
+            let result = resolve_effort(provider, model, Some(requested));
+            assert_eq!(result.requested, Some(requested));
+            assert_eq!(result.effective, Some(effective), "{model}");
+            assert!(result.adjusted.is_some());
+        }
+        assert_eq!(resolve_effort("openai", "gpt-5", Some(Other("ultra"))).adjusted.as_deref(), Some("unknown level"));
+        assert_eq!(resolve_effort("openai", "gpt-5", Some(Minimal)).adjusted.as_deref(), Some("clamped to allowed top-three levels"));
+        assert_eq!(resolve_effort("anthropic", "claude-sonnet-4-6", Some(Xhigh)).adjusted.as_deref(), Some("clamped to allowed top-three levels"));
+        // 已在允许范围内：不调整
+        for (provider, model, level) in [("openai", "gpt-6-astra", Max), ("openai", "gpt-5", Low), ("anthropic", "claude-sonnet-5-5", Xhigh), ("anthropic", "claude-opus-4-5-20251101", Medium)] {
+            assert_eq!(resolve_effort(provider, model, Some(level)), EffortResolution { requested: Some(level), effective: Some(level), adjusted: None });
+        }
+        for provider in ["openai", "anthropic", "faux"] {
+            let result = resolve_effort(provider, "future", Some(Other("ultra")));
+            assert_eq!(result.effective, result.requested);
+            assert!(result.adjusted.is_none());
+        }
+        for model in ["gpt-4.1", "gpt-3.5-turbo"] {
+            let result = resolve_effort("openai", model, Some(Max));
+            assert_eq!(result.effective, None);
+            assert!(result.adjusted.is_some());
+        }
+        for (provider, model) in [("openai", "gpt-5"), ("openai", "gpt-4.1"), ("anthropic", "claude-sonnet-5-5")] {
+            assert_eq!(resolve_effort(provider, model, None), EffortResolution { requested: None, effective: None, adjusted: None });
+        }
+        assert_eq!(allowed_efforts(&effort_caps("openai", "gpt-6-astra")), [High, Xhigh, Max]);
+        assert_eq!(allowed_efforts(&effort_caps("anthropic", "claude-sonnet-4-6")), [Medium, High, Max]);
+        let caps = EffortCaps { levels: vec![Off, Minimal], mechanism: EffortMechanism::OpenAiEffort, default: None, max_output: None };
+        assert_eq!(allowed_efforts(&caps), [Off, Minimal]);
+    }
+
+    #[test]
     fn capabilities() {
         assert_eq!(reasoning_support("gpt-4.1-mini"), ReasoningSupport::Unsupported);
         assert_eq!(reasoning_support("gpt-5-mini-2025-08-07"), ReasoningSupport::Levels(GPT5));
         assert_eq!(reasoning_support("gpt-5.1"), ReasoningSupport::Levels(GPT51));
         assert_eq!(reasoning_support("gpt-5.4-mini"), ReasoningSupport::Levels(GPT52P));
         assert_eq!(reasoning_support("o4-mini"), ReasoningSupport::Levels(O_SERIES));
-        assert_eq!(reasoning_support("gpt-6-sol"), ReasoningSupport::Unknown);
+        assert_eq!(reasoning_support("gpt-6-sol"), ReasoningSupport::Levels(WITH_MAX));
         assert!(is_chat_model("gpt-5.4-mini") && is_chat_model("o3") && is_chat_model("gpt-4.1"));
         assert!(!is_chat_model("gpt-5.3-codex") && !is_chat_model("text-embedding-3-small") && !is_chat_model("gpt-5.5-pro") && !is_chat_model("gpt-realtime"));
         assert!(is_snapshot("gpt-4.1-2025-04-14") && !is_snapshot("gpt-4.1"));

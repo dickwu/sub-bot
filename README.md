@@ -38,7 +38,7 @@
 - 可选 `providers.<id>.baseUrl`；`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 环境变量优先于配置。
 - 选择顺序：会话 JSON `provider` > profile `provider` > 有效模型名以 `claude-` 开头时推断 Anthropic > 默认 provider。默认 provider 为显式 `--provider`（或 `SUB_BOT_PROVIDER`）> `defaultProvider` > `openai`。`run` / `rpc` / `ask` 的显式 `--provider` 也作为会话覆盖；已有 sessionId 的 ask 继续原会话。
 - 启动必须能加载默认 provider，以及 profile / 默认模型引用或推断的 provider；缺少 key 即安全失败。其它 provider 有 key 来源则加载，无来源则跳过。后续会话选择未加载 provider 返回 400，并提示配置来源；`faux` 始终可用。
-- `api` / `defaultApi` 仅用于 OpenAI。Anthropic 的 `reasoningEffort` 原样作为 thinking level 传入 provider，不使用 OpenAI 模型能力降级规则。
+- `api` / `defaultApi` 仅用于 OpenAI。Anthropic 按模型选择 adaptive effort、effort + extended-thinking budget 或纯 budget，详见「模型与推理强度」。
 
 `sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录，每个模型都有 `provider` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
 
@@ -258,7 +258,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "tools": ["read", "ls", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"
       "model": "gpt-5.4-mini",                 // profile 默认模型
       "allowedModels": ["gpt-5*", "gpt-4.1*"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制
-      "reasoningEffort": "medium",             // 可选：none|minimal|low|medium|high|xhigh
+      "reasoningEffort": "medium",             // 可选：none|minimal|low|medium|high|xhigh|max 或 provider 小写名称
       "api": "auto",                           // 可选：auto|chat|responses，覆盖 defaultApi
       "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
       "tokenBudget": 300000,                   // 可选：整次运行的 token 预算，用完后禁止再调工具、要求直接给结论
@@ -292,7 +292,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--config`（`SUB_BOT_CONFIG`）
   - `--provider openai|anthropic|faux`
   - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
-  - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh`
+  - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh|max` 或 provider 小写名称
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
   - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
@@ -308,14 +308,25 @@ sub-bot --model gpt-5.4-mini --reasoning-effort high run "解释一下这个仓�
 sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 ```
 
-`models` 的三列分别是 provider、模型 id、推理强度可选值：`-` 表示该模型不支持 `reasoning_effort`（如 gpt-4.1、gpt-4o），`?` 表示未知（原样传给 OpenAI）。
+`models` 显示 provider、模型 id、完整推理档位和 `default`；方括号标出允许的最高三档，例如 `low,medium,[high,xhigh,max] default=medium`。`-` 表示不支持，`?` 表示未知。JSON 保留完整 `reasoningEfforts`，新增 `allowedEfforts` 和 `defaultEffort`。
 
-选择优先级：
-- 模型：请求/命令行的 `model` > profile 的 `model` > `defaultModel`。如果 profile 设置了 `allowedModels`，不在列表里的模型会被拒绝（HTTP 400）
-- 推理强度：请求/命令行的 `reasoningEffort` > profile 的 `reasoningEffort` > `defaultReasoningEffort`；都没有就不发送
-- 模型不支持推理强度时，参数会被忽略，并记一条 warn 日志；模型不支持所选档位时（比如 gpt-5 没有 `none`、gpt-5.1 没有 `minimal`），换成最接近的档位并记 warn
-- 内置能力表之外的新模型：先原样发送；如果 OpenAI 返回 400 说明不支持，会从错误信息里学到可选档位，缓存下来并自动重试（最多两次）
-- 不支持的档位会被缓存，缓存按（模型, API, 是否带工具）区分，所以带工具会话里的降级不会影响不带工具的会话
+- 名称支持 `none`（别名 `off`，内置名称大小写不敏感）、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，以及 `[a-z0-9_-]{1,32}` 的未来 provider 名称（如 `ultra`）。未知名称不假定全局排序，只采用 provider 列表的顺序。
+- 模型优先级：请求/命令行 > profile > `defaultModel`；`allowedModels` 仍是模型白名单。
+- 强度优先级：请求/命令行 > profile > `defaultReasoningEffort`；均未设置则不发 effort/thinking，让 provider 使用默认值（目录中的 default 仅作说明，不自动填入）。
+- **最高三档规则**：已知模型只允许完整目录中最高的三档，`none`/`minimal` 也计为档位。不足三档则全部允许。低于范围向上钳制；缺失/超高的内置名称取最近允许档位，平局取高；不在目录里的未知名称取最高档并标记 `unknown level`。例如 gpt-5 的 minimal → low，gpt-6-astra 的 low → high，sonnet-4-6 的 xhigh → max。所有调整记 warn；不支持的模型省略参数。
+- 表外模型原样发送。OpenAI 400 的 `Supported values are: ...` 保留原始顺序和未知名称，缓存按（模型、API、是否带工具）区分；内置名称按列表中已知档位取最近（平局取高），无法定位的名称（如未列出的 `ultra`）取列表最高档重试，最多两次。
+- Anthropic 4.7+/已列出的 5.x 用 `thinking: adaptive` + `output_config.effort`（low/medium/high/xhigh/max）；opus/sonnet-4-6、mythos-preview 同机制但没有 xhigh。opus-4-5 用 effort + enabled budget；sonnet/haiku-4-5 仅 enabled budget（low/medium/high → 8192/16384/32000），不发 effort。日期后缀不影响目录匹配。未知 Claude 用 adaptive + effort 原样传递。
+- Adaptive 默认输出额度按**有效**档位为 low/medium 16000、high 32000、xhigh 64000、max 为模型上限；显式 `maxOutputTokens` 优先，最终不超过模型上限（已知 adaptive 128000、4.5/未知 64000）。Budget 机制还保证输出额度至少 budget+4096。启用 thinking 不发 temperature；签名 thinking 回放保持不变。
+
+### 实测能力（不经过钳制）
+
+```bash
+sub-bot probe-efforts --model gpt-6-astra --api responses --openai-key-file keys/openai.key
+sub-bot --config sub-bot.json probe-efforts --model claude-sonnet-5-5 --provider anthropic --levels high,xhigh,max,ultra --json
+sub-bot probe-efforts --model claude-opus-4-5 --thinking enabled --anthropic-key-file keys/anthropic.key
+```
+
+默认探测 `none,minimal,low,medium,high,xhigh,max,ultra`。每档一次无工具的 `Reply with OK`，绕过目录、运行时降级/缓存和瞬态重试。OpenAI 输出上限 none 为 256，其它档位 1024；Anthropic 为 2048。Anthropic 默认 adaptive；若 HTTP 400 指向 thinking 字段，再试一次 omit。显式 `--thinking adaptive|omit|enabled` 固定变体，不自动回退。沿用正常 key-file/config/base URL 解析，仅加载选定 provider。每档一行，或 `--json` 数组 `{model,provider,level,accepted,status,variant,error,supportedValues}`；错误先脱敏再截取 300 字符，未取得 HTTP 状态时为 null。探测失败也会继续后续档位；这是能力诊断，不是质量评估。动态修改 effort 的 HTTP/RPC API 留待 phase 2。
 
 ### 用哪个 API（`api`）
 

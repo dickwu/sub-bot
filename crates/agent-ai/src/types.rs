@@ -168,21 +168,21 @@ impl std::str::FromStr for Api {
     }
 }
 
-/// 推理强度（OpenAI `reasoning_effort`）。`Off` 序列化为 `"none"`（也接受 `"off"`）。
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "lowercase")]
+/// 可扩展的推理强度；未知名称只在 provider 的有序列表中有序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThinkingLevel {
-    #[serde(rename = "none", alias = "off")]
     Off,
     Minimal,
     Low,
     Medium,
     High,
     Xhigh,
+    Max,
+    Other(&'static str),
 }
 
 impl ThinkingLevel {
-    pub const ALL: [ThinkingLevel; 6] = [Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::Xhigh];
+    pub const ALL: [ThinkingLevel; 7] = [Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Off => "none",
@@ -191,12 +191,52 @@ impl ThinkingLevel {
             Self::Medium => "medium",
             Self::High => "high",
             Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Other(name) => name,
         }
     }
-    /// 在模型支持的取值里挑最接近的（距离相同取更高的一档）。
+    pub fn rank_in(self, levels: &[ThinkingLevel]) -> Option<usize> {
+        levels.iter().position(|level| *level == self)
+    }
+    /// 仅内置名称有全局顺序；Other 不能假定比任何档位高或低。
+    pub fn builtin_rank(self) -> Option<usize> {
+        self.rank_in(&Self::ALL)
+    }
+    /// 优先采用列表中的位置；缺失的内置名称按已知档位距离选择，平局取列表中较高的一档。
     pub fn nearest_in(self, supported: &[ThinkingLevel]) -> Option<ThinkingLevel> {
-        let idx = |l: ThinkingLevel| l as i32;
-        supported.iter().copied().min_by_key(|s| ((idx(*s) - idx(self)).abs(), -idx(*s)))
+        if let Some(index) = self.rank_in(supported) {
+            return Some(supported[index]);
+        }
+        let rank = self.builtin_rank()?;
+        supported
+            .iter()
+            .copied()
+            .enumerate()
+            .filter_map(|(index, level)| Some(((rank.abs_diff(level.builtin_rank()?), std::cmp::Reverse(index)), level)))
+            .min_by_key(|(key, _)| *key)
+            .map(|(_, level)| level)
+    }
+}
+
+impl PartialOrd for ThinkingLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        if self == other {
+            Some(std::cmp::Ordering::Equal)
+        } else {
+            Some(self.builtin_rank()?.cmp(&other.builtin_rank()?))
+        }
+    }
+}
+
+impl Serialize for ThinkingLevel {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ThinkingLevel {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -209,15 +249,84 @@ impl std::fmt::Display for ThinkingLevel {
 impl std::str::FromStr for ThinkingLevel {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, String> {
+        // 内置名称保持 v0.7 的大小写不敏感（兼容旧配置/环境变量）；其它名称必须是小写。
         match s.to_ascii_lowercase().as_str() {
-            "none" | "off" => Ok(Self::Off),
-            "minimal" => Ok(Self::Minimal),
-            "low" => Ok(Self::Low),
-            "medium" => Ok(Self::Medium),
-            "high" => Ok(Self::High),
-            "xhigh" => Ok(Self::Xhigh),
-            o => Err(format!("unknown reasoning effort '{o}' (none|minimal|low|medium|high|xhigh)")),
+            "none" | "off" => return Ok(Self::Off),
+            "minimal" => return Ok(Self::Minimal),
+            "low" => return Ok(Self::Low),
+            "medium" => return Ok(Self::Medium),
+            "high" => return Ok(Self::High),
+            "xhigh" => return Ok(Self::Xhigh),
+            "max" => return Ok(Self::Max),
+            _ => {}
         }
+        match s {
+            name if (1..=32).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-') => {
+                use std::{
+                    collections::HashSet,
+                    sync::{LazyLock, Mutex},
+                };
+                static NAMES: LazyLock<Mutex<HashSet<&'static str>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+                let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
+                let interned = match names.get(name) {
+                    Some(name) => *name,
+                    None => {
+                        let name: &'static str = Box::leak(name.to_owned().into_boxed_str());
+                        names.insert(name);
+                        name
+                    }
+                };
+                Ok(Self::Other(interned))
+            }
+            _ => Err("reasoning effort must be a lowercase name [a-z0-9_-]{1,32} (e.g. none, low, high, xhigh, max)".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod effort_tests {
+    use super::ThinkingLevel::*;
+    use super::*;
+
+    #[test]
+    fn names_roundtrip_and_intern() {
+        for name in ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "unknown", "a_1-z", &"a".repeat(32)] {
+            let level: ThinkingLevel = name.parse().unwrap();
+            assert_eq!(level.to_string(), name);
+            assert_eq!(serde_json::to_string(&level).unwrap(), format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<ThinkingLevel>(&format!("\"{name}\"")).unwrap(), level);
+            let again: ThinkingLevel = name.to_owned().parse().unwrap();
+            assert!(std::ptr::eq(level.as_str(), again.as_str()));
+        }
+        assert_eq!("off".parse::<ThinkingLevel>().unwrap(), Off);
+        assert_eq!(serde_json::from_str::<ThinkingLevel>("\"off\"").unwrap(), Off);
+        for (name, level) in [("MAX", Max), ("High", High), ("OFF", Off), ("None", Off), ("XHigh", Xhigh)] {
+            assert_eq!(name.parse::<ThinkingLevel>().unwrap(), level);
+        }
+        // Copy + 内存驻留：同名 Other 永远指向同一个 &'static str。
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<ThinkingLevel>();
+        let ultra: ThinkingLevel = "ultra".parse().unwrap();
+        let copied = ultra;
+        assert_eq!(ultra, copied);
+        assert_eq!(ultra, Other("ultra"));
+        assert_eq!(serde_json::from_str::<Vec<ThinkingLevel>>(r#"["max","ultra","none"]"#).unwrap(), [Max, Other("ultra"), Off]);
+        for name in ["", "Ultra", "two words", "a.b", "é", &"a".repeat(33)] {
+            assert!(name.parse::<ThinkingLevel>().is_err());
+        }
+    }
+
+    #[test]
+    fn only_provider_order_ranks_other_names() {
+        assert!(Max > Xhigh);
+        assert_eq!(Other("ultra").partial_cmp(&Max), None);
+        let levels = [Low, Other("ultra"), High, Other("unknown"), Max];
+        assert_eq!(Other("ultra").rank_in(&levels), Some(1));
+        assert_eq!(Other("ultra").nearest_in(&levels), Some(Other("ultra")));
+        assert_eq!(Other("absent").nearest_in(&levels), None);
+        assert_eq!(Xhigh.nearest_in(&[Medium, High, Max]), Some(Max));
+        assert_eq!(Minimal.nearest_in(&[Off, Low]), Some(Low));
+        assert_eq!(High.nearest_in(&[]), None);
     }
 }
 

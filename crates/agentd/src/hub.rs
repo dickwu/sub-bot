@@ -3,7 +3,7 @@ use crate::{
     issues::{IssueEvent, IssueScope, Reporter, Severity},
     webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
-use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
+use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, openai::OpenAiProvider, Message, ModelInfo, Provider, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
 use agent_session::Session;
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
@@ -358,23 +358,6 @@ pub struct Hub {
     models_cache: tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<ModelInfo>)>>,
 }
 
-/// 按模型能力处理推理强度：不支持则忽略（warn），取值不支持则换成最接近的（warn），未知模型原样发送。
-pub fn resolve_effort(model: &str, requested: Option<ThinkingLevel>) -> Option<ThinkingLevel> {
-    let level = requested?;
-    match reasoning_support(model) {
-        ReasoningSupport::Unsupported => {
-            tracing::warn!(model, requested = %level, "model does not support reasoning_effort; ignoring");
-            None
-        }
-        ReasoningSupport::Levels(ls) if !ls.contains(&level) => {
-            let n = level.nearest_in(ls);
-            tracing::warn!(model, requested = %level, using = %n.map(|l| l.as_str()).unwrap_or("-"), "reasoning_effort not supported by model; using nearest");
-            n
-        }
-        _ => Some(level),
-    }
-}
-
 fn expand_tools(names: &[String]) -> Result<Vec<String>> {
     let mut out = vec![];
     for n in names {
@@ -703,7 +686,7 @@ impl Hub {
         let provider_id = select_provider(req.provider.as_deref(), p.provider.as_deref(), &model, &self.default_provider);
         let provider = self.provider(provider_id)?;
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
-        let reasoning = if provider_id == "openai" { resolve_effort(&model, requested_effort) } else { requested_effort };
+        let reasoning = agent_ai::resolve_effort(provider_id, &model, requested_effort).effective;
         let config = LoopConfig {
             provider,
             model,

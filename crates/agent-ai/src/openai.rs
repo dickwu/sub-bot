@@ -32,9 +32,26 @@ fn effective_effort(cache: &EffortCache, key: &EffortKey, requested: Option<Thin
     let requested = requested?;
     match cache.lock().unwrap().get(key) {
         Some(None) => None,
-        Some(Some(levels)) => requested.nearest_in(levels),
+        Some(Some(levels)) => runtime_effort(requested, levels),
         None => Some(requested),
     }
+}
+
+/// 运行时列表是排序依据：在列表中按位置取，内置名称取最近（平局取高）；无法定位的名称取最高档。
+fn runtime_effort(requested: ThinkingLevel, levels: &[ThinkingLevel]) -> Option<ThinkingLevel> {
+    requested.nearest_in(levels).or_else(|| levels.last().copied())
+}
+
+/// 提取 provider 给出的顺序（包括未来的新名称），供运行时缓存和探测报告共用。
+pub fn supported_values(body: &str) -> Vec<ThinkingLevel> {
+    let decoded = serde_json::from_str::<Value>(body).ok();
+    let message = decoded.as_ref().and_then(|v| v["error"]["message"].as_str()).unwrap_or(body);
+    let Some((_, tail)) = message.split_once("Supported values are:") else { return vec![] };
+    let tail = tail.split('.').next().unwrap_or(tail);
+    if let Some(quote) = tail.chars().find(|c| matches!(c, '\'' | '"')) {
+        return tail.split(quote).skip(1).step_by(2).filter_map(|name| name.parse().ok()).collect();
+    }
+    tail.split([',', ' ', '[', ']', '\n', '\r']).filter(|name| !name.is_empty() && *name != "and").filter_map(|name| name.parse().ok()).collect()
 }
 
 /// OpenAI 关于推理强度的 400 错误分类。
@@ -58,9 +75,10 @@ fn parse_effort_error(body: &str) -> Option<EffortError> {
     if body.contains("Unrecognized request argument") || body.contains("Unsupported parameter") {
         return Some(EffortError::Unsupported);
     }
-    let tail = &body[body.find("Supported values are:")?..];
-    let tail = &tail[..tail.find('.').unwrap_or(tail.len())];
-    let levels: Vec<ThinkingLevel> = tail.split('\'').skip(1).step_by(2).filter_map(|w| w.parse().ok()).collect();
+    if !body.contains("Supported values are:") {
+        return None;
+    }
+    let levels = supported_values(body);
     Some(if levels.is_empty() { EffortError::Unsupported } else { EffortError::Levels(levels) })
 }
 
@@ -83,6 +101,7 @@ impl OpenAiProvider {
 
     fn resolve_api(&self, req: &Request) -> Api {
         match req.api {
+            Api::Auto if req.raw_effort => default_api(&req.model),
             Api::Auto => self.api_cache.lock().unwrap().get(&req.model).copied().unwrap_or_else(|| default_api(&req.model)),
             a => a,
         }
@@ -235,20 +254,22 @@ struct CallCtx {
 }
 
 async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
-    let max_retries = req.llm_max_retries.unwrap_or(3);
+    let max_retries = if req.raw_effort { 0 } else { req.llm_max_retries.unwrap_or(3) };
     let mut state = (ctx, req, api, attempt);
-    crate::retry::run_with_retries(&mut state, max_retries, tx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3))).await
+    crate::retry::run_with_retries(&mut state, max_retries, tx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3)))
+        .await
+        .map_err(|error| redact(&if ctx.key.expose().is_empty() { error } else { error.replace(ctx.key.expose(), "[redacted]") }))
 }
 
 /// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。
 async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, CallError> {
-    let requested = req.reasoning;
+    let requested = if req.raw_effort { req.reasoning } else { crate::models::resolve_effort("openai", &req.model, req.reasoning).effective };
     let auto = req.api == Api::Auto;
     let mut retries = 0;
     let mut tried: Vec<(Api, Option<ThinkingLevel>)> = vec![];
     let resp = loop {
         let key = (req.model.clone(), api, !req.tools.is_empty());
-        req.reasoning = effective_effort(&ctx.effort_cache, &key, requested);
+        req.reasoning = if req.raw_effort { requested } else { effective_effort(&ctx.effort_cache, &key, requested) };
         tried.push((api, req.reasoning));
         *attempt = (api, req.reasoning);
         let (url, body) = match api {
@@ -272,8 +293,9 @@ async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Ass
         let retry_after = resp.headers().get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()).and_then(retry_after);
         // Preserve HTTP classification even if reading the error body fails/times out.
         let text = tokio::time::timeout(ctx.stream_idle_timeout, resp.text()).await.ok().and_then(Result::ok).unwrap_or_default();
-        let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {text}", api.as_str()));
-        if status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
+        let safe_text = if ctx.key.expose().is_empty() { text.clone() } else { text.replace(ctx.key.expose(), "[redacted]") };
+        let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {safe_text}", api.as_str()));
+        if req.raw_effort || status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
             record(api, req.reasoning);
             return Err(CallError { reason: err_msg, transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after });
         }
@@ -303,7 +325,7 @@ async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Ass
                 tracing::warn!(issue = "typed", model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), "model does not accept reasoning effort; retrying without it");
             }
             EffortError::Levels(levels) => {
-                let next = requested.and_then(|r| r.nearest_in(&levels));
+                let next = requested.and_then(|r| runtime_effort(r, &levels));
                 tracing::warn!(issue = "typed", model = %req.model, api = %api, requested = %requested.map(|l| l.as_str()).unwrap_or("-"), using = next.map(|l| l.as_str()).unwrap_or("-"), supported = ?levels, "reasoning effort not supported by model; using nearest");
                 ctx.effort_cache.lock().unwrap().insert(key, Some(levels));
             }
@@ -320,6 +342,9 @@ async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Ass
         _ => parse_chat(resp, &req.model, &tx, ctx.stream_idle_timeout).await?,
     };
     msg.api = Some(api);
+    if let Some(error) = &mut msg.error_message {
+        *error = redact(&if ctx.key.expose().is_empty() { error.clone() } else { error.replace(ctx.key.expose(), "[redacted]") });
+    }
     msg.reasoning_effort = req.reasoning;
     Ok(msg)
 }
@@ -431,7 +456,7 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
 }
 
 /// 去掉错误信息里任何形似 API key 的片段（OpenAI 401 会回显部分 key）。
-pub(crate) fn redact(s: &str) -> String {
+pub fn redact(s: &str) -> String {
     s.split_inclusive(|c: char| c.is_whitespace() || c == '"' || c == '\'' || c == ',')
         .map(|w| {
             if w.trim_start_matches(|c: char| !c.is_alphanumeric()).starts_with("sk-") {
@@ -465,7 +490,8 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let provider = OpenAiProvider::with_stream_idle_timeout(crate::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(200));
-        let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None, llm_max_retries: Some(0) };
+        let req =
+            Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None, raw_effort: false, thinking: None, llm_max_retries: Some(0) };
         let started = std::time::Instant::now();
         let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.expect("stream hung");
         server.abort();
@@ -513,11 +539,99 @@ mod tests {
                 }
             });
             let provider = OpenAiProvider::new(crate::Secret::new("test"), Some(format!("http://{addr}")));
-            let req = Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: Some(ThinkingLevel::High), api, max_tokens: None, llm_max_retries: Some(0) };
+            let req = Request {
+                model: "test".into(),
+                system_prompt: None,
+                messages: vec![],
+                tools: vec![],
+                reasoning: Some(ThinkingLevel::High),
+                api,
+                max_tokens: None,
+                raw_effort: false,
+                thinking: None,
+                llm_max_retries: Some(0),
+            };
             let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.unwrap();
             server.await.unwrap();
             assert!(matches!(events.last(), Some(AssistantEvent::Done { .. })));
             assert!(!events.iter().any(|event| matches!(event, AssistantEvent::Retry { .. })));
+        }
+    }
+
+    #[test]
+    fn provider_order_includes_unknown_levels() {
+        use ThinkingLevel::*;
+        let expected = vec![Low, Max, Other("ultra"), Other("unknown"), Other("and")];
+        for text in
+            ["reasoning_effort: Supported values are: 'low', 'max', 'ultra', 'unknown', and 'and'.", "reasoning.effort: Supported values are: \"low\", \"max\", \"ultra\", \"unknown\", and \"and\"."]
+        {
+            assert_eq!(parse_effort_error(text), Some(EffortError::Levels(expected.clone())));
+            assert_eq!(supported_values(&json!({"error":{"message":text}}).to_string()), expected);
+        }
+        assert_eq!(runtime_effort(High, &expected), Some(Max));
+        assert_eq!(runtime_effort(Off, &[Minimal, Low, Medium, High]), Some(Minimal));
+        assert_eq!(runtime_effort(Xhigh, &[Low, Medium, High]), Some(High));
+        assert_eq!(runtime_effort(High, &[Other("ultra"), Other("mega")]), Some(Other("mega")));
+        assert_eq!(runtime_effort(Other("ultra"), &expected), Some(Other("ultra")));
+        assert_eq!(runtime_effort(Other("absent"), &expected), Some(Other("and")));
+    }
+
+    #[tokio::test]
+    async fn runtime_order_cache_and_raw_bypass() {
+        use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+        #[derive(Clone, Default)]
+        struct Mock(Arc<Mutex<Vec<Value>>>);
+        async fn handler(State(mock): State<Mock>, Json(body): Json<Value>) -> (StatusCode, String) {
+            let mut requests = mock.0.lock().unwrap();
+            let index = requests.len();
+            requests.push(body);
+            if matches!(index, 0 | 3) {
+                return (StatusCode::BAD_REQUEST, "reasoning_effort: Supported values are: 'max', 'ultra', 'unknown'.".into());
+            }
+            if index == 4 {
+                return (StatusCode::SERVICE_UNAVAILABLE, "busy".into());
+            }
+            (StatusCode::OK, "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n".into())
+        }
+        for api in [Api::Chat, Api::Responses] {
+            let mock = Mock::default();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let provider = OpenAiProvider::new(crate::Secret::new("test"), Some(format!("http://{}", listener.local_addr().unwrap())));
+            let app = Router::new().route("/chat/completions", post(handler)).route("/responses", post(handler)).with_state(mock.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let mut req = Request {
+                model: "gpt-5".into(),
+                reasoning: Some(ThinkingLevel::Off),
+                raw_effort: false,
+                thinking: None,
+                api,
+                system_prompt: None,
+                messages: vec![],
+                tools: vec![],
+                max_tokens: Some(1024),
+                llm_max_retries: Some(3),
+            };
+            for _ in 0..2 {
+                let events = provider.stream(req.clone(), CancellationToken::new()).collect::<Vec<_>>().await;
+                assert!(matches!(events.last(), Some(AssistantEvent::Done { message }) if message.reasoning_effort == Some(ThinkingLevel::Max)));
+            }
+            req.raw_effort = true;
+            for level in [ThinkingLevel::Other("ultra"), ThinkingLevel::Max] {
+                req.reasoning = Some(level);
+                let events = provider.stream(req.clone(), CancellationToken::new()).collect::<Vec<_>>().await;
+                assert!(matches!(events.last(), Some(AssistantEvent::Error { message }) if message.reasoning_effort == Some(level)));
+                assert!(!events.iter().any(|e| matches!(e, AssistantEvent::Retry { .. })));
+            }
+            req.reasoning = Some(ThinkingLevel::Off);
+            provider.stream(req, CancellationToken::new()).collect::<Vec<_>>().await;
+            let requests = mock.0.lock().unwrap();
+            let field = if api == Api::Chat { "/reasoning_effort" } else { "/reasoning/effort" };
+            let levels: Vec<_> = requests.iter().map(|v| v.pointer(field).unwrap().as_str().unwrap()).collect();
+            assert_eq!(levels, ["low", "max", "max", "ultra", "max", "none"]);
+            assert_eq!(provider.effort_cache.lock().unwrap().get(&("gpt-5".into(), api, false)), Some(&Some(vec![ThinkingLevel::Max, ThinkingLevel::Other("ultra"), ThinkingLevel::Other("unknown")])));
+            server.abort();
         }
     }
 

@@ -13,11 +13,23 @@ pub struct Request {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub reasoning: Option<ThinkingLevel>,
+    /// 探测专用：绕过目录、能力缓存、降级及瞬态重试。
+    pub raw_effort: bool,
+    /// 仅 raw_effort 时覆盖 Anthropic thinking；默认 adaptive。
+    pub thinking: Option<ProbeThinking>,
     /// 走哪个 OpenAI API（其它 provider 忽略）
     pub api: Api,
     pub max_tokens: Option<u32>,
     /// Additional transient-error attempts; None uses the default (3).
     pub llm_max_retries: Option<u32>,
+}
+
+/// 原始能力探测的 Anthropic thinking 变体，不改变正常请求的模型机制。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeThinking {
+    Adaptive,
+    Omit,
+    Enabled,
 }
 
 /// Provider 抽象，对应 pi-ai 中每个 `api/*.ts` 的 `streamSimple`。

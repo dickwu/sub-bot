@@ -69,6 +69,8 @@ fn request() -> Request {
         api: Api::Auto,
         max_tokens: None,
         llm_max_retries: Some(1),
+        raw_effort: false,
+        thinking: None,
     }
 }
 
@@ -170,6 +172,72 @@ async fn thinking_signature_and_redacted_round_trip() {
 }
 
 #[test]
+fn per_model_effort_bodies() {
+    use ThinkingLevel::*;
+    for (model, level, thinking, effort, max_tokens) in [
+        ("claude-sonnet-5-5", Max, json!({"type":"adaptive"}), json!("max"), 128000),
+        ("claude-sonnet-4-6", High, json!({"type":"adaptive"}), json!("high"), 32000),
+        ("claude-opus-4-5-20251101", Medium, json!({"type":"enabled","budget_tokens":16384}), json!("medium"), 20480),
+        ("claude-haiku-4-5-20251001", Low, json!({"type":"enabled","budget_tokens":8192}), Value::Null, 16000),
+        ("claude-future", Other("ultra"), json!({"type":"adaptive"}), json!("ultra"), 16000),
+    ] {
+        let mut req = request();
+        req.model = model.into();
+        req.reasoning = Some(level);
+        let body = build_body(&req);
+        assert_eq!(body["thinking"], thinking, "{model}");
+        assert_eq!(body["output_config"]["effort"], effort, "{model}");
+        assert_eq!(body["max_tokens"], max_tokens, "{model}");
+        assert!(body.get("temperature").is_none());
+        req.max_tokens = Some(999999);
+        assert_eq!(build_body(&req)["max_tokens"], crate::effort_caps("anthropic", model).max_output.unwrap());
+        req.reasoning = None;
+        let body = build_body(&req);
+        assert!(body.get("thinking").is_none() && body.get("output_config").is_none());
+    }
+    let mut req = request();
+    req.model = "claude-sonnet-5-5".into();
+    for (level, tokens) in [(Medium, 32000), (High, 32000), (Xhigh, 64000), (Max, 128000)] {
+        // medium is below this model's allowed top three, so clamps to high.
+        req.reasoning = Some(level);
+        assert_eq!(build_body(&req)["max_tokens"], tokens);
+    }
+    req.max_tokens = Some(2048);
+    assert_eq!(build_body(&req)["max_tokens"], 2048);
+}
+
+#[tokio::test]
+async fn effective_metadata_and_raw_bypass() {
+    let server = server(vec![(200, sse(text_events())), (400, "thinking is not supported".into()), (503, "busy".into())]).await;
+    let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
+    let mut req = request();
+    req.model = "claude-sonnet-4-6".into();
+    req.reasoning = Some(ThinkingLevel::Xhigh);
+    assert_eq!(done(&collect(&provider, req.clone()).await).reasoning_effort, Some(ThinkingLevel::Max));
+    req.raw_effort = true;
+    req.reasoning = Some(ThinkingLevel::Other("ultra"));
+    req.max_tokens = Some(2048);
+    req.llm_max_retries = Some(3);
+    for _ in 0..2 {
+        let events = collect(&provider, req.clone()).await;
+        assert!(matches!(events.last(), Some(AssistantEvent::Error { message }) if message.reasoning_effort == req.reasoning));
+        assert!(!events.iter().any(|e| matches!(e, AssistantEvent::Retry { .. })));
+    }
+    let requests = server.mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    for (_, body) in &requests[1..] {
+        assert_eq!(body["output_config"]["effort"], "ultra");
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(body["max_tokens"], 2048);
+    }
+    for (variant, expected) in [(ProbeThinking::Omit, Value::Null), (ProbeThinking::Enabled, json!({"type":"enabled","budget_tokens":1024}))] {
+        req.thinking = Some(variant);
+        assert_eq!(build_body(&req)["thinking"], expected);
+        assert_eq!(build_body(&req)["output_config"]["effort"], "ultra");
+    }
+}
+
+#[test]
 fn body_shape_merging_caching_images_and_budgets() {
     let mut req = request();
     req.reasoning = Some(ThinkingLevel::High);
@@ -211,14 +279,13 @@ fn body_shape_merging_caching_images_and_budgets() {
     assert!(body.get("temperature").is_none() && body.get("top_k").is_none());
     for level in [ThinkingLevel::Off, ThinkingLevel::Minimal] {
         req.reasoning = Some(level);
-        assert!(build_body(&req).get("thinking").is_none());
+        assert_eq!(build_body(&req)["thinking"]["budget_tokens"], 8192); // top-three clamp to low
     }
+    req.reasoning = None;
     req.max_tokens = None;
-    assert_eq!(build_body(&req)["max_tokens"], 16384);
-    req.model = "claude-3-7-sonnet-20250219".into();
-    // Older Claude models use the conservative default too.
+    assert_eq!(build_body(&req)["max_tokens"], 16000);
     req.model = "claude-3-5-sonnet-20241022".into();
-    assert_eq!(build_body(&req)["max_tokens"], 8192);
+    assert_eq!(build_body(&req)["max_tokens"], 8192); // legacy models keep the conservative default
 }
 
 #[tokio::test]
@@ -300,12 +367,15 @@ async fn thinking_adjustment_is_not_transient_retry() {
 async fn models_paginate() {
     let server = server(vec![
         (200, json!({"data":[{"id":"claude-sonnet-4", "created_at":"2025-05-14T00:00:00Z"}], "has_more":true, "last_id":"claude-sonnet-4"}).to_string()),
-        (200, json!({"data":[{"id":"claude-opus-4"}], "has_more":false, "last_id":"claude-opus-4"}).to_string()),
+        (200, json!({"data":[{"id":"claude-opus-4-5-20251101"}], "has_more":false, "last_id":"claude-opus-4-5-20251101"}).to_string()),
     ])
     .await;
     let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
     let models = provider.list_models().await.unwrap();
-    assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["claude-opus-4", "claude-sonnet-4"]);
+    assert_eq!(models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["claude-opus-4-5-20251101", "claude-sonnet-4"]);
+    assert_eq!(models[0].reasoning_efforts, [ThinkingLevel::Low, ThinkingLevel::Medium, ThinkingLevel::High]);
+    assert_eq!(models[0].allowed_efforts, models[0].reasoning_efforts);
+    assert_eq!(models[0].default_effort, Some(ThinkingLevel::High));
     assert!(models.iter().all(|m| crate::models::is_chat_model(&m.id)));
     assert!(models[1].created.is_some());
     let requests = server.mock.requests.lock().unwrap();

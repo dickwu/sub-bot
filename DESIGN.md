@@ -17,7 +17,7 @@
 - 启动计算 needed 集合：默认 provider + 默认模型推断 + 每个 profile 的显式/推断选择。needed 缺 key 即失败；其它 provider 有来源才加载，无来源静默跳过（debug）。faux 无需 key、始终注册。显式配置但无效的 key 文件仍是错误，不降级到低优先级来源。
 - `providers.<id>` 保存 apiKeyFile/baseUrl；顶层 apiKeyFile 是 OpenAI 别名，两者冲突拒绝。key 文件按配置目录解析，CLI 文件 > provider FILE 环境变量 > 配置文件 > provider key 环境变量。base URL 环境变量优先于配置。Hub 加载时只记录 key_source，并将所有 key 注册到共享 Reporter 的脱敏列表。
 - 模型目录按 provider 独立缓存 10 分钟，输出扁平模型信息 + provider；筛选只请求选定 provider，OpenAI 对话/快照过滤不影响其它 provider。目录请求失败整体返回错误（不返回不完整目录）。profiles 暴露解析后的 provider；LLM issue scope 带 provider，用于归因和去重。
-- 非 OpenAI 忽略 API 选择，reasoning 作为 thinking level 原样传入。Hub 使用 `AnthropicProvider::with_stream_idle_timeout(Secret, Option<String>, Duration)` 连接真实 Messages API，传入已加载的 key、base URL 和 idle timeout。支持 tool_result 合并、签名 thinking 回放、最多三个缓存断点及分页模型目录；message_start / message_delta 的 usage 按字段保留最新非 null 值。
+- 非 OpenAI 忽略 API 选择，reasoning 按 provider/model 的 effort catalog 解析。Hub 使用 `AnthropicProvider::with_stream_idle_timeout(Secret, Option<String>, Duration)` 连接真实 Messages API，传入已加载的 key、base URL 和 idle timeout。支持 tool_result 合并、签名 thinking 回放、最多三个缓存断点及分页模型目录；message_start / message_delta 的 usage 按字段保留最新非 null 值。
 - ask 的同步 SSE 错误、异步提交/轮询 HTTP 错误包含服务端 JSON error；非 JSON 错误保留 HTTP 状态摘要。
 
 ## v0.7.0 流式客户端与可靠性改进
@@ -278,14 +278,15 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 
 ---
 
-### 模型选择与推理强度（v0.2）
-- `ThinkingLevel`：`none`（别名 `off`）/ `minimal` / `low` / `medium` / `high` / `xhigh`，对应 OpenAI 的 `reasoning_effort`。
-- 优先级：会话请求（HTTP `model`/`reasoningEffort`、CLI `--model`/`--reasoning-effort`）> profile > 全局默认；`allowedModels` 支持 `*` 通配。
-- `agent-ai/src/models.rs` 有一张静态能力表（2026-10 实测）：gpt-4.x/gpt-4o 不支持；gpt-5/-mini/-nano 为 minimal..high；gpt-5.1 为 none/low/medium/high；gpt-5.2 及以后加 xhigh；o3 为 low..xhigh；chat-latest 只有 medium。建会话时按表处理：不支持就忽略并 warn，档位不支持就取最接近的并 warn。
-- 实测：gpt-5.4 及以后在 Chat Completions 上拒绝“函数工具 + reasoning_effort”（只能 none），gpt-6.x 带工具时完全不可用（要求 /v1/responses）。v0.3 起 `api: auto` 让这些模型默认走 Responses API；`auto` 下遇到该错误也会切换并缓存。推理强度降级缓存的键是（模型, API, 是否带工具），每次调用最多重试 2 次，且不会重复尝试同一组 (API, 强度)。
-- 实际生效的 API 和推理强度写在每条 `AssistantMessage` 的 `api` / `reasoningEffort` 上，`run --json`、会话响应和 RPC `get_state` 都报告实际值。
-- 预算：profile 的 `maxOutputTokens` 限制单次输出；`tokenBudget` 限制整次运行，超出后注入一条提示并做最后一次不带工具的调用，让模型直接给出结论。
-- 表外模型（如 gpt-6.x）先原样发送；OpenAI 返回 400 时 `openai.rs` 解析错误（`Unrecognized request argument` → 不支持；`Supported values are: ...` → 可选档位），按模型缓存，warn 后自动重试一次。
+### 模型选择与推理强度（v0.8.0 phase 1，未升版本）
+- `ThinkingLevel` 保持 Copy：内置顺序 none（别名 off）< minimal < low < medium < high < xhigh < max；`Other(&'static str)` 接受 `[a-z0-9_-]{1,32}`，全局 Mutex<HashSet> 去重后 Box::leak。serde/Display 输出原始名称；Other 没有全局 rank，`rank_in` 只使用 provider 有序列表的位置。
+- `agent-ai::models::{effort_caps, allowed_efforts, resolve_effort}` 是统一能力/策略入口；`EffortCaps` 带完整 levels、mechanism、default、max_output。OpenAI 精确匹配列出的 gpt-5/5.1..5.6/6.x（不对未来型号做前缀猜测），保留实测 o3 的 xhigh；Claude 去掉日期后缀匹配。文档来源 URL 留在代码注释中。
+- `allowed_efforts` 取完整 levels 的最高三档（none/minimal 计数）；请求低于范围向上钳制，缺档/超高内置名称取最近允许档位（平局取高），未列出的 Other 取最高档并标记 `unknown level`。Unsupported 省略，Unknown 原样；未指定保持 None，不填入目录 default。`EffortResolution` 保留 requested/effective/adjusted，调整记 warn。
+- Anthropic 已列出的 Full/NoXhigh 模型用 adaptive + output_config.effort（上限 128000）；opus-4-5 用 effort + enabled budget；sonnet/haiku-4-5 只用 budget，三档映射 8192/16384/32000（上限 64000）。未知 Claude 用 adaptive + effort 原样发送，上限 64000。None 不发 thinking/effort。Adaptive 默认 max_tokens 按有效档位 16000/16000/32000/64000/模型上限；显式额度优先；budget 模式至少 budget+4096；全部封顶模型上限。不发 temperature，保留 signed/redacted thinking 回放。
+- 优先级仍为请求/CLI > profile > 全局默认，`allowedModels` 仍是模型白名单。Hub 只委托 agent-ai 解析；provider 也对直接调用执行策略。`ModelInfo` 保留完整 reasoningEfforts，增加 allowedEfforts/defaultEffort；`models` 用方括号标记允许三档并打印 default。
+- OpenAI 运行时 `Supported values are: ...` 解析任意名称并保留顺序；内置名称按已知档位取最近（平局取高），无法定位的名称取最高档。缓存键（模型、API、是否带工具）和最多两次能力调整不变；auto 的工具冲突仍可切换 Responses。实际 API/effort 写入 AssistantMessage 元数据。
+- `sub-bot probe-efforts --model <id> [--provider openai|anthropic] [--levels none,minimal,low,medium,high,xhigh,max,ultra] [--api chat|responses] [--json]` 只加载选定 provider 的正常配置/key，不创建 Hub/会话。`Request.raw_effort` 绕过目录、缓存、降级和瞬态重试；每档一次无工具短请求（OpenAI none 256、其余 1024，Anthropic 2048）。Anthropic 默认 adaptive，thinking 字段被 400 拒绝时重试一次 omit；`--thinking adaptive|omit|enabled` 固定变体。结果含 accepted/status/variant、脱敏后最多 300 字符 error、原序 supportedValues。CLI/faux/本地 HTTP 测试覆盖原样发送与回退。
+- 仅 phase 1：不增加动态 effort HTTP/RPC API，不升版本。profile 的 maxOutputTokens、整次运行 tokenBudget 语义保持原有边界（Anthropic 额外应用上述模型预算规则）。
 
 ## v0.3.2 reliability
 

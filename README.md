@@ -324,6 +324,26 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 
 ### 实测能力（不经过钳制）
 
+2026-11-02 用 `probe-efforts` 对账号内全部模型逐档实测（none…max + ultra）：
+
+| 模型 | 接受的档位 | 最高三档 |
+|---|---|---|
+| gpt-5 / 5-mini / 5-nano | minimal, low, medium, high | low, medium, high |
+| gpt-5.1 | none, low, medium, high | low, medium, high |
+| gpt-5.2 / 5.4 / 5.4-mini / 5.4-nano / 5.5 | none … xhigh | medium, high, xhigh |
+| gpt-5.6-luna/sol/terra, gpt-6-luna/sol, gpt-6.1-terra | none, low … max | high, xhigh, max |
+| gpt-6-astra, gpt-6.1-sol | low … max | high, xhigh, max |
+| o3 | low, medium, high | low, medium, high |
+| chat-latest | medium | medium |
+| gpt-4.x / 3.5 | 不支持 reasoning_effort | - |
+| claude fable-5/5-1, opus-4-7/4-8/5/5-5, sonnet-5/5-5, haiku-5-5 | low … max | high, xhigh, max |
+| claude opus-4-6, sonnet-4-6 | low, medium, high, max | medium, high, max |
+| claude opus-4-5 | low, medium, high（effort + budget） | low, medium, high |
+| claude haiku-4-5 | 不支持 effort（仅 budget） | low, medium, high（映射为 budget） |
+
+`ultra` 两家 API 都不接受：OpenAI 返回 `Supported values are: 'none', 'minimal', 'low', 'medium', 'high', 'xhigh', and 'max'`，Anthropic 返回 `Input should be 'low', 'medium', 'high', 'xhigh' or 'max'`。`max` 在两家都高于 `xhigh`。
+
+
 ```bash
 sub-bot probe-efforts --model gpt-6-astra --api responses --openai-key-file keys/openai.key
 sub-bot --config sub-bot.json probe-efforts --model claude-sonnet-5-5 --provider anthropic --levels high,xhigh,max,ultra --json

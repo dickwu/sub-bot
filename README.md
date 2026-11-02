@@ -7,7 +7,7 @@
 - OpenAI / Anthropic API key 从文件或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.8.0。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.8.1。OpenAI 默认模型改为 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -236,19 +236,21 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 
 离线试用（不调用 OpenAI）：加上 `--provider faux`。
 
+**默认 OpenAI 模型**：默认模型是 `gpt-6.1-sol`；推荐的 OpenAI 模型只有 `gpt-6.1-sol` 与 `gpt-6-astra`。不带 `--config` 且 provider 为 OpenAI 时，内置 `default` profile 的 `allowedModels` 只允许这两个（`--model` 显式指定的其它模型会自动加入）。需要其它 OpenAI 模型时，在配置文件 profile 的 `allowedModels` 中显式添加（或不填 `allowedModels` 表示不限制）。
+
 `serve` 收到 Ctrl-C 或 SIGTERM 时停止接受新会话/提交，取消正在运行的会话，等运行收尾并写入 JSONL 后退出。
 
 ## 配置（`sub-bot.json`）
 
 ```jsonc
 {
-  "defaultModel": "gpt-4.1-mini",
+  "defaultModel": "gpt-6.1-sol",            // 默认 gpt-6.1-sol
   "sessionIdleTtlSecs": 3600,                 // 普通会话空闲 TTL，0 禁用
   "chatSessionTtlSecs": 600,                  // /v1/chat 自动创建会话的空闲 TTL，0 禁用（独立于普通 TTL）
   "maxSessionsPerClient": 64,                // 每个 client 的内存会话上限，0 不限制
   "taskTtlSecs": 3600,                       // 已完成任务保留秒数（从完成时计时）；0 在下次清理时过期
   "webhookMaxAttempts": 6,                   // webhook 最大投递次数（含首次）
-  "defaultReasoningEffort": "low",            // 可选：全局默认推理强度
+  "defaultReasoningEffort": "high",           // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
   "streamIdleTimeoutSecs": 300,               // LLM 流连续无字节的超时；推理模型可能长时间静默
   "chatTimeoutSecs": 900,                     // /v1/chat 非流式默认等待上限
@@ -257,9 +259,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
       "tools": ["read", "ls", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"
-      "model": "gpt-5.4-mini",                 // profile 默认模型
-      "allowedModels": ["gpt-5*", "gpt-4.1*"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制
-      "reasoningEffort": "medium",             // 可选：none|minimal|low|medium|high|xhigh|max 或 provider 小写名称
+      "model": "gpt-6.1-sol",                  // profile 默认模型
+      "allowedModels": ["gpt-6.1-sol", "gpt-6-astra"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制；其它 OpenAI 模型需在此显式添加
+      "reasoningEffort": "high",               // 可选：none|minimal|low|medium|high|xhigh|max 或 provider 小写名称
       "api": "auto",                           // 可选：auto|chat|responses，覆盖 defaultApi
       "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
       "tokenBudget": 300000,                   // 可选：整次运行的 token 预算，用完后禁止再调工具、要求直接给结论
@@ -305,14 +307,16 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 ## 模型与推理强度
 
 ```bash
-sub-bot models                       # 合并已加载 provider 的模型；OpenAI 默认去掉非对话模型和日期快照
+sub-bot models                       # 合并已加载 provider 的模型；OpenAI 默认去掉非对话模型和日期快照；行首 * = 被 profile 的 allowedModels 允许
 sub-bot models --all --json          # 全部模型，JSON 输出
 sub-bot --config sub-bot.json models --profile coder   # 只列 coder 的 allowedModels 允许的
-sub-bot --model gpt-5.4-mini --reasoning-effort high run "解释一下这个仓库的结构"
-sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
+sub-bot --model gpt-6.1-sol --reasoning-effort high run "解释一下这个仓库的结构"
+sub-bot --model gpt-6-astra --reasoning-effort xhigh run --json "say hi"
 ```
 
 `models` 显示 provider、模型 id、完整推理档位和 `default`；方括号标出允许的最高三档，例如 `low,medium,[high,xhigh,max] default=medium`。`-` 表示不支持，`?` 表示未知。JSON 保留完整 `reasoningEfforts`，新增 `allowedEfforts` 和 `defaultEffort`。
+
+不带 `--profile` 时，若已加载配置中 OpenAI 相关 profile 设置了 `allowedModels`，文本输出在被任一 profile 允许的模型行首标 `*`（stderr 摘要注明 `* = allowed by profiles`，`--all` 同样标记）；`--json` 每个模型带布尔字段 `allowed`（任一 profile 允许即 true；没有任何 profile 限制时都为 true）。`--profile` 仍只列该 profile 允许的模型。
 
 - 名称支持 `none`（别名 `off`，内置名称大小写不敏感）、`minimal`、`low`、`medium`、`high`、`xhigh`、`max`，以及 `[a-z0-9_-]{1,32}` 的未来 provider 名称（如 `ultra`）。未知名称不假定全局排序，只采用 provider 列表的顺序。
 - 模型优先级：请求/命令行 > profile > `defaultModel`；`allowedModels` 仍是模型白名单。
@@ -457,7 +461,7 @@ sub-bot ask --effort high "解释这个仓库"
 ```bash
 # 一次性调用，等待结果
 curl -s localhost:7878/v1/chat -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
-  -d '{"message":"给 src/lib.rs 加单元测试并运行 cargo test","session":{"profile":"coder","cwd":"my-project","model":"gpt-5.4","reasoningEffort":"high"}}'
+  -d '{"message":"给 src/lib.rs 加单元测试并运行 cargo test","session":{"profile":"coder","cwd":"my-project","model":"gpt-6-astra","reasoningEffort":"high"}}'
 
 # 查询可用模型
 curl -s 'localhost:7878/v1/models?profile=coder' -H "Authorization: Bearer $BOT_TOKEN"
@@ -536,7 +540,7 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 ← {"type":"agent_settled","aborted":false}
 ```
 
-模型和推理强度用全局参数指定：`sub-bot --model gpt-5.4-mini --reasoning-effort low rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。
+模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。
 
 支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
 

@@ -254,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
     let load = |fallback_token: &str| -> anyhow::Result<config::Config> {
         match &cli.config {
             Some(p) => config::Config::load(p),
-            None => Ok(config::Config::fallback(cli.model.clone().unwrap_or_else(|| "gpt-4.1-mini".into()), fallback_token, cli.workspace.clone())),
+            None => Ok(config::Config::fallback_for(cli.provider.as_deref(), cli.model.clone(), fallback_token, cli.workspace.clone())),
         }
     };
     let fallback_token = match &cli.cmd {
@@ -420,14 +420,34 @@ async fn main() -> anyhow::Result<()> {
                 let p = hub.config.profiles.get(name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
                 list.retain(|m| config::Config::model_allowed(p, &m.model.id));
             }
+            // --profile 过滤后剩下的都被该 profile 允许；否则按所有 profile 的 allowedModels 标记。
+            let (allowed, restricted) =
+                if profile.is_some() { (vec![true; list.len()], false) } else { allowed_by_profiles(&list, hub.config.profiles.values().map(|p| (hub.profile_provider(p), p))) };
             if json {
-                println!("{}", serde_json::to_string_pretty(&list)?);
+                let out: Vec<serde_json::Value> = list
+                    .iter()
+                    .zip(&allowed)
+                    .map(|(m, &ok)| {
+                        let mut v = serde_json::to_value(m)?;
+                        v["allowed"] = serde_json::json!(ok);
+                        Ok(v)
+                    })
+                    .collect::<serde_json::Result<_>>()?;
+                println!("{}", serde_json::to_string_pretty(&out)?);
             } else {
-                for m in &list {
+                for (m, &ok) in list.iter().zip(&allowed) {
                     let efforts = format_efforts(&m.model);
-                    println!("{:<12} {:<32} {} default={}", m.provider, m.model.id, efforts, m.model.default_effort.map(|l| l.as_str()).unwrap_or("?"));
+                    let mark = if !restricted {
+                        ""
+                    } else if ok {
+                        "* "
+                    } else {
+                        "  "
+                    };
+                    println!("{mark}{:<12} {:<32} {} default={}", m.provider, m.model.id, efforts, m.model.default_effort.map(|l| l.as_str()).unwrap_or("?"));
                 }
-                eprintln!("{} models (reasoning efforts: [...] = allowed top-three, '-' = unsupported, '?' = unknown, passed through)", list.len());
+                let marker = if restricted { ", * = allowed by profiles" } else { "" };
+                eprintln!("{} models (reasoning efforts: [...] = allowed top-three, '-' = unsupported, '?' = unknown, passed through{marker})", list.len());
             }
         }
     }
@@ -441,6 +461,25 @@ fn add_usage(total: &mut agent_ai::Usage, u: &agent_ai::Usage) {
     total.cache_write += u.cache_write;
     total.reasoning += u.reasoning;
     total.total_tokens += u.total_tokens;
+}
+
+/// 每个模型是否被 profile 的 allowedModels 允许：只看与模型同 provider 且设置了 allowedModels 的 profile，任一允许即 true；
+/// 该 provider 没有任何 profile 限制时为 true。第二个返回值表示列表涉及的 provider 是否存在 allowedModels 限制（决定是否显示 `*` 标记）。
+fn allowed_by_profiles<'a>(list: &[hub::ProviderModel], profiles: impl IntoIterator<Item = (&'a str, &'a config::Profile)>) -> (Vec<bool>, bool) {
+    let restricting: Vec<(&str, &config::Profile)> = profiles.into_iter().filter(|(_, p)| p.allowed_models.is_some()).collect();
+    let mut restricted = false;
+    let allowed = list
+        .iter()
+        .map(|m| {
+            let mut relevant = restricting.iter().filter(|(provider, _)| *provider == m.provider).peekable();
+            if relevant.peek().is_none() {
+                return true;
+            }
+            restricted = true;
+            relevant.any(|(_, p)| config::Config::model_allowed(p, &m.model.id))
+        })
+        .collect();
+    (allowed, restricted)
 }
 
 fn format_efforts(model: &agent_ai::ModelInfo) -> String {
@@ -526,6 +565,30 @@ mod tests {
         let model = agent_ai::models::info_for("claude-sonnet-4-6".into(), None, None);
         assert_eq!(format_efforts(&model), "low,[medium,high,max]");
         assert_eq!(model.default_effort, Some(ThinkingLevel::High));
+    }
+
+    #[test]
+    fn models_allowed_by_profiles_marks_union_per_provider() {
+        let model = |provider: &str, id: &str| hub::ProviderModel { provider: provider.into(), model: agent_ai::models::info_for(id.into(), None, None) };
+        let list = vec![model("openai", "gpt-6.1-sol"), model("openai", "gpt-6-astra"), model("openai", "gpt-5.5"), model("anthropic", "claude-opus-5-5")];
+        let profile = |allowed: Option<&[&str]>| {
+            let mut p = config::Config::fallback("faux".into(), "t", ".".into()).profiles.remove("default").unwrap();
+            p.allowed_models = allowed.map(|l| l.iter().map(|s| s.to_string()).collect());
+            p
+        };
+        // 没有任何 allowedModels：全部 allowed，不显示标记。
+        let open = profile(None);
+        assert_eq!(allowed_by_profiles(&list, [("openai", &open)]), (vec![true; 4], false));
+        assert_eq!(allowed_by_profiles(&list, []), (vec![true; 4], false));
+        // openai profile 的并集；anthropic 不受 openai profile 限制。
+        let sol = profile(Some(&["gpt-6.1-sol"]));
+        let astra = profile(Some(&["gpt-6-astra"]));
+        assert_eq!(allowed_by_profiles(&list, [("openai", &sol), ("openai", &astra), ("openai", &open)]), (vec![true, true, false, true], true));
+        let defaults = profile(Some(config::DEFAULT_OPENAI_ALLOWED_MODELS));
+        assert_eq!(allowed_by_profiles(&list, [("openai", &defaults)]).0, [true, true, false, true]);
+        // 只有 anthropic profile 限制时 openai 模型不受影响。
+        let claude = profile(Some(&["claude-sonnet*"]));
+        assert_eq!(allowed_by_profiles(&list, [("anthropic", &claude)]), (vec![true, true, true, false], true));
     }
 
     #[test]

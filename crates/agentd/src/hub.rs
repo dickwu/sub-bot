@@ -89,6 +89,8 @@ pub(crate) struct SessionDynamic {
     last_call: Mutex<Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)>>,
     /// 已收到过 prompt：此后 depth 不能再修改，路由不再改变
     prompted: AtomicBool,
+    /// 最近一次 warn 过的推理强度调整 (模型, 请求值)，避免同一调整重复 warn
+    effort_warned: Mutex<Option<(String, Option<ThinkingLevel>)>>,
 }
 
 impl SessionDynamic {
@@ -98,7 +100,16 @@ impl SessionDynamic {
 
     /// 按当前模型解析推理强度并写入会话；返回解析结果和实际值是否变化。
     fn apply_effort(&self, requested: Option<ThinkingLevel>) -> (EffortResolution, bool) {
-        let resolution = agent_ai::resolve_effort(&self.provider_id, &self.model.get(), requested);
+        let model = self.model.get();
+        let resolution = agent_ai::resolve_effort_quiet(&self.provider_id, &model, requested);
+        // 调整只在会话层 warn，且同一 (模型, 请求值) 只报一次（创建与路由都会解析；provider 内部的二次解析只记 debug）。
+        if let Some(reason) = &resolution.adjusted {
+            let mut warned = self.effort_warned.lock().unwrap();
+            if warned.as_ref() != Some(&(model.clone(), requested)) {
+                tracing::warn!(session_id = %self.session_id, provider = %self.provider_id, model = %model, requested = ?requested, effective = ?resolution.effective, reason = %reason, "reasoning effort adjusted");
+                *warned = Some((model, requested));
+            }
+        }
         *self.effort.lock().unwrap() = (requested, resolution.adjusted.clone());
         let changed = self.reasoning.set(resolution.effective) != resolution.effective;
         if changed {
@@ -223,6 +234,12 @@ impl SessionDynamic {
         let (resolution, changed) = self.apply_effort(requested);
         if changed {
             emit(self.effort_event(&resolution));
+        }
+        // session_run span 在 submit 时用基础模型创建；路由（含 deep / latest: / auto）确定后更新为实际模型和推理强度。
+        let span = tracing::Span::current();
+        if span.metadata().is_some_and(|m| m.name() == "session_run") {
+            span.record("model", tracing::field::display(&routing.model));
+            span.record("reasoning_effort", resolution.effective.map(|l| l.as_str()).unwrap_or("-"));
         }
         tracing::info!(session_id = %self.session_id, depth = routing.depth.as_str(), model = %routing.model, reason = %routing.reason, "model routed");
         emit(AgentEvent::ModelRouted { routing: serde_json::to_value(&routing).unwrap_or_default() });
@@ -980,6 +997,7 @@ impl Hub {
             }),
             last_call: Mutex::new(None),
             prompted: AtomicBool::new(false),
+            effort_warned: Mutex::new(None),
         });
         dynamic.plan();
         dynamic.apply_effort(requested_effort);
@@ -1483,6 +1501,82 @@ pub(crate) mod tests {
         prompt_and_wait(&h, "hello").await;
         assert_eq!(h.routing().model, "claude-opus-5-5");
         assert!(h.routing().reason.contains("no model matches latest:claude-fable"), "{}", h.routing().reason);
+    }
+
+    /// 捕获 WARN 事件消息与 session_run span 上重录的字段。
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<String>>>);
+
+    struct FieldText<'a>(&'a str, Option<String>);
+    impl tracing::field::Visit for FieldText<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == self.0 {
+                self.1 = Some(value.to_string());
+            }
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == self.0 {
+                self.1 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>> tracing_subscriber::Layer<S> for Capture {
+        fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut v = FieldText("message", None);
+                event.record(&mut v);
+                self.0.lock().unwrap().push(format!("warn:{}", v.1.unwrap_or_default()));
+            }
+        }
+        fn on_record(&self, id: &tracing::span::Id, values: &tracing::span::Record<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if ctx.span(id).is_some_and(|s| s.name() == "session_run") {
+                for name in ["model", "reasoning_effort"] {
+                    let mut v = FieldText(name, None);
+                    values.record(&mut v);
+                    if let Some(value) = v.1 {
+                        self.0.lock().unwrap().push(format!("{name}:{value}"));
+                    }
+                }
+            }
+        }
+    }
+
+    fn capture() -> (Capture, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = Capture::default();
+        let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
+        (capture, guard)
+    }
+
+    #[tokio::test]
+    async fn session_run_span_records_routed_model() {
+        let catalog = vec!["claude-opus-5-5", "claude-fable-5-1"];
+        let (hub, _) = claude_hub(catalog, |p| p.deep_model = Some("latest:claude-fable".into()));
+        let (capture, _guard) = capture();
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { depth: Some(Depth::Deep), reasoning_effort: Some(ThinkingLevel::High), ..Default::default() }).unwrap();
+        assert_eq!(h.model(), "claude-opus-5-5");
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(h.routing().model, "claude-fable-5-1");
+        let seen = capture.0.lock().unwrap().clone();
+        assert!(seen.contains(&"model:claude-fable-5-1".to_string()), "{seen:?}");
+        assert!(seen.iter().any(|s| s.starts_with("reasoning_effort:")), "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn effort_adjustment_warns_once_per_session_model() {
+        let (hub, _) = claude_hub(vec![], |p| p.model = Some("claude-sonnet-4-6".into()));
+        let (capture, _guard) = capture();
+        let warns = || capture.0.lock().unwrap().iter().filter(|s| *s == "warn:reasoning effort adjusted").count();
+        // 创建时解析一次，第一次 prompt 路由时再次解析同一 (模型, 请求值)：只 warn 一次。
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { reasoning_effort: Some(ThinkingLevel::Xhigh), ..Default::default() }).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        prompt_and_wait(&h, "again").await;
+        assert_eq!(warns(), 1);
+        // 请求值变化后的新调整再 warn 一次；不需要调整时不 warn。
+        h.set_reasoning_effort(Some(ThinkingLevel::Low));
+        h.set_reasoning_effort(Some(ThinkingLevel::High));
+        assert_eq!(warns(), 2);
     }
 
     #[tokio::test]

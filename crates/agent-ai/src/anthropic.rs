@@ -107,7 +107,7 @@ impl Provider for AnthropicProvider {
 
     fn stream(&self, mut req: Request, cancel: CancellationToken) -> EventStream {
         if !req.raw_effort {
-            req.reasoning = crate::models::resolve_effort("anthropic", &req.model, req.reasoning).effective;
+            req.reasoning = crate::models::resolve_effort_quiet("anthropic", &req.model, req.reasoning).effective;
         }
         let (tx, rx) = mpsc::channel(64);
         let provider = self.clone();
@@ -242,9 +242,9 @@ pub fn build_body(req: &Request) -> Value {
     if let Some(last) = messages.iter_mut().rev().find(|m| m["role"] == "user").and_then(|m| m["content"].as_array_mut()).and_then(|blocks| blocks.last_mut()) {
         last["cache_control"] = json!({"type":"ephemeral"});
     }
-    use crate::models::{effort_caps, resolve_effort, EffortMechanism::*};
+    use crate::models::{effort_caps, resolve_effort_quiet, EffortMechanism::*};
     let caps = effort_caps("anthropic", &req.model);
-    let level = if req.raw_effort { req.reasoning } else { resolve_effort("anthropic", &req.model, req.reasoning).effective };
+    let level = if req.raw_effort { req.reasoning } else { resolve_effort_quiet("anthropic", &req.model, req.reasoning).effective };
     let budget = if matches!(caps.mechanism, AnthropicEffortWithBudget | AnthropicBudgetOnly) && !req.raw_effort { thinking_budget(level) } else { None };
     let default_tokens = match level {
         Some(ThinkingLevel::High) => 32000,

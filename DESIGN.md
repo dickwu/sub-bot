@@ -11,6 +11,13 @@
 
 ---
 
+## v0.8.1 OpenAI 默认模型
+
+- `config::DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"`（全局 `defaultModel` 默认值与 CLI 回退），`DEFAULT_OPENAI_ALLOWED_MODELS = ["gpt-6.1-sol", "gpt-6-astra"]`。
+- `Config::fallback_for`（无 `--config`）：provider 为 openai（或未指定且模型不是 `claude-*`）时 default profile 的 `allowedModels` 为上述两个，`--model` 显式指定的其它模型自动加入；anthropic/faux 不限制。显式配置文件仍可使用任何模型。
+- `sub-bot models`：无 `--profile` 时按同 provider、设置了 `allowedModels` 的 profile 并集标记 `*`，JSON 增加 `allowed`。
+- 推理强度调整：hub 的 `SessionDynamic::apply_effort` 按 (模型, 请求值) 去重后 warn 一次；provider 内部用 `resolve_effort_quiet`（debug）。`session_run` span 在路由后重录 `model` / `reasoning_effort`。
+
 ## v0.8.0 动态推理强度与 Claude 模型路由
 
 - **运行期可变配置**：`agent_core::LoopConfig` 的 `model` 与 `reasoning` 改为 `Shared<T>`（`Arc<Mutex<T>>` 包装）。`stream_assistant` 每次模型调用读取一次快照，所以修改从**下一次调用**生效，包括正在进行的 run（工具结果之后那次调用）。`LoopConfig.before_run: Option<BeforeRun>` 是一个异步 hook，Agent 在每次 run 的第一次模型调用之前调用（与 abort 竞争：取消时不再等待）；在 hook 执行期间 Agent 已处于 running，新的提交照常排队。`Agent::emit` 允许在会话事件流上广播运行期事件。新增事件 `effort_changed {requested, effective, adjusted}` 与 `model_routed {routing}`。

@@ -2,8 +2,8 @@
   "dataDir": "/var/lib/sub-bot",
   "shutdownGraceSecs": 10,
   "defaultProvider": "openai",
-  "defaultModel": "gpt-4.1",
-  "defaultReasoningEffort": "low",
+  "defaultModel": "gpt-6.1-sol",
+  "defaultReasoningEffort": "high",
   "defaultApi": "auto",
   "apiKeyFile": "/etc/sub-bot/openai.key",
   "providers": {
@@ -42,12 +42,12 @@
       "workspaceRoots": ["./work"]
     },
     "coder": {
-      "model": "gpt-5.4-mini",
+      "model": "gpt-6.1-sol",
       "allowedModels": [
-        "gpt-5*",
-        "gpt-4.1*"
+        "gpt-6.1-sol",
+        "gpt-6-astra"
       ],
-      "reasoningEffort": "medium",
+      "reasoningEffort": "high",
       "workspaceRoots": [
         "./work"
       ],
@@ -65,7 +65,7 @@
       }
     },
     "reviewer": {
-      "model": "gpt-4.1-mini",
+      "model": "gpt-6-astra",
       "tools": [
         "preset:readonly"
       ],

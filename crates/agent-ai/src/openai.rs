@@ -263,7 +263,7 @@ async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Send
 
 /// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。
 async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, CallError> {
-    let requested = if req.raw_effort { req.reasoning } else { crate::models::resolve_effort("openai", &req.model, req.reasoning).effective };
+    let requested = if req.raw_effort { req.reasoning } else { crate::models::resolve_effort_quiet("openai", &req.model, req.reasoning).effective };
     let auto = req.api == Api::Auto;
     let mut retries = 0;
     let mut tried: Vec<(Api, Option<ThinkingLevel>)> = vec![];

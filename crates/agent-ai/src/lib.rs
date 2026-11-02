@@ -18,7 +18,7 @@ pub mod types;
 pub const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub use models::default_api;
-pub use models::{allowed_efforts, effort_caps, resolve_effort, EffortCaps, EffortMechanism, EffortResolution, ModelInfo, ReasoningSupport};
+pub use models::{allowed_efforts, effort_caps, resolve_effort, resolve_effort_quiet, EffortCaps, EffortMechanism, EffortResolution, ModelInfo, ReasoningSupport};
 pub use provider::{EventStream, ProbeThinking, Provider, ProviderRegistry, Request};
 pub use secrets::Secret;
 pub use types::*;

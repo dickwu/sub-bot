@@ -121,7 +121,25 @@ pub fn allowed_efforts(caps: &EffortCaps) -> Vec<ThinkingLevel> {
     caps.levels[caps.levels.len().saturating_sub(3)..].to_vec()
 }
 
+/// 解析推理强度；有调整时记一次 warn。供会话/请求层（hub）使用，每次解析只应在这一层报告。
 pub fn resolve_effort(provider_id: &str, model: &str, requested: Option<ThinkingLevel>) -> EffortResolution {
+    let result = resolve_effort_quiet(provider_id, model, requested);
+    if let Some(reason) = &result.adjusted {
+        tracing::warn!(provider = provider_id, model, requested = ?requested, effective = ?result.effective, reason, "reasoning effort adjusted");
+    }
+    result
+}
+
+/// 与 [`resolve_effort`] 结果相同，但调整只记 debug。provider 构造请求时的二次解析用它，避免与 hub 重复 warn。
+pub fn resolve_effort_quiet(provider_id: &str, model: &str, requested: Option<ThinkingLevel>) -> EffortResolution {
+    let result = resolve_effort_inner(provider_id, model, requested);
+    if let Some(reason) = &result.adjusted {
+        tracing::debug!(provider = provider_id, model, requested = ?requested, effective = ?result.effective, reason, "reasoning effort adjusted (request)");
+    }
+    result
+}
+
+fn resolve_effort_inner(provider_id: &str, model: &str, requested: Option<ThinkingLevel>) -> EffortResolution {
     let caps = effort_caps(provider_id, model);
     let mut result = EffortResolution { requested, effective: requested, adjusted: None };
     if let Some(level) = requested {
@@ -139,9 +157,6 @@ pub fn resolve_effort(provider_id: &str, model: &str, requested: Option<Thinking
             }
             _ => {}
         }
-    }
-    if let Some(reason) = &result.adjusted {
-        tracing::warn!(provider = provider_id, model, requested = ?requested, effective = ?result.effective, reason, "reasoning effort adjusted");
     }
     result
 }

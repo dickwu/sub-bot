@@ -334,8 +334,13 @@ fn default_chat_timeout_secs() -> u64 {
 }
 
 fn default_model() -> String {
-    "gpt-4.1-mini".into()
+    DEFAULT_OPENAI_MODEL.into()
 }
+
+/// 默认 OpenAI 模型（全局 defaultModel 的默认值）。
+pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6.1-sol";
+/// 内置 default profile（无配置文件、provider=openai）默认只允许的 OpenAI 模型；需要其它模型时在 profile 的 allowedModels 中显式添加。
+pub const DEFAULT_OPENAI_ALLOWED_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-astra"];
 
 /// provider=anthropic 且没有配置/请求模型时使用的默认 Claude 模型。
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
@@ -545,6 +550,27 @@ impl Config {
             }
         }
         Ok(())
+    }
+
+    /// 无配置文件时的内置配置（CLI 入口）：provider 为 openai（或未指定、按模型推断为 openai）时，default profile 只允许
+    /// [`DEFAULT_OPENAI_ALLOWED_MODELS`]；用户 `--model` 显式指定的其它模型也会加入，不会被拒绝。anthropic/faux 不限制。
+    pub fn fallback_for(provider: Option<&str>, model: Option<String>, token: &str, workspace: PathBuf) -> Self {
+        let explicit = model.clone();
+        let model = model.unwrap_or_else(|| DEFAULT_OPENAI_MODEL.into());
+        let mut cfg = Self::fallback(model.clone(), token, workspace);
+        let openai = match provider {
+            Some(p) => p == "openai",
+            None => !model.starts_with("claude-"),
+        };
+        if openai {
+            let mut allowed: Vec<String> = vec![];
+            if let Some(m) = explicit.filter(|m| !DEFAULT_OPENAI_ALLOWED_MODELS.contains(&m.as_str())) {
+                allowed.push(m);
+            }
+            allowed.extend(DEFAULT_OPENAI_ALLOWED_MODELS.iter().map(|m| m.to_string()));
+            cfg.profiles.get_mut("default").expect("default profile").allowed_models = Some(allowed);
+        }
+        cfg
     }
 
     /// 无配置文件时的默认值：一个以 `workspace` 为根、启用默认编码工具的 `default` profile + 单一 client。
@@ -766,6 +792,42 @@ mod tests {
         }
         let example: Config = serde_json::from_str(include_str!("../../../sub-bot.example.json")).unwrap();
         assert_eq!(example.profiles["claude"].deep_model.as_deref(), Some(DEFAULT_CLAUDE_DEEP_MODEL));
+        assert_eq!(example.default_model, DEFAULT_OPENAI_MODEL);
+        assert_eq!(example.profiles["coder"].model.as_deref(), Some(DEFAULT_OPENAI_MODEL));
+        assert_eq!(example.profiles["coder"].allowed_models.as_deref(), Some(&["gpt-6.1-sol".to_string(), "gpt-6-astra".to_string()][..]));
+        assert_eq!(example.profiles["reviewer"].model.as_deref(), Some("gpt-6-astra"));
+        assert!(Config::model_allowed(&example.profiles["coder"], "gpt-6-astra") && !Config::model_allowed(&example.profiles["coder"], "gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn default_openai_model_and_fallback_allowed_models() {
+        assert_eq!(DEFAULT_OPENAI_MODEL, "gpt-6.1-sol");
+        assert_eq!(DEFAULT_OPENAI_ALLOWED_MODELS, ["gpt-6.1-sol", "gpt-6-astra"]);
+        let parsed: Config = serde_json::from_str(r#"{"profiles":{}}"#).unwrap();
+        assert_eq!(parsed.default_model, DEFAULT_OPENAI_MODEL);
+        let allowed = |cfg: &Config| cfg.profiles["default"].allowed_models.clone();
+        let defaults: Vec<String> = DEFAULT_OPENAI_ALLOWED_MODELS.iter().map(|m| m.to_string()).collect();
+        // 未指定 provider / 显式 openai，且没有 --model：只允许两个默认模型。
+        for provider in [None, Some("openai")] {
+            let cfg = Config::fallback_for(provider, None, "t", PathBuf::from("."));
+            assert_eq!(cfg.default_model, DEFAULT_OPENAI_MODEL);
+            assert_eq!(allowed(&cfg).as_ref(), Some(&defaults));
+            assert!(Config::model_allowed(&cfg.profiles["default"], "gpt-6-astra"));
+            assert!(!Config::model_allowed(&cfg.profiles["default"], "gpt-5.5"));
+            cfg.validate().unwrap();
+        }
+        // --model 指定列表内模型：不重复；列表外模型：加入且不会被拒绝。
+        let cfg = Config::fallback_for(None, Some("gpt-6-astra".into()), "t", PathBuf::from("."));
+        assert_eq!((cfg.default_model.as_str(), allowed(&cfg)), ("gpt-6-astra", Some(defaults.clone())));
+        let cfg = Config::fallback_for(Some("openai"), Some("gpt-5.5".into()), "t", PathBuf::from("."));
+        assert_eq!(allowed(&cfg), Some(vec!["gpt-5.5".to_string(), "gpt-6.1-sol".into(), "gpt-6-astra".into()]));
+        assert!(Config::model_allowed(&cfg.profiles["default"], "gpt-5.5"));
+        // anthropic / faux（以及未指定 provider 但模型是 Claude）不受影响。
+        for (provider, model) in [(Some("anthropic"), None), (Some("faux"), None), (Some("anthropic"), Some("claude-sonnet-5-5")), (None, Some("claude-sonnet-5-5"))] {
+            let cfg = Config::fallback_for(provider, model.map(String::from), "t", PathBuf::from("."));
+            assert_eq!(allowed(&cfg), None, "{provider:?} {model:?}");
+        }
+        assert_eq!(allowed(&Config::fallback("faux".into(), "t", PathBuf::from("."))), None);
     }
 
     #[test]

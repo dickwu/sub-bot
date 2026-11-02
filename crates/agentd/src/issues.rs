@@ -46,6 +46,8 @@ pub struct IssueScope {
 pub struct IssueEvent {
     pub id: String,
     pub ts: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_ts: Option<u64>,
     pub severity: Severity,
     pub kind: String,
     pub component: String,
@@ -68,6 +70,7 @@ impl IssueEvent {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             ts: now_ms(),
+            last_ts: None,
             severity,
             kind: kind.into(),
             component: component.into(),
@@ -320,7 +323,7 @@ impl Reporter {
                     a.first.count = a.suppressed.saturating_add(1);
                     a.first.id = uuid::Uuid::new_v4().to_string();
                     a.first.ts = now_ms();
-                    self.emit(a.first);
+                    self.deliver(a.first);
                 }
             }
         }
@@ -333,10 +336,21 @@ impl Reporter {
             let key = (event.kind.clone(), event.component.clone(), event.scope.session_id.clone(), event.scope.client.clone(), event.scope.task_id.clone());
             if let Some(a) = dedup.get_mut(&key) {
                 a.suppressed = a.suppressed.saturating_add(1);
-                // Do not suppress a severity escalation below a receiver's threshold.
-                if event.severity > a.first.severity {
-                    a.first.severity = event.severity;
-                    self.emit(event);
+                a.first.count = a.suppressed.saturating_add(1);
+                a.first.last_ts = Some(event.ts.max(a.first.last_ts.unwrap_or(a.first.ts)));
+                // Escalations still reach receivers immediately, but belong to the same stored issue.
+                let escalated = event.severity > a.first.severity;
+                a.first.severity = a.first.severity.max(event.severity);
+                {
+                    let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(stored) = state.recent.iter_mut().find(|stored| stored.id == a.first.id) {
+                        *stored = a.first.clone();
+                    }
+                }
+                // JSONL snapshots are upserts by the first issue's id, not additional occurrences.
+                self.append_log(&a.first);
+                if escalated {
+                    self.deliver(event);
                 }
                 continue;
             }
@@ -348,7 +362,7 @@ impl Reporter {
                             if a.suppressed > 0 {
                                 a.first.count = a.suppressed.saturating_add(1);
                                 a.first.id = uuid::Uuid::new_v4().to_string();
-                                self.emit(a.first);
+                                self.deliver(a.first);
                             }
                         }
                     }
@@ -377,11 +391,6 @@ impl Reporter {
         targets
     }
     fn emit(self: &Arc<Self>, event: IssueEvent) {
-        let failure = event.kind == "webhook_delivery_failed";
-        let mut targets: Vec<_> = self.alerts.iter().filter(|t| event.severity >= t.min_severity.unwrap_or(Severity::Error)).cloned().collect();
-        let subscriptions = event.subscription_targets.clone().unwrap_or_else(|| self.subscription_targets(&event.scope));
-        targets.extend(subscriptions.into_iter().filter(|t| t.wants_issue(event.severity)));
-        targets.retain(|t| event.excluded_target.as_ref().is_none_or(|url| *url != normalize_url(&t.target.url)));
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.recent.len() == 1000 {
@@ -389,10 +398,14 @@ impl Reporter {
             }
             state.recent.push_back(event.clone());
         }
+        self.append_log(&event);
+        self.deliver(event);
+    }
+    fn append_log(&self, event: &IssueEvent) {
         if let Some(path) = &self.log_path {
             let result = (|| -> std::io::Result<()> {
                 let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-                let mut line = serde_json::to_vec(&event)?;
+                let mut line = serde_json::to_vec(event)?;
                 line.push(b'\n');
                 file.write_all(&line)
             })();
@@ -400,6 +413,14 @@ impl Reporter {
                 self.io_errors.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+    /// Delivery snapshots (including summaries) must not create additional recent issues.
+    fn deliver(self: &Arc<Self>, event: IssueEvent) {
+        let failure = event.kind == "webhook_delivery_failed";
+        let mut targets: Vec<_> = self.alerts.iter().filter(|t| event.severity >= t.min_severity.unwrap_or(Severity::Error)).cloned().collect();
+        let subscriptions = event.subscription_targets.clone().unwrap_or_else(|| self.subscription_targets(&event.scope));
+        targets.extend(subscriptions.into_iter().filter(|t| t.wants_issue(event.severity)));
+        targets.retain(|t| event.excluded_target.as_ref().is_none_or(|url| *url != normalize_url(&t.target.url)));
         for target in targets {
             if let Some(store) = self.store.lock().unwrap().as_ref().and_then(std::sync::Weak::upgrade) {
                 let delivery = crate::store::Delivery {
@@ -598,24 +619,112 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn dedupe_aggregates_at_window_end() {
-        let r = Reporter::new(&AlertsConfig { dedup_window_secs: 2, ..Default::default() }, None, vec![]);
-        r.report(event("one", Severity::Error));
+    async fn dedupe_updates_recent_before_window_end() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-dedup-{}", uuid::Uuid::new_v4()));
+        let r = Reporter::new(&AlertsConfig { dedup_window_secs: 2, ..Default::default() }, Some(dir.clone()), vec![]);
+        let first = event("one", Severity::Error);
+        let id = first.id.clone();
+        let ts = first.ts;
+        r.report(first);
         tokio::task::yield_now().await;
         assert_eq!(r.recent(None, 0, 100).len(), 1);
-        r.report(event("one", Severity::Error));
-        r.report(event("one", Severity::Error));
+        assert!(json!(r.recent(None, 0, 100)[0]).get("lastTs").is_none());
+        for offset in 1..=2 {
+            let mut next = event("one", Severity::Error);
+            next.ts = ts + offset;
+            r.report(next);
+        }
         tokio::task::yield_now().await;
-        assert_eq!(r.recent(None, 0, 100).len(), 1);
+        let events = r.recent(Some("bot"), 0, 100);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, id);
+        assert_eq!(events[0].ts, ts);
+        assert_eq!(events[0].count, 3);
+        assert_eq!(events[0].last_ts, Some(ts + 2));
+        let before = serde_json::to_value(&events).unwrap();
+        let log = std::fs::read_to_string(dir.join("issues.log")).unwrap();
+        let snapshots: Vec<Value> = log.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(snapshots.len(), 3);
+        for (i, snapshot) in snapshots.iter().enumerate() {
+            assert_eq!(snapshot["id"], id);
+            assert_eq!(snapshot["count"], i + 1);
+        }
+        assert_eq!(snapshots[2], before[0]);
         tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(serde_json::to_value(r.recent(None, 0, 100)).unwrap(), before);
+        assert_eq!(std::fs::read_to_string(dir.join("issues.log")).unwrap(), log);
+        r.report(event("one", Severity::Error));
         tokio::task::yield_now().await;
         let events = r.recent(None, 0, 100);
         assert_eq!(events.len(), 2);
-        assert_eq!(events[1].count, 3); // suppressed + first, not three new occurrences
+        assert_eq!(events[0].count, 3);
+        assert_eq!(events[1].count, 1);
         assert_ne!(events[0].id, events[1].id);
-        r.report(event("one", Severity::Error));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn dedupe_webhook_summary_agrees_with_recent() {
+        // Exercise both direct deliveries and the store-backed delivery path.
+        for persisted in [false, true] {
+            let (target, seen, _server) = receiver(StatusCode::NO_CONTENT, "dedup-key").await;
+            let dir = std::env::temp_dir().join(format!("sub-bot-dedup-store-{}", uuid::Uuid::new_v4()));
+            let store = persisted.then(|| crate::store::Store::open(&dir, Duration::from_secs(3600)).unwrap());
+            let r = Reporter::with_policy(&AlertsConfig { resolved: vec![target], dedup_window_secs: 1, ..Default::default() }, None, vec![], policy());
+            if let Some(store) = &store {
+                r.attach_store(store);
+            }
+            for _ in 0..3 {
+                r.report(event("one", Severity::Error));
+            }
+            tokio::task::yield_now().await;
+            let recent = r.recent(None, 0, 100);
+            assert_eq!(recent.len(), 1);
+            assert_eq!(recent[0].count, 3);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while seen.lock().unwrap().len() < 2 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+            r.flush(Duration::from_secs(2)).await;
+            let deliveries = seen.lock().unwrap().clone();
+            assert_eq!(deliveries.len(), 2);
+            assert_eq!(deliveries[0]["data"]["count"], 1);
+            assert_eq!(deliveries[1]["data"]["count"], 3);
+            assert_ne!(deliveries[0]["data"]["id"], deliveries[1]["data"]["id"]);
+            assert_eq!(serde_json::to_value(r.recent(None, 0, 100)).unwrap(), json!(recent));
+            if persisted {
+                drop(r);
+                drop(store);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dedupe_escalation_updates_same_recent_issue() {
+        let (mut target, seen, _server) = receiver(StatusCode::NO_CONTENT, "escalation-key").await;
+        target.min_severity = Some(Severity::Fatal);
+        let r = Reporter::with_policy(&AlertsConfig { resolved: vec![target], dedup_window_secs: 60, ..Default::default() }, None, vec![], policy());
+        let first = event("one", Severity::Warn);
+        let id = first.id.clone();
+        r.report(first);
+        r.report(event("one", Severity::Fatal));
         tokio::task::yield_now().await;
-        assert_eq!(r.recent(None, 0, 100).len(), 3);
+        let recent = r.recent(None, 0, 100);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, id);
+        assert_eq!(recent[0].count, 2);
+        assert_eq!(recent[0].severity, Severity::Fatal);
+        r.flush(Duration::from_secs(3)).await;
+        let deliveries = seen.lock().unwrap();
+        assert_eq!(deliveries.len(), 2); // immediate escalation plus summary
+        assert!(deliveries.iter().any(|d| d["data"]["count"] == 1));
+        assert!(deliveries.iter().any(|d| d["data"]["count"] == 2));
+        assert_eq!(serde_json::to_value(r.recent(None, 0, 100)).unwrap(), json!(recent));
     }
 
     #[tokio::test]

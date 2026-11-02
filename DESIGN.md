@@ -11,6 +11,19 @@
 
 ---
 
+## v0.8.0 动态推理强度与 Claude 模型路由
+
+- **运行期可变配置**：`agent_core::LoopConfig` 的 `model` 与 `reasoning` 改为 `Shared<T>`（`Arc<Mutex<T>>` 包装）。`stream_assistant` 每次模型调用读取一次快照，所以修改从**下一次调用**生效，包括正在进行的 run（工具结果之后那次调用）。`LoopConfig.before_run: Option<BeforeRun>` 是一个异步 hook，Agent 在每次 run 的第一次模型调用之前调用（与 abort 竞争：取消时不再等待）；在 hook 执行期间 Agent 已处于 running，新的提交照常排队。`Agent::emit` 允许在会话事件流上广播运行期事件。新增事件 `effort_changed {requested, effective, adjusted}` 与 `model_routed {routing}`。
+- **SessionDynamic**（hub.rs）：会话中运行期可变的部分——provider、`Shared` model/reasoning、请求的 effort 与调整原因、`Routing`、issue scope、最近一次调用、`prompted` 标志。它不引用 Agent / Hub，因此可以被 before_run hook 持有而不形成循环引用；模型目录缓存改为 `Arc<ModelsCache>` 供 hook 共享。
+- **推理强度**：所有入口（创建、PATCH、prompt/chat 顶层字段、RPC `set_reasoning_effort` / `prompt.reasoningEffort`、CLI `--effort`）都调用 `SessionHandle::set_reasoning_effort` → `resolve_effort(provider, 当前模型, requested)`（top-3 规则、钳制记 warn）。修改是粘性的；实际值变化时清空 last_call，使 `reasoningEffort` 报告新值直到下一次调用回写实际发送值（含 OpenAI 运行时降级）。每次修改广播 `effort_changed` 并记 info 日志。路由改变模型后用同一请求值重新解析。
+- **默认 Claude 模型**：`Hub::default_model_for(provider)`：`providers.<id>.defaultModel` > （anthropic 且全局 `defaultModel` 不是 `claude-*`）`claude-opus-5-5` > `defaultModel`；只在请求和 profile 都没有 model 时使用。
+- **路由**（routing.rs）：`depth = standard | deep | auto`，默认 `autoRoute ? auto : standard`。显式 `model` 总是胜出（reason `explicit model`）。anthropic profile 的 `deepModel` 默认**固定**为 `claude-fable-5-1`（默认配置不随新模型漂移）；`latest:<prefix>` 在路由时用 provider 模型目录（10 分钟缓存）解析：按 id 中前缀之后的数字段排序（`5-1` > `5`），含非数字段（如 `-preview`）的 id 不参与；同版本存在无日期 id 时忽略 8 位日期快照，否则取最新日期。解析失败 → 基础模型 + reason。
+  - standard / deep（固定 id）在创建和首个 prompt 之前的 PATCH 时同步规划（会话视图立即显示目标模型）；auto 与别名在 before_run hook 中决定。第一次 run 时 hook 设置 `decided=true` 并最终确定模型，之后不再路由；`prompted` 在第一次 submit 时置位，此后修改 depth 返回 `DepthLocked`（HTTP 409）。
+  - auto 分类器：routerModel（默认基础模型）一次调用，固定系统提示，用户消息为首个 prompt 文本（前 8000 字符），无工具，`max_tokens=200`，30 秒超时，1 次瞬态重试；推理强度为 low（仅当 low 在该模型允许的 top-3 中，否则不发送，避免被钳制成高强度）。在回复中逐个 `{` 尝试流式解析，取第一个含布尔 `deep` 的对象，reason 截为 20 个词。失败 → standard、reason `router error: ...`、warn issue `routing_error`（不包含模型输出或 prompt）。分类用量记在 `routing.usage`，`run --json` 的 `totalUsage` 包含它。未配置 deepModel 时跳过分类。
+- **报告**：`SessionHandle::effort_fields()` 统一输出 `reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`；用于会话视图（POST/GET/PATCH）、`/v1/chat` 响应与 task result、`run --json`、RPC `get_state`；`ask --json` 在结束时追加一行 `{"type":"session_state", ...会话视图}`。`/v1/profiles` 增加 `allowedEfforts` / `defaultEffort` / `routing{deepModel, autoRoute, routerModel, defaultDepth}`。
+- **HTTP**：新增 `PATCH /v1/sessions/{id}`（`{reasoningEffort?, depth?}`，未知字段 400）。JSON 请求体用 `ApiJson` 提取器，解析错误（含非法 effort/depth 名称）统一返回 400 而非 axum 默认 422；`POST /v1/sessions` 仍允许空请求体。
+- **RPC**：`run_io` 抽象 stdin/stdout 以便测试；新增 `set_reasoning_effort`，`prompt` 支持 `reasoningEffort` / `depth`；`rpc --depth`、`run --depth`。
+
 ## 多 provider 集成（v0.7.0）
 
 - Hub 持有按 id 索引的 provider registry；每个 Agent 的 LoopConfig 持有选定 provider 的 Arc，不依赖服务全局单一 provider。选择顺序为 session.provider > profile.provider > 有效模型 `claude-` 推断 > CLI/config 默认（最终 openai）。已建会话不会因后续请求而换 provider。

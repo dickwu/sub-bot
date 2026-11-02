@@ -9,14 +9,67 @@ use tokio_util::sync::CancellationToken;
 
 pub type Emit = Arc<dyn Fn(AgentEvent) + Send + Sync>;
 pub type Queue = Arc<Mutex<VecDeque<Message>>>;
+/// 每次 run 开始前（第一次模型调用之前）调用，参数是本次 run 的初始消息；可用于异步路由模型等。
+pub type BeforeRun = Arc<dyn Fn(Vec<Message>, Emit) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
+
+/// 运行期可修改的共享值：每次模型调用时读取快照，修改从下一次调用生效（包括正在进行的 run）。
+pub struct Shared<T>(Arc<Mutex<T>>);
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.lock().unwrap().fmt(f)
+    }
+}
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(Arc::new(Mutex::new(value)))
+    }
+    /// 替换并返回旧值。
+    pub fn set(&self, value: T) -> T {
+        std::mem::replace(&mut *self.0.lock().unwrap(), value)
+    }
+}
+
+impl<T: Clone> Shared<T> {
+    pub fn get(&self) -> T {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for Shared<String> {
+    fn from(value: &str) -> Self {
+        Self::new(value.to_string())
+    }
+}
 
 #[derive(Clone)]
 pub struct LoopConfig {
     pub provider: Arc<dyn Provider>,
-    pub model: String,
+    /// 运行期可修改（路由）；每次模型调用读取一次。
+    pub model: Shared<String>,
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn AgentTool>>,
-    pub reasoning: Option<ThinkingLevel>,
+    /// 运行期可修改（动态推理强度）；每次模型调用读取一次。
+    pub reasoning: Shared<Option<ThinkingLevel>>,
     pub api: agent_ai::Api,
     /// 每轮结束后注入（对应 `getSteeringMessages`）。
     pub steering: Queue,
@@ -31,6 +84,8 @@ pub struct LoopConfig {
     pub token_budget: Option<u64>,
     /// 单次运行的时间上限；None 表示不限时。
     pub run_timeout: Option<std::time::Duration>,
+    /// 见 [`BeforeRun`]；None 时不调用。
+    pub before_run: Option<BeforeRun>,
 }
 
 fn drain(q: &Queue) -> Vec<Message> {
@@ -68,9 +123,9 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             let over_budget = cfg.token_budget.is_some_and(|b| used_tokens >= b);
             let assistant = if turns > cfg.max_turns {
                 emit(AgentEvent::RunOutcome { kind: "max_turns".into() });
-                AssistantMessage::failed(&cfg.model, StopReason::Error, "max_turns exceeded")
+                AssistantMessage::failed(&cfg.model.get(), StopReason::Error, "max_turns exceeded")
             } else if over_budget && budget_forced {
-                AssistantMessage::failed(&cfg.model, StopReason::Error, "token budget exceeded")
+                AssistantMessage::failed(&cfg.model.get(), StopReason::Error, "token budget exceeded")
             } else if over_budget {
                 budget_forced = true;
                 emit(AgentEvent::RunOutcome { kind: "token_budget_exceeded".into() });
@@ -136,26 +191,27 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
 }
 
 async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
+    let model = cfg.model.get();
     let req = Request {
-        model: cfg.model.clone(),
+        model: model.clone(),
         system_prompt: cfg.system_prompt.clone(),
         messages: context.lock().unwrap().clone(),
         tools: if with_tools { cfg.tools.iter().map(|t| t.spec()).collect() } else { vec![] },
-        reasoning: cfg.reasoning,
+        reasoning: cfg.reasoning.get(),
         raw_effort: false,
         thinking: None,
         api: cfg.api,
         max_tokens: cfg.max_tokens,
         llm_max_retries: cfg.llm_max_retries,
     };
-    emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&cfg.model)) });
+    emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&model)) });
     let mut stream = cfg.provider.stream(req, cancel.clone());
     let mut final_msg = None;
     loop {
         let ev = tokio::select! {
             biased;
             _ = cancel.cancelled() => {
-                let message = AssistantMessage::failed(&cfg.model, StopReason::Aborted, "aborted");
+                let message = AssistantMessage::failed(&model, StopReason::Aborted, "aborted");
                 emit(AgentEvent::MessageUpdate { assistant_message_event: AssistantEvent::Error { message: message.clone() } });
                 final_msg = Some(message);
                 break;
@@ -175,7 +231,7 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
         }
         emit(AgentEvent::MessageUpdate { assistant_message_event: ev });
     }
-    let msg = final_msg.unwrap_or_else(|| AssistantMessage::failed(&cfg.model, StopReason::Error, "provider stream ended without done/error"));
+    let msg = final_msg.unwrap_or_else(|| AssistantMessage::failed(&model, StopReason::Error, "provider stream ended without done/error"));
     emit(AgentEvent::MessageEnd { message: Message::Assistant(msg.clone()) });
     msg
 }
@@ -293,7 +349,7 @@ mod tests {
             model: "m".into(),
             system_prompt: None,
             tools: vec![Arc::new(Echo)],
-            reasoning: None,
+            reasoning: Default::default(),
             api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
@@ -302,6 +358,7 @@ mod tests {
             llm_max_retries: None,
             token_budget: None,
             run_timeout: None,
+            before_run: None,
         };
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
@@ -341,7 +398,7 @@ mod tests {
             model: "m".into(),
             system_prompt: None,
             tools: vec![Arc::new(Echo)],
-            reasoning: None,
+            reasoning: Default::default(),
             api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
@@ -350,6 +407,7 @@ mod tests {
             llm_max_retries: None,
             token_budget: Some(250),
             run_timeout: None,
+            before_run: None,
         };
         let emit: Emit = Arc::new(|_| {});
         let ctx = Mutex::new(vec![]);

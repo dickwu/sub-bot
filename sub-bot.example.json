@@ -8,7 +8,8 @@
   "apiKeyFile": "/etc/sub-bot/openai.key",
   "providers": {
     "anthropic": {
-      "apiKeyFile": "/etc/sub-bot/anthropic.key"
+      "apiKeyFile": "/etc/sub-bot/anthropic.key",
+      "defaultModel": "claude-opus-5-5"
     }
   },
   "alerts": {
@@ -28,8 +29,16 @@
   "profiles": {
     "claude": {
       "provider": "anthropic",
-      "model": "claude-sonnet-4-5",
       "reasoningEffort": "high",
+      "deepModel": "claude-fable-5-1",
+      "autoRoute": true,
+      "routerModel": "claude-haiku-5-5",
+      "workspaceRoots": ["./work"]
+    },
+    "claude-latest": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5-5",
+      "deepModel": "latest:claude-fable",
       "workspaceRoots": ["./work"]
     },
     "coder": {
@@ -113,6 +122,7 @@
       "profiles": [
         "coder",
         "claude",
+        "claude-latest",
         "reviewer",
         "docs-writer"
       ]

@@ -3,23 +3,44 @@
 //! stdout 输出 `{"id":"1","type":"response","command":"prompt","success":true,"data":{...}}` 和事件行。
 //! 严格按 LF 分帧；日志一律走 stderr。
 use crate::config::Client;
-use crate::hub::{Hub, SessionRequest};
+use crate::hub::{Hub, SessionHandle, SessionRequest};
+use crate::routing::Depth;
+use agent_ai::ThinkingLevel;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 #[derive(Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 enum Command {
-    Prompt { message: String },
-    Steer { message: String },
-    FollowUp { message: String },
+    /// reasoningEffort：粘性修改（从这条消息起）；depth：只在第一次 prompt 时有效
+    Prompt {
+        message: String,
+        reasoning_effort: Option<ThinkingLevel>,
+        depth: Option<Depth>,
+    },
+    /// 修改会话推理强度（从下一次模型调用生效，运行中也一样）
+    SetReasoningEffort {
+        level: ThinkingLevel,
+    },
+    Steer {
+        message: String,
+    },
+    FollowUp {
+        message: String,
+    },
     Abort,
     GetMessages,
     GetState,
     GetAvailableModels,
+}
+
+fn state(hub: &Hub, session: &SessionHandle) -> Value {
+    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile});
+    data.as_object_mut().unwrap().extend(session.effort_fields());
+    data
 }
 
 fn send_response(out: &mpsc::UnboundedSender<Value>, id: Option<Value>, command: String, resp: Value) {
@@ -33,13 +54,17 @@ fn send_response(out: &mpsc::UnboundedSender<Value>, id: Option<Value>, command:
 
 /// stdio 的调用方就是父进程本身，视为可用全部 profile 的本地 client。
 pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
+    run_io(hub, req, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect(), ..Default::default() };
     let session = hub.create_session(&client, req)?;
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
 
     // 单一 writer，保证每条记录整行写出
     let writer = tokio::spawn(async move {
-        let mut stdout = tokio::io::stdout();
+        let mut stdout = output;
         while let Some(v) = out_rx.recv().await {
             let mut line = serde_json::to_vec(&v).unwrap_or_default();
             line.push(b'\n');
@@ -70,7 +95,7 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     });
 
     let mut requests = tokio::task::JoinSet::new();
-    let mut lines = BufReader::new(tokio::io::stdin()).split(b'\n');
+    let mut lines = BufReader::new(input).split(b'\n');
     while let Some(raw) = lines.next_segment().await? {
         while requests.try_join_next().is_some() {}
         let text = String::from_utf8_lossy(&raw);
@@ -89,8 +114,17 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
         let cmd_name = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
         let resp = match serde_json::from_value::<Command>(parsed) {
             Err(e) => json!({"success": false, "error": e.to_string()}),
-            Ok(Command::Prompt { message }) => {
-                json!({"success": true, "data": {"disposition": session.submit(message, None)}})
+            Ok(Command::Prompt { message, reasoning_effort, depth }) => match depth.map(|d| session.set_depth(d)).transpose() {
+                Err(e) => json!({"success": false, "error": e.to_string()}),
+                Ok(_) => {
+                    if let Some(level) = reasoning_effort {
+                        session.set_reasoning_effort(Some(level));
+                    }
+                    json!({"success": true, "data": {"disposition": session.submit(message, None)}})
+                }
+            },
+            Ok(Command::SetReasoningEffort { level }) => {
+                json!({"success": true, "data": session.set_reasoning_effort(Some(level)).json()})
             }
             Ok(Command::Steer { message }) => {
                 json!({"success": true, "data": {"disposition": session.submit(message, Some("steer"))}})
@@ -111,9 +145,7 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
                 });
                 continue;
             }
-            Ok(Command::GetState) => {
-                json!({"success": true, "data": {"sessionId": session.id, "isStreaming": session.agent.is_running(), "model": session.agent.config.model, "reasoningEffort": session.effective_effort(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile}})
-            }
+            Ok(Command::GetState) => json!({"success": true, "data": state(&hub, &session)}),
             Ok(Command::GetAvailableModels) => {
                 let hub = hub.clone();
                 let out = out_tx.clone();
@@ -137,4 +169,57 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     drop(out_tx);
     let _ = writer.await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncBufReadExt;
+
+    #[tokio::test]
+    async fn set_reasoning_effort_clamps_and_get_state_reports() {
+        let mut cfg = crate::config::Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<agent_ai::Request>::new()));
+        Arc::get_mut(&mut hub).unwrap().providers.insert("anthropic".into(), Arc::new(crate::hub::tests::RecordingProvider { id: "anthropic", seen: seen.clone(), models: vec![] }));
+        let (mut input, input_rx) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output) = tokio::io::duplex(1024 * 1024);
+        let req = SessionRequest { provider: Some("anthropic".into()), model: Some("claude-sonnet-4-6".into()), depth: Some(Depth::Deep), ..Default::default() };
+        let server = tokio::spawn(run_io(hub, req, input_rx, output_tx));
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let mut call = async |command: Value| -> Value {
+            input.write_all(format!("{command}\n").as_bytes()).await.unwrap();
+            loop {
+                let line: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                if line["type"] == "response" && line["id"] == command["id"] {
+                    return line;
+                }
+            }
+        };
+        let response = call(json!({"id": "1", "type": "set_reasoning_effort", "level": "low"})).await;
+        assert_eq!(response["success"], true);
+        assert_eq!(response["data"], json!({"requested": "low", "effective": "medium", "adjusted": "clamped to allowed top-three levels", "allowedEfforts": ["medium", "high", "max"]}));
+        assert_eq!(call(json!({"id": "2", "type": "set_reasoning_effort", "level": "NOT VALID"})).await["success"], false);
+        let state = call(json!({"id": "3", "type": "get_state"})).await;
+        assert_eq!((state["data"]["reasoningEffort"].clone(), state["data"]["requestedReasoningEffort"].clone()), (json!("medium"), json!("low")));
+        assert_eq!(state["data"]["routing"]["reason"], "explicit model");
+        assert_eq!(state["data"]["model"], "claude-sonnet-4-6");
+        let response = call(json!({"id": "4", "type": "prompt", "message": "hi", "reasoningEffort": "max"})).await;
+        assert_eq!(response["success"], true);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(seen.lock().unwrap()[0].reasoning, Some(ThinkingLevel::Max));
+        let response = call(json!({"id": "5", "type": "prompt", "message": "hi", "depth": "standard"})).await;
+        assert_eq!(response["success"], false);
+        assert!(response["error"].as_str().unwrap().contains("before the first prompt"));
+        drop(call);
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(3), server).await.unwrap().unwrap().unwrap();
+    }
 }

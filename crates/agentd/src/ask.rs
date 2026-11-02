@@ -21,9 +21,16 @@ pub struct Ask {
     /// Maximum seconds to wait for the request and final result (including async polling).
     #[arg(long, default_value_t = 3600)]
     pub timeout: u64,
-    /// Emit session metadata then NDJSON events in sync mode; with --async, print the final task JSON.
+    /// Emit session metadata then NDJSON events in sync mode (ending with a `session_state` line carrying
+    /// reasoningEffort/requestedReasoningEffort/effortAdjusted/allowedEfforts/routing); with --async, print the final task JSON.
     #[arg(long)]
     pub json: bool,
+    /// Use the profile's deep model (same as --depth deep).
+    #[arg(long, conflicts_with = "depth")]
+    pub deep: bool,
+    /// Model routing for a new session (or one without prompts yet): standard | deep | auto.
+    #[arg(long)]
+    pub depth: Option<crate::routing::Depth>,
     /// Message, or - to read stdin.
     pub message: String,
 }
@@ -34,6 +41,9 @@ pub struct Client {
     token: Option<axum::http::HeaderValue>,
     http: reqwest::Client,
     provider: Option<String>,
+    /// 粘性推理强度（/v1/chat 顶层 reasoningEffort）
+    effort: Option<agent_ai::ThinkingLevel>,
+    depth: Option<crate::routing::Depth>,
 }
 
 impl Client {
@@ -61,7 +71,7 @@ impl Client {
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Self { socket, url, token, http, provider: None })
+        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None })
     }
 
     async fn response(
@@ -109,10 +119,22 @@ impl Client {
         Ok((status, value))
     }
 
+    fn chat_body(&self, message: &str, profile: Option<&str>, session: Option<&str>, extra: Value) -> Value {
+        let mut body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session});
+        if let Some(effort) = self.effort {
+            body["reasoningEffort"] = json!(effort);
+        }
+        if let Some(depth) = self.depth {
+            body["depth"] = json!(depth);
+        }
+        body.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
+        body
+    }
+
     pub async fn ask_stream(&self, message: &str, profile: Option<&str>, session: Option<&str>, timeout_secs: u64, mut on_event: impl FnMut(&str, &Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
         use http_body_util::BodyExt;
         let request = async {
-            let body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session, "stream": true});
+            let body = self.chat_body(message, profile, session, json!({"stream": true}));
             let (status, headers, mut body, _connections) = self.response(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
             if !status.is_success() {
                 let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
@@ -153,7 +175,7 @@ impl Client {
     }
 
     async fn ask_async_inner(&self, message: &str, profile: Option<&str>, session: Option<&str>) -> anyhow::Result<Value> {
-        let body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session, "async": true});
+        let body = self.chat_body(message, profile, session, json!({"async": true}));
         let (status, response) = self.request(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
         if !status.is_success() {
             return Err(http_error(status, Some(&response)));
@@ -279,7 +301,7 @@ impl StreamOutcome {
     }
 }
 
-pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>) -> anyhow::Result<()> {
+pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: Option<agent_ai::ThinkingLevel>) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let mut message = args.message.clone();
     if message == "-" {
@@ -297,11 +319,17 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>) -> anyho
     let socket = args.socket.clone().or_else(|| (args.url.is_none() && default_socket.exists()).then_some(default_socket));
     let mut client = Client::new(socket, args.url.clone(), token.as_deref())?;
     client.provider = provider.map(str::to_owned);
+    client.effort = effort;
+    client.depth = if args.deep { Some(crate::routing::Depth::Deep) } else { args.depth };
     if !args.asynchronous {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
+        let mut session_id = None;
         let result = client
             .ask_stream(&message, args.profile.as_deref(), args.session.as_deref(), args.timeout, |data, event| {
+                if event["type"] == "session" {
+                    session_id = event["sessionId"].as_str().map(str::to_owned);
+                }
                 if args.json {
                     // Preserve the server JSON, removing only SSE's physical line breaks for NDJSON.
                     writeln!(stdout, "{}", data.replace(['\r', '\n'], ""))?;
@@ -317,6 +345,15 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>) -> anyho
         if !args.json {
             writeln!(stdout)?;
             stdout.flush()?;
+        } else if let Some(id) = session_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            // 结束时附上会话的推理强度与路由信息（失败不影响退出码）。
+            if let Ok((status, mut view)) = client.request(axum::http::Method::GET, &format!("/v1/sessions/{id}"), None).await {
+                if status.is_success() && view.is_object() {
+                    view["type"] = json!("session_state");
+                    writeln!(stdout, "{view}")?;
+                    stdout.flush()?;
+                }
+            }
         }
         return result;
     }
@@ -358,6 +395,17 @@ mod tests {
             assert_eq!(ask.timeout, expected);
         }
         assert!(crate::Cli::try_parse_from(["sub-bot", "ask", "--timeout", "-1", "hello"]).is_err());
+    }
+
+    #[test]
+    fn chat_body_carries_sticky_effort_and_depth() {
+        let mut client = Client::new(None, Some("http://127.0.0.1:1".into()), None).unwrap();
+        let body = client.chat_body("hi", None, Some("s"), json!({"stream": true}));
+        assert!(body.get("reasoningEffort").is_none() && body.get("depth").is_none());
+        client.effort = Some(agent_ai::ThinkingLevel::Max);
+        client.depth = Some(crate::routing::Depth::Deep);
+        let body = client.chat_body("hi", Some("p"), None, json!({"async": true}));
+        assert_eq!((body["reasoningEffort"].clone(), body["depth"].clone(), body["async"].clone(), body["session"]["profile"].clone()), (json!("max"), json!("deep"), json!(true), json!("p")));
     }
 
     #[cfg(unix)]

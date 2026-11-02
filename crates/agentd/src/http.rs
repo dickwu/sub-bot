@@ -1,13 +1,14 @@
 use crate::{
     config::{Client, Config, ResolvedTarget, TargetSpec, MAX_TARGETS},
-    hub::{Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
+    hub::{DepthLocked, Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
     issues::Severity,
+    routing::Depth,
     webhook::WebhookTarget,
 };
-use agent_ai::Message;
+use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
 use axum::{
-    extract::{Extension, Path, Query, Request, State},
+    extract::{Extension, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     middleware::{self, Next},
     response::{sse::Event, IntoResponse, Response, Sse},
@@ -92,7 +93,7 @@ pub(crate) fn test_router(hub: Arc<Hub>) -> Router {
 fn router(st: AppState) -> Router {
     let api = Router::new()
         .route("/v1/sessions", post(create_session))
-        .route("/v1/sessions/{id}", get(get_session).delete(delete_session))
+        .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
@@ -123,6 +124,38 @@ fn bad_request(e: impl std::fmt::Display) -> (StatusCode, Json<serde_json::Value
     (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()})))
 }
 
+/// JSON 请求体；任何解析错误（含非法 reasoningEffort / depth 名称）都返回 400 而不是 axum 默认的 422。
+pub(crate) struct ApiJson<T>(pub T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned> FromRequest<S> for ApiJson<T> {
+    type Rejection = (StatusCode, Json<serde_json::Value>);
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(Self(value)),
+            Err(e) => Err(bad_request(e.body_text())),
+        }
+    }
+}
+
+fn depth_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    if e.is::<DepthLocked>() {
+        (StatusCode::CONFLICT, Json(json!({"error": e.to_string()})))
+    } else {
+        bad_request(e)
+    }
+}
+
+/// 粘性修改：depth（仅第一次 prompt 之前）与推理强度（从下一次模型调用生效）。
+fn apply_overrides(h: &SessionHandle, effort: Option<ThinkingLevel>, depth: Option<Depth>) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(depth) = depth {
+        h.set_depth(depth).map_err(depth_error)?;
+    }
+    if let Some(level) = effort {
+        h.set_reasoning_effort(Some(level));
+    }
+    Ok(())
+}
+
 fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
     if e.is::<TooManySessions>() {
         (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))
@@ -133,7 +166,21 @@ fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
 
 async fn get_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
     let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
-    Ok(Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "model": h.agent.config.model, "isStreaming": h.agent.is_running()})).into_response())
+    Ok(Json(st.hub.session_view(&h)).into_response())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PatchBody {
+    reasoning_effort: Option<ThinkingLevel>,
+    /// 只能在第一次 prompt 之前修改（否则 409）
+    depth: Option<Depth>,
+}
+
+async fn patch_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, ApiJson(b): ApiJson<PatchBody>) -> ApiResult {
+    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    apply_overrides(&h, b.reasoning_effort, b.depth)?;
+    Ok(Json(st.hub.session_view(&h)).into_response())
 }
 
 async fn delete_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
@@ -148,7 +195,19 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
     let list: Vec<_> = c
         .profiles
         .iter()
-        .filter_map(|n| st.hub.config.profiles.get(n).map(|p| json!({"name": n, "provider": st.hub.profile_provider(p), "model": p.model.clone().unwrap_or_else(|| st.hub.config.default_model.clone()), "allowedModels": p.allowed_models, "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort), "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})))
+        .filter_map(|n| {
+            st.hub.config.profiles.get(n).map(|p| {
+                let provider = st.hub.profile_provider(p);
+                let model = st.hub.profile_model(p);
+                json!({"name": n, "provider": provider, "model": model, "allowedModels": p.allowed_models,
+                    "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort),
+                    "allowedEfforts": agent_ai::allowed_efforts(&agent_ai::effort_caps(provider, &model)),
+                    "defaultEffort": agent_ai::effort_caps(provider, &model).default,
+                    "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
+                        "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+            })
+        })
         .collect();
     Ok(Json(json!({"client": c.name, "profiles": list, "registeredTools": st.hub.tool_names()})).into_response())
 }
@@ -179,23 +238,31 @@ async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Quer
     Ok(Json(json!({"models": list})).into_response())
 }
 
-async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: Option<Json<SessionRequest>>) -> ApiResult {
-    let b = body.map(|b| b.0).unwrap_or_default();
+async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: axum::body::Bytes) -> ApiResult {
+    // 允许空请求体（全部默认值）
+    let b: SessionRequest = if body.iter().all(u8::is_ascii_whitespace) { SessionRequest::default() } else { serde_json::from_slice(&body).map_err(bad_request)? };
     let h = st.hub.create_session(&c, b).map_err(create_error)?;
-    Ok((StatusCode::CREATED, Json(json!({"sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "model": h.agent.config.model, "reasoningEffort": h.agent.config.reasoning, "requestedReasoningEffort": h.requested_effort, "api": st.hub.effective_api(&h.agent.config), "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>()}))).into_response())
+    Ok((StatusCode::CREATED, Json(st.hub.session_view(&h))).into_response())
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PromptBody {
     message: String,
     /// "steer" | "follow_up"：运行中时如何排队
     mode: Option<String>,
+    /// 粘性：从这条消息起修改会话推理强度
+    reasoning_effort: Option<ThinkingLevel>,
+    /// 只在第一次 prompt 时有效（之后 409）
+    depth: Option<Depth>,
 }
 
-async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, request_id: Option<Extension<RequestId>>, Json(b): Json<PromptBody>) -> ApiResult {
+async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, request_id: Option<Extension<RequestId>>, ApiJson(b): ApiJson<PromptBody>) -> ApiResult {
+    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
     if let Some(Extension(id_value)) = request_id {
-        st.hub.get(&c, &id).ok_or_else(not_found)?.set_request_id(id_value.0);
+        h.set_request_id(id_value.0);
     }
+    apply_overrides(&h, b.reasoning_effort, b.depth)?;
     let d = st.hub.submit(&c, &id, b.message, b.mode.as_deref()).ok_or_else(not_found)?;
     Ok((StatusCode::ACCEPTED, Json(json!({"disposition": d}))).into_response())
 }
@@ -310,6 +377,12 @@ struct ChatBody {
     webhook_events: WebhookEvents,
     /// 非流式等待上限；不填使用全局 chatTimeoutSecs。
     timeout_secs: Option<u64>,
+    /// 粘性：新会话或 sessionId 指定的已有会话从这条消息起使用该推理强度
+    #[serde(default)]
+    reasoning_effort: Option<ThinkingLevel>,
+    /// standard | deep | auto：新会话或尚未收到 prompt 的已有会话
+    #[serde(default)]
+    depth: Option<Depth>,
 }
 
 /// A host entry allows any port; host:port restricts it. The configured URL implicitly
@@ -368,7 +441,7 @@ fn webhook_targets(c: &Client, callback: Option<&serde_json::Value>, events: &We
 }
 
 /// 一步到位接口：给只想“发一句话拿回答”的 bot 用。
-async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Option<Extension<RequestId>>, Json(b): Json<ChatBody>) -> ApiResult {
+async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Option<Extension<RequestId>>, ApiJson(mut b): ApiJson<ChatBody>) -> ApiResult {
     if st.hub.is_shutting_down() {
         return Err((StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"}))));
     }
@@ -378,8 +451,16 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
     let targets = webhook_targets(&c, b.callback_url.as_ref(), &b.webhook_events)?;
     let timeout_secs = b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs);
     let h = match b.session_id {
-        Some(id) => st.hub.get(&c, &id).ok_or_else(not_found)?,
-        None => st.hub.create_chat_session(&c, b.session).map_err(create_error)?,
+        Some(id) => {
+            let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+            apply_overrides(&h, b.reasoning_effort, b.depth)?;
+            h
+        }
+        None => {
+            b.session.reasoning_effort = b.reasoning_effort.or(b.session.reasoning_effort);
+            b.session.depth = b.depth.or(b.session.depth);
+            st.hub.create_chat_session(&c, b.session).map_err(create_error)?
+        }
     };
     if let Some(Extension(id)) = request_id {
         h.set_request_id(id.0);
@@ -516,7 +597,9 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
         if partial_text.is_empty() {
             partial_text = new_messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a.text()) } else { None }).collect::<Vec<_>>().join("");
         }
-        return ChatOutcome { status: TaskStatus::Timeout, body: json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "messages": new_messages}) };
+        let mut body = json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "model": h.model(), "messages": new_messages});
+        body.as_object_mut().unwrap().extend(h.effort_fields());
+        return ChatOutcome { status: TaskStatus::Timeout, body };
     }
     let last = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a.clone()) } else { None });
     let status = if aborted || last.as_ref().is_some_and(|a| a.stop_reason == agent_ai::StopReason::Aborted) {
@@ -526,18 +609,18 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
     } else {
         TaskStatus::Succeeded
     };
-    ChatOutcome {
-        status,
-        body: json!({
-            "sessionId": h.id,
-            "text": last.as_ref().map(|a| a.text()).unwrap_or_default(),
-            "stopReason": last.as_ref().map(|a| a.stop_reason),
-            "error": last.as_ref().and_then(|a| a.error_message.clone()),
-            "aborted": aborted,
-            "usage": last.as_ref().map(|a| &a.usage),
-            "messages": new_messages,
-        }),
-    }
+    let mut body = json!({
+        "sessionId": h.id,
+        "model": h.model(),
+        "text": last.as_ref().map(|a| a.text()).unwrap_or_default(),
+        "stopReason": last.as_ref().map(|a| a.stop_reason),
+        "error": last.as_ref().and_then(|a| a.error_message.clone()),
+        "aborted": aborted,
+        "usage": last.as_ref().map(|a| &a.usage),
+        "messages": new_messages,
+    });
+    body.as_object_mut().unwrap().extend(h.effort_fields());
+    ChatOutcome { status, body }
 }
 
 fn assistant_progress(id: &str, message: &agent_ai::AssistantMessage) -> Option<serde_json::Value> {
@@ -549,6 +632,7 @@ fn assistant_progress(id: &str, message: &agent_ai::AssistantMessage) -> Option<
 mod tests {
     use super::*;
     use crate::issues::ScopeKey;
+    use agent_ai::ThinkingLevel;
     use axum::body::{to_bytes, Body};
     use serde_json::Value;
     use tower::ServiceExt;
@@ -1049,6 +1133,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dynamic_effort_patch_mid_run_and_reporting() {
+        let mut cfg = config();
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<agent_ai::Request>::new()));
+        Arc::get_mut(&mut hub).unwrap().providers.insert("faux".into(), Arc::new(crate::hub::tests::RecordingProvider { id: "faux", seen: seen.clone(), models: vec![] }));
+        let app = test_router(hub.clone());
+        let (status, view) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"reasoningEffort": "low"})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!((view["reasoningEffort"].clone(), view["requestedReasoningEffort"].clone(), view["effortAdjusted"].clone()), (json!("low"), json!("low"), Value::Null));
+        assert_eq!(view["routing"]["depth"], "standard");
+        assert_eq!(view["allowedEfforts"], json!([]));
+        let id = view["sessionId"].as_str().unwrap().to_string();
+        let path = format!("/v1/sessions/{id}");
+        for body in [json!({"reasoningEffort": "NOT VALID"}), json!({"reasoningEffort": "high", "model": "x"}), json!({"depth": "deeper"})] {
+            assert_eq!(request(&app, "PATCH", &path, Some("test-token"), body).await.0, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"reasoningEffort": "Not Valid"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "PATCH", "/v1/sessions/unknown", Some("test-token"), json!({"reasoningEffort": "high"})).await.0, StatusCode::NOT_FOUND);
+        let h = hub.get(&hub.config.clients[0], &id).unwrap();
+        let mut rx = h.subscribe();
+        let (status, _) = request(&app, "POST", &format!("{path}/prompt"), Some("test-token"), json!({"message": "/tool bash {\"command\":\"sleep 0.5\"}"})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        // 运行中修改：从下一次模型调用（工具结果之后）生效
+        let (status, view) = request(&app, "PATCH", &path, Some("test-token"), json!({"reasoningEffort": "high"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view["reasoningEffort"], "high");
+        assert_eq!(view["isStreaming"], true);
+        assert_eq!(request(&app, "PATCH", &path, Some("test-token"), json!({"depth": "deep"})).await.0, StatusCode::CONFLICT);
+        let mut changed = vec![];
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    AgentEvent::EffortChanged { effective, .. } => changed.push(effective),
+                    AgentEvent::AgentSettled { .. } => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(changed, [Some(ThinkingLevel::High)]);
+        let efforts: Vec<_> = seen.lock().unwrap().iter().map(|r| r.reasoning).collect();
+        assert_eq!(efforts, [Some(ThinkingLevel::Low), Some(ThinkingLevel::High)]);
+        // prompt 自带的 reasoningEffort 是粘性的；depth 在第一次 prompt 之后 409
+        let (status, _) = request(&app, "POST", &format!("{path}/prompt"), Some("test-token"), json!({"message": "x", "depth": "deep"})).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = request(&app, "POST", &format!("{path}/prompt"), Some("test-token"), json!({"message": "x", "reasoningEffort": "medium"})).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let (_, view) = request(&app, "GET", &path, Some("test-token"), json!({})).await;
+        assert_eq!(view["requestedReasoningEffort"], "medium");
+        // /v1/chat：顶层 reasoningEffort / depth，作用于新会话或已有会话
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", "reasoningEffort": "xhigh", "depth": "auto", "session": {"reasoningEffort": "low"}})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["reasoningEffort"], "xhigh");
+        assert_eq!(body["routing"]["depth"], "auto");
+        assert_eq!(body["routing"]["reason"], "no deepModel configured; using base model");
+        assert_eq!(body["routing"]["decided"], true);
+        assert!(body["allowedEfforts"].is_array() && body.get("effortAdjusted").is_some());
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "again", "sessionId": body["sessionId"], "reasoningEffort": "minimal"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["reasoningEffort"], "minimal");
+        assert_eq!(seen.lock().unwrap().last().unwrap().reasoning, Some(ThinkingLevel::Minimal));
+        let (_, body) = request(&app, "GET", "/v1/profiles", Some("test-token"), json!({})).await;
+        assert_eq!(body["profiles"][0]["routing"], json!({"deepModel": null, "autoRoute": false, "routerModel": "faux", "defaultDepth": "standard"}));
+        hub.abort_all().await;
+    }
+
+    #[tokio::test]
     async fn create_delete_get_and_owner_visibility() {
         let (app, _) = app(64);
         let (status, body) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({})).await;
@@ -1138,7 +1298,7 @@ mod tests {
                     State(AppState { hub: hub.clone() }),
                     Extension(client.clone()),
                     None,
-                    Json(ChatBody {
+                    ApiJson(ChatBody {
                         message: r#"/tool bash {"command":"sleep 10"}"#.into(),
                         session_id: None,
                         session: SessionRequest::default(),
@@ -1147,6 +1307,8 @@ mod tests {
                         asynchronous: false,
                         callback_url: None,
                         webhook_events: WebhookEvents::default(),
+                        reasoning_effort: None,
+                        depth: None,
                     }),
                 ),
             )

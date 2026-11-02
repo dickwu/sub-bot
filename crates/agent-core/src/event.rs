@@ -1,5 +1,5 @@
 use crate::tool::ToolResult;
-use agent_ai::{AssistantEvent, Message, ToolResultMessage};
+use agent_ai::{AssistantEvent, Message, ThinkingLevel, ToolResultMessage};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -18,6 +18,16 @@ pub enum AgentEvent {
     /// 会话级：不会再自动继续（对应 RPC 的 `agent_settled`）。
     AgentSettled {
         aborted: bool,
+    },
+    /// 会话推理强度被修改（从下一次模型调用生效）。
+    EffortChanged {
+        requested: Option<ThinkingLevel>,
+        effective: Option<ThinkingLevel>,
+        adjusted: Option<String>,
+    },
+    /// 会话模型路由已确定（创建时或第一次 prompt 时，只发生一次）。
+    ModelRouted {
+        routing: Value,
     },
     TurnStart,
     TurnEnd {

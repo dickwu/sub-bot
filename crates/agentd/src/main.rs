@@ -21,6 +21,7 @@ mod local_tests;
 mod logging;
 mod probe;
 mod prompt;
+mod routing;
 mod rpc;
 mod server;
 mod store;
@@ -42,8 +43,8 @@ struct Cli {
     /// 模型。serve：覆盖全局默认模型（profile 自己的 model 仍优先）；rpc/run：本会话使用的模型（受 allowedModels 限制）
     #[arg(long, global = true, env = "SUB_BOT_MODEL")]
     model: Option<String>,
-    /// 推理强度 none|minimal|low|medium|high|xhigh|max 或 provider 的小写名称；已知模型限制为最高三档
-    #[arg(long, global = true, env = "SUB_BOT_REASONING_EFFORT")]
+    /// 推理强度 none|minimal|low|medium|high|xhigh|max 或 provider 的小写名称；已知模型限制为最高三档（别名 --effort）
+    #[arg(long, visible_alias = "effort", global = true, env = "SUB_BOT_REASONING_EFFORT")]
     reasoning_effort: Option<ThinkingLevel>,
     /// OpenAI API：auto（默认：gpt-5.4+/gpt-6.x/o 系列走 Responses，其余走 Chat Completions）| chat | responses。serve：全局默认；rpc/run：本会话
     #[arg(long, global = true, env = "SUB_BOT_API")]
@@ -101,12 +102,18 @@ enum Cmd {
     Rpc {
         #[arg(long)]
         profile: Option<String>,
+        /// 模型路由：standard | deep | auto（显式 --model 时忽略）
+        #[arg(long)]
+        depth: Option<routing::Depth>,
     },
     /// 一次性执行一个 prompt，打印最终回复后退出
     Run {
         #[arg(long)]
         profile: Option<String>,
-        /// 输出 JSON（text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、usage（最后一次调用）、totalUsage（整次运行）、turns、toolCalls、stopReason、error）
+        /// 模型路由：standard | deep | auto（显式 --model 时忽略）
+        #[arg(long)]
+        depth: Option<routing::Depth>,
+        /// 输出 JSON（text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、effortAdjusted、allowedEfforts、routing、usage（最后一次调用）、totalUsage（整次运行，含路由分类调用）、turns、toolCalls、stopReason、error）
         #[arg(long)]
         json: bool,
         prompt: String,
@@ -231,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir), cli.provider.as_deref()).await;
+        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir), cli.provider.as_deref(), cli.reasoning_effort).await;
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -315,8 +322,15 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req =
-        |profile: Option<String>| hub::SessionRequest { provider: cli.provider.clone(), profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
+    let session_req = |profile: Option<String>, depth: Option<routing::Depth>| hub::SessionRequest {
+        provider: cli.provider.clone(),
+        profile,
+        model: cli.model.clone(),
+        reasoning_effort: cli.reasoning_effort,
+        depth,
+        api: cli.api,
+        ..Default::default()
+    };
     match cli.cmd {
         Cmd::Issues { ref command } => match command {
             IssuesCmd::Test { severity, message } => {
@@ -348,13 +362,13 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile } => {
+        Cmd::Rpc { ref profile, depth } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            rpc::run(hub, session_req(profile.clone())).await?;
+            rpc::run(hub, session_req(profile.clone(), depth)).await?;
         }
-        Cmd::Run { ref profile, json, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone()))?;
+            let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone(), depth))?;
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
             let mut last = None;
@@ -365,12 +379,7 @@ async fn main() -> anyhow::Result<()> {
                     Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => {
                         turns += 1;
                         tool_calls += a.tool_calls().len();
-                        total.input += a.usage.input;
-                        total.output += a.usage.output;
-                        total.cache_read += a.usage.cache_read;
-                        total.cache_write += a.usage.cache_write;
-                        total.reasoning += a.usage.reasoning;
-                        total.total_tokens += a.usage.total_tokens;
+                        add_usage(&mut total, &a.usage);
                         if a.api.is_some() || session.agent.config.provider.id() == "anthropic" {
                             used = Some((a.api, a.reasoning_effort));
                         }
@@ -388,12 +397,15 @@ async fn main() -> anyhow::Result<()> {
                 // reasoningEffort / api 是实际发送给模型的值（运行时降级后），requestedReasoningEffort 是请求值
                 let (api, effort) = match used {
                     Some((a, e)) => (a.map(|a| a.as_str()).unwrap_or("n/a").to_string(), e),
-                    None => (hub.effective_api(&session.agent.config).to_string(), session.agent.config.reasoning),
+                    None => (hub.effective_api(&session.agent.config).to_string(), session.agent.config.reasoning.get()),
                 };
-                println!(
-                    "{}",
-                    serde_json::json!({"sessionId": session.id, "model": session.agent.config.model, "api": api, "reasoningEffort": effort, "requestedReasoningEffort": session.requested_effort, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message})
-                );
+                if let Some(u) = &session.routing().usage {
+                    add_usage(&mut total, u);
+                }
+                let mut out = serde_json::json!({"sessionId": session.id, "model": session.model(), "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
+                out.as_object_mut().unwrap().extend(session.effort_fields());
+                out["reasoningEffort"] = serde_json::json!(effort);
+                println!("{out}");
             } else {
                 println!("{}", last.text());
             }
@@ -420,6 +432,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn add_usage(total: &mut agent_ai::Usage, u: &agent_ai::Usage) {
+    total.input += u.input;
+    total.output += u.output;
+    total.cache_read += u.cache_read;
+    total.cache_write += u.cache_write;
+    total.reasoning += u.reasoning;
+    total.total_tokens += u.total_tokens;
 }
 
 fn format_efforts(model: &agent_ai::ModelInfo) -> String {
@@ -481,6 +502,22 @@ mod tests {
         assert_eq!(args.levels.len(), 8);
         assert!(Cli::try_parse_from(["sub-bot", "probe-efforts", "--levels", "INVALID"]).is_err());
         assert!(Cli::try_parse_from(["sub-bot", "probe-efforts", "--thinking", "invalid"]).is_err());
+    }
+
+    #[test]
+    fn effort_alias_and_depth_flags() {
+        for flag in ["--effort", "--reasoning-effort"] {
+            let cli = Cli::try_parse_from(["sub-bot", "ask", flag, "high", "--deep", "hi"]).unwrap();
+            assert_eq!(cli.reasoning_effort, Some(ThinkingLevel::High));
+            let Cmd::Ask(ask) = cli.cmd else { panic!("ask") };
+            assert!(ask.deep && ask.depth.is_none());
+        }
+        let Cmd::Ask(ask) = Cli::try_parse_from(["sub-bot", "ask", "--depth", "auto", "hi"]).unwrap().cmd else { panic!("ask") };
+        assert_eq!(ask.depth, Some(routing::Depth::Auto));
+        assert!(Cli::try_parse_from(["sub-bot", "ask", "--depth", "auto", "--deep", "hi"]).is_err());
+        assert!(Cli::try_parse_from(["sub-bot", "ask", "--depth", "huge", "hi"]).is_err());
+        let Cmd::Rpc { depth, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--depth", "deep"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!(depth, Some(routing::Depth::Deep));
     }
 
     #[test]

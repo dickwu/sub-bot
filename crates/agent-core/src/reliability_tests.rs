@@ -132,7 +132,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         model: "test".into(),
         system_prompt: None,
         tools: vec![],
-        reasoning: None,
+        reasoning: Default::default(),
         api: Default::default(),
         steering: Default::default(),
         follow_up: Default::default(),
@@ -141,6 +141,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         llm_max_retries: None,
         token_budget: None,
         run_timeout: None,
+        before_run: None,
     }
 }
 

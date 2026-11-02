@@ -7,7 +7,7 @@
 - OpenAI / Anthropic API key 从文件或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.7.0。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.8.0。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -38,6 +38,7 @@
 - 可选 `providers.<id>.baseUrl`；`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 环境变量优先于配置。
 - 选择顺序：会话 JSON `provider` > profile `provider` > 有效模型名以 `claude-` 开头时推断 Anthropic > 默认 provider。默认 provider 为显式 `--provider`（或 `SUB_BOT_PROVIDER`）> `defaultProvider` > `openai`。`run` / `rpc` / `ask` 的显式 `--provider` 也作为会话覆盖；已有 sessionId 的 ask 继续原会话。
 - 启动必须能加载默认 provider，以及 profile / 默认模型引用或推断的 provider；缺少 key 即安全失败。其它 provider 有 key 来源则加载，无来源则跳过。后续会话选择未加载 provider 返回 400，并提示配置来源；`faux` 始终可用。
+- 未指定模型的 anthropic 会话默认用 `claude-opus-5-5`；`deepModel`（默认固定 `claude-fable-5-1`）/ `autoRoute` / `routerModel` 控制 standard / deep / auto 路由，见「动态推理强度与模型路由」。
 - `api` / `defaultApi` 仅用于 OpenAI。Anthropic 按模型选择 adaptive effort、effort + extended-thinking budget 或纯 budget，详见「模型与推理强度」。
 
 `sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录，每个模型都有 `provider` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
@@ -269,6 +270,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
       "maxTurns": 50,
+      "deepModel": "claude-fable-5-1",         // 可选：depth=deep 用的模型；anthropic profile 默认固定为 claude-fable-5-1；"latest:claude-fable" 跟随最新版
+      "autoRoute": false,                      // 可选：true 时默认 depth=auto（第一次 prompt 前用 routerModel 分类）
+      "routerModel": null,                     // 可选：分类用的模型，默认 = profile 基础模型
       "shellEnv": {                            // 可选：bash 子进程的环境变量策略
         "mode": "inherit",                     // inherit（默认，继承后剔除）| allowlist（清空后只保留基础变量和 allow）
         "deny": ["AWS_*", "GITHUB_TOKEN"],     // 额外剔除，支持 * 通配
@@ -292,7 +296,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--config`（`SUB_BOT_CONFIG`）
   - `--provider openai|anthropic|faux`
   - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
-  - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh|max` 或 provider 小写名称
+  - `--reasoning-effort` / `--effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh|max` 或 provider 小写名称；`ask` 时作为 `/v1/chat` 顶层 `reasoningEffort` 发送（粘性）
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
   - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
@@ -326,7 +330,58 @@ sub-bot --config sub-bot.json probe-efforts --model claude-sonnet-5-5 --provider
 sub-bot probe-efforts --model claude-opus-4-5 --thinking enabled --anthropic-key-file keys/anthropic.key
 ```
 
-默认探测 `none,minimal,low,medium,high,xhigh,max,ultra`。每档一次无工具的 `Reply with OK`，绕过目录、运行时降级/缓存和瞬态重试。OpenAI 输出上限 none 为 256，其它档位 1024；Anthropic 为 2048。Anthropic 默认 adaptive；若 HTTP 400 指向 thinking 字段，再试一次 omit。显式 `--thinking adaptive|omit|enabled` 固定变体，不自动回退。沿用正常 key-file/config/base URL 解析，仅加载选定 provider。每档一行，或 `--json` 数组 `{model,provider,level,accepted,status,variant,error,supportedValues}`；错误先脱敏再截取 300 字符，未取得 HTTP 状态时为 null。探测失败也会继续后续档位；这是能力诊断，不是质量评估。动态修改 effort 的 HTTP/RPC API 留待 phase 2。
+默认探测 `none,minimal,low,medium,high,xhigh,max,ultra`。每档一次无工具的 `Reply with OK`，绕过目录、运行时降级/缓存和瞬态重试。OpenAI 输出上限 none 为 256，其它档位 1024；Anthropic 为 2048。Anthropic 默认 adaptive；若 HTTP 400 指向 thinking 字段，再试一次 omit。显式 `--thinking adaptive|omit|enabled` 固定变体，不自动回退。沿用正常 key-file/config/base URL 解析，仅加载选定 provider。每档一行，或 `--json` 数组 `{model,provider,level,accepted,status,variant,error,supportedValues}`；错误先脱敏再截取 300 字符，未取得 HTTP 状态时为 null。探测失败也会继续后续档位；这是能力诊断，不是质量评估。运行时修改 effort 见下文「动态推理强度与模型路由」。
+
+## 动态推理强度与模型路由（v0.8.0）
+
+### 动态推理强度
+
+每个会话保存一个**请求的**推理强度（`requestedReasoningEffort`）和按当前模型解析后的**实际**值（`reasoningEffort`）。所有修改都经过 `agent_ai::models::resolve_effort`（已知模型只允许目录中最高三档，超出时钳制并记 warn，原因写在 `effortAdjusted`）。修改是**粘性的**：从这条消息起一直生效，并且从**下一次模型调用**开始生效——运行中修改也一样（例如当前工具调用结束后的那次调用）。名称语法非法返回 400。
+
+```bash
+# 新建会话时指定
+curl -X POST localhost:7878/v1/sessions -H "Authorization: Bearer $T" -d '{"profile":"claude","reasoningEffort":"high"}'
+# 会话中途修改（运行中也可以），返回 200 + 会话视图
+curl -X PATCH localhost:7878/v1/sessions/$SID -H "Authorization: Bearer $T" -d '{"reasoningEffort":"max"}'
+# 随消息修改（粘性）
+curl -X POST localhost:7878/v1/sessions/$SID/prompt -H "Authorization: Bearer $T" -d '{"message":"继续","reasoningEffort":"xhigh"}'
+# /v1/chat 顶层字段：作用于新会话或 sessionId 指定的已有会话
+curl -X POST localhost:7878/v1/chat -H "Authorization: Bearer $T" -d '{"message":"hi","sessionId":"'$SID'","reasoningEffort":"high"}'
+# CLI：--effort 是 --reasoning-effort 的别名
+sub-bot ask --effort high "解释这个仓库"
+# RPC
+{"id":"7","type":"set_reasoning_effort","level":"low"}
+← {"id":"7","type":"response","command":"set_reasoning_effort","success":true,"data":{"requested":"low","effective":"medium","adjusted":"clamped to allowed top-three levels","allowedEfforts":["medium","high","max"]}}
+```
+
+每次修改在事件流上广播 `{"type":"effort_changed","requested":..,"effective":..,"adjusted":..}`，并记 `reasoning effort changed` info 日志（session_id / requested / effective）。
+
+### Claude 模型路由（depth）
+
+- **默认模型**：provider 为 anthropic 且请求和 profile 都没有指定模型时使用 `claude-opus-5-5`；`providers.anthropic.defaultModel` 可覆盖，profile `model` 再覆盖它（全局 `defaultModel` 本身是 `claude-*` 时也视为已配置）。
+- **profile 字段**：`deepModel`（anthropic profile 默认**固定**为 `claude-fable-5-1`，不会自动跟随新版本）、`autoRoute`（默认 false）、`routerModel`（默认 = profile 基础模型）。想跟随最新版可写 `"deepModel": "latest:claude-fable"`：在 provider 模型目录（Hub 缓存，最多每 10 分钟刷新）中取该前缀下版本号最新的 id（`claude-fable-5-1` > `claude-fable-5`；同版本存在无日期 id 时忽略 `-20260101` 这类快照），记 `deep model alias resolved` 日志；解析失败时使用基础模型并在 `routing.reason` 中说明原因。
+- **depth**：`standard`（基础模型）| `deep`（deepModel）| `auto`（分类器决定）。默认 `autoRoute ? auto : standard`。可在 `POST /v1/sessions`、`/v1/chat`（顶层或 `session` 内）、首个 prompt 之前的 `PATCH /v1/sessions/{id}`、`POST .../prompt`（仅首个）、`ask --deep` / `ask --depth <d>`、`rpc --depth <d>` / `run --depth <d>`、RPC `prompt` 的 `depth`（仅首个）中指定。路由在创建会话或**第一次 prompt** 时决定，之后**不会重新路由**；首个 prompt 之后再给 depth 返回 409（RPC 返回 `success:false`）。
+- **优先级**：调用方显式 `model` 总是胜出（depth 被忽略，reason `explicit model`）> depth。
+- **auto 分类器**：第一次 prompt 前用 routerModel 做一次便宜调用（允许时用 low 推理强度、否则不发；最多 200 输出 token、无工具、30 秒超时），固定系统提示要求只回答 `{"deep":true|false,"reason":"<=20 words"}`；回复中查找 JSON 对象。出错/超时/无法解析时使用 standard，reason 为 `router error: ...`，并上报 warn 级 issue `routing_error`。分类调用的用量单独记录在 `routing.usage`，并计入 `run --json` 的 `totalUsage`。没有配置 deepModel 时不调用分类器。
+- 选定模型后按该模型的能力重新解析推理强度（例如 profile `medium` 在 fable 上会被钳制到 `high`），并广播 `{"type":"model_routed","routing":{...}}` 事件、记 `model routed` 日志（session_id / depth / model / reason）。
+
+### 报告字段
+
+会话视图（`POST/GET/PATCH /v1/sessions[/{id}]`）、`/v1/chat` 响应、task `result`、`run --json`、`ask --json`（最后一行 `{"type":"session_state",...}`）和 RPC `get_state` 都包含：
+
+```json
+{
+  "model": "claude-fable-5-1",
+  "reasoningEffort": "high",
+  "requestedReasoningEffort": "medium",
+  "effortAdjusted": "clamped to allowed top-three levels",
+  "allowedEfforts": ["high", "xhigh", "max"],
+  "routing": {"depth": "auto", "model": "claude-fable-5-1", "baseModel": "claude-opus-5-5", "deepModel": "claude-fable-5-1",
+              "auto": true, "reason": "router: open-ended design task", "usage": {"input": 120, "output": 18, "...": 0}, "decided": true}
+}
+```
+
+`/v1/models` 与 `sub-bot models --json` 的每个模型带 `allowedEfforts`（最高三档）和 `defaultEffort`；`/v1/profiles` 返回每个 profile 的 `reasoningEffort`、`allowedEfforts`、`defaultEffort` 和 `routing: {deepModel, autoRoute, routerModel, defaultDepth}`。
 
 ### 用哪个 API（`api`）
 
@@ -355,16 +410,17 @@ sub-bot probe-efforts --model claude-opus-4-5 --thinking enabled --anthropic-key
 | 方法和路径 | 说明 |
 |---|---|
 | `GET /v1/health` | 健康检查（无需鉴权） |
-| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`） |
-| `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts`；`profile` 只返回该 profile 允许的 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, cwd, model, api, reasoningEffort, requestedReasoningEffort, tools}` |
-| `GET /v1/sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |
+| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`） |
+| `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
+| `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404 |
+| `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?}`：修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
 | `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
-| `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up"}`，返回 202 |
+| `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", reasoningEffort?, depth?}`，返回 202；`reasoningEffort` 粘性，`depth` 仅首个 prompt |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
-| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?}` |
+| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
 
 超时行为：
@@ -460,9 +516,9 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 ← {"type":"agent_settled","aborted":false}
 ```
 
-模型和推理强度用全局参数指定：`sub-bot --model gpt-5.4-mini --reasoning-effort low rpc --profile coder`。
+模型和推理强度用全局参数指定：`sub-bot --model gpt-5.4-mini --reasoning-effort low rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。
 
-支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
+支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
 
 ## API key
 

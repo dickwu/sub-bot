@@ -101,6 +101,14 @@ impl Agent {
                     let settled = &settled;
                     AssertUnwindSafe(async move {
                         let mut pending = vec![message];
+                        if let Some(hook) = this.config.before_run.clone() {
+                            // 取消时不再等待 hook；run_loop 会立即以 aborted 结束。
+                            tokio::select! {
+                                biased;
+                                _ = token.cancelled() => {}
+                                _ = hook(pending.clone(), emit.clone()) => {}
+                            }
+                        }
                         loop {
                             let out = run_loop(&this.messages, pending, &this.config, token.clone(), emit.clone()).await;
                             on_messages(out);
@@ -174,6 +182,10 @@ impl Agent {
         if let Some(t) = self.state.lock().unwrap().cancel.as_ref() {
             t.cancel();
         }
+    }
+    /// 在会话事件流上广播一个事件（例如运行期配置变化）。
+    pub fn emit(&self, event: AgentEvent) {
+        let _ = self.events.send(event);
     }
     pub async fn messages(&self) -> Vec<Message> {
         self.messages.lock().unwrap().clone()

@@ -1,10 +1,11 @@
+use crate::routing::{Depth, Routing};
 use crate::{
     config::{Client, Config, Profile, ResolvedTarget},
     issues::{IssueEvent, IssueScope, Reporter, Severity},
     webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
-use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, openai::OpenAiProvider, Message, ModelInfo, Provider, ThinkingLevel};
-use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
+use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, openai::OpenAiProvider, EffortResolution, Message, ModelInfo, Provider, ThinkingLevel};
+use agent_core::{Agent, AgentEvent, AgentTool, Emit, LoopConfig, Shared};
 use agent_session::Session;
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
 use anyhow::{bail, Result};
@@ -28,13 +29,10 @@ pub struct SessionHandle {
     pub issues: Arc<Reporter>,
     issue_targets: Vec<ResolvedTarget>,
     run_generation: std::sync::atomic::AtomicU64,
-    issue_scope: Mutex<IssueScope>,
     caller_tools: Vec<String>,
     observing: AtomicBool,
-    /// 调用方/配置请求的推理强度（解析前）
-    pub requested_effort: Option<ThinkingLevel>,
-    /// 最近一次成功调用实际使用的 (API, 推理强度)
-    last_call: Mutex<Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)>>,
+    /// 运行期可变状态（推理强度、路由、issue scope），与 Agent 的 before_run hook 共享
+    dynamic: Arc<SessionDynamic>,
     store: Mutex<Option<Session>>,
     last_activity: Mutex<Instant>,
     idle_ttl: Duration,
@@ -43,9 +41,198 @@ pub struct SessionHandle {
 
 pub use agent_core::Disposition;
 
+type ModelsCache = tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<ModelInfo>)>>;
+const MODELS_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// provider 模型目录（缓存 10 分钟），供 /v1/models 与 `latest:` 别名解析共用。
+async fn cached_models(cache: &ModelsCache, id: &str, provider: &dyn Provider) -> Result<Vec<ModelInfo>> {
+    let mut cache = cache.lock().await;
+    if let Some((_, models)) = cache.get(id).filter(|(t, _)| t.elapsed() < MODELS_CACHE_TTL) {
+        return Ok(models.clone());
+    }
+    let models = provider.list_models().await.map_err(|e| anyhow::anyhow!("provider {id}: {e}"))?;
+    cache.insert(id.into(), (Instant::now(), models.clone()));
+    Ok(models)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortChange {
+    pub requested: Option<ThinkingLevel>,
+    pub effective: Option<ThinkingLevel>,
+    pub adjusted: Option<String>,
+    pub allowed: Vec<ThinkingLevel>,
+}
+
+impl EffortChange {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({"requested": self.requested, "effective": self.effective, "adjusted": self.adjusted, "allowedEfforts": self.allowed})
+    }
+}
+
+/// 会话里运行期可变的部分。不引用 Agent / Hub，因此可以放进 Agent 的 before_run hook 而不形成循环引用。
+pub(crate) struct SessionDynamic {
+    session_id: String,
+    provider_id: String,
+    provider: Arc<dyn Provider>,
+    model: Shared<String>,
+    reasoning: Shared<Option<ThinkingLevel>>,
+    /// (调用方请求的推理强度, 调整原因)
+    effort: Mutex<(Option<ThinkingLevel>, Option<String>)>,
+    routing: Mutex<Routing>,
+    /// 配置的深度模型（可能是 `latest:<prefix>` 别名）
+    deep_spec: Option<String>,
+    router_model: String,
+    catalog: Arc<ModelsCache>,
+    issues: Arc<Reporter>,
+    issue_scope: Mutex<IssueScope>,
+    /// 最近一次成功调用实际使用的 (API, 推理强度)；推理强度变化后清空
+    last_call: Mutex<Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)>>,
+    /// 已收到过 prompt：此后 depth 不能再修改，路由不再改变
+    prompted: AtomicBool,
+}
+
+impl SessionDynamic {
+    fn allowed_efforts(&self) -> Vec<ThinkingLevel> {
+        agent_ai::allowed_efforts(&agent_ai::effort_caps(&self.provider_id, &self.model.get()))
+    }
+
+    /// 按当前模型解析推理强度并写入会话；返回解析结果和实际值是否变化。
+    fn apply_effort(&self, requested: Option<ThinkingLevel>) -> (EffortResolution, bool) {
+        let resolution = agent_ai::resolve_effort(&self.provider_id, &self.model.get(), requested);
+        *self.effort.lock().unwrap() = (requested, resolution.adjusted.clone());
+        let changed = self.reasoning.set(resolution.effective) != resolution.effective;
+        if changed {
+            *self.last_call.lock().unwrap() = None;
+        }
+        (resolution, changed)
+    }
+
+    fn effort_event(&self, r: &EffortResolution) -> AgentEvent {
+        tracing::info!(session_id = %self.session_id, requested = r.requested.map(|l| l.as_str()).unwrap_or("-"), effective = r.effective.map(|l| l.as_str()).unwrap_or("-"), "reasoning effort changed");
+        AgentEvent::EffortChanged { requested: r.requested, effective: r.effective, adjusted: r.adjusted.clone() }
+    }
+
+    fn set_model(&self, model: String) {
+        self.issue_scope.lock().unwrap().model = Some(model.clone());
+        self.model.set(model);
+    }
+
+    /// 第一次 prompt 之前的同步规划：standard/deep（固定 id）直接生效，auto 与 `latest:` 别名在第一次 run 前决定。
+    fn plan(&self) {
+        let model = {
+            let mut r = self.routing.lock().unwrap();
+            if r.decided || r.explicit {
+                return;
+            }
+            let (model, reason) = match (r.depth, self.deep_spec.as_deref()) {
+                (Depth::Standard, _) => (r.base_model.clone(), "depth standard".to_string()),
+                (Depth::Deep, None) => (r.base_model.clone(), "no deepModel configured; using base model".into()),
+                (Depth::Deep, Some(spec)) if spec.starts_with("latest:") => (r.base_model.clone(), "pending: deep model alias resolves at first prompt".into()),
+                (Depth::Deep, Some(spec)) => (spec.to_string(), "depth deep".into()),
+                (Depth::Auto, _) => (r.base_model.clone(), "pending: classified at first prompt".into()),
+            };
+            r.model = model.clone();
+            r.reason = reason;
+            model
+        };
+        self.set_model(model);
+    }
+
+    async fn deep_model(&self) -> std::result::Result<String, String> {
+        let spec = self.deep_spec.as_deref().ok_or_else(|| "no deepModel configured".to_string())?;
+        let Some(prefix) = spec.strip_prefix("latest:") else { return Ok(spec.to_string()) };
+        let models = cached_models(&self.catalog, &self.provider_id, &*self.provider).await.map_err(|e| format!("cannot list models: {e}"))?;
+        let resolved = crate::routing::resolve_latest(prefix, models.iter().map(|m| m.id.as_str())).ok_or_else(|| format!("no model matches {spec}"))?;
+        tracing::info!(alias = spec, resolved = %resolved, "deep model alias resolved");
+        Ok(resolved)
+    }
+
+    /// 每次 run 开始前调用；只有第一次真正路由。
+    async fn route_first_run(self: Arc<Self>, messages: Vec<Message>, emit: Emit) {
+        let (depth, explicit, base, current) = {
+            let mut r = self.routing.lock().unwrap();
+            if r.decided {
+                return;
+            }
+            r.decided = true;
+            (r.depth, r.explicit, r.base_model.clone(), r.model.clone())
+        };
+        let mut usage = None;
+        let mut resolved_deep = None;
+        let (model, reason, auto) = if explicit {
+            (current, "explicit model".to_string(), false)
+        } else {
+            match depth {
+                Depth::Standard => (base, "depth standard".to_string(), false),
+                Depth::Deep => match self.deep_model().await {
+                    Ok(m) => {
+                        resolved_deep = Some(m.clone());
+                        (m, "depth deep".into(), false)
+                    }
+                    Err(e) => (base, format!("deep model unavailable ({e}); using base model"), false),
+                },
+                Depth::Auto if self.deep_spec.is_none() => (base, "no deepModel configured; using base model".into(), false),
+                Depth::Auto => {
+                    let task = messages
+                        .iter()
+                        .filter_map(|m| match m {
+                            Message::User { content, .. } => {
+                                Some(content.iter().filter_map(|c| if let agent_ai::Content::Text { text } = c { Some(text.as_str()) } else { None }).collect::<Vec<_>>().join("\n"))
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let (result, router_usage) = crate::routing::classify(&*self.provider, &self.router_model, &task).await;
+                    usage = router_usage;
+                    match result {
+                        Ok(c) if c.deep => match self.deep_model().await {
+                            Ok(m) => {
+                                resolved_deep = Some(m.clone());
+                                (m, format!("router: {}", c.reason), true)
+                            }
+                            Err(e) => (base, format!("router chose deep but deep model unavailable ({e}); using base model"), true),
+                        },
+                        Ok(c) => (base, format!("router: {}", c.reason), true),
+                        Err(e) => {
+                            let scope = self.issue_scope.lock().unwrap().clone();
+                            self.issues.report(
+                                IssueEvent::new(Severity::Warn, "routing_error", "routing", "Model router failed; using the standard model")
+                                    .scope(scope)
+                                    .details(serde_json::json!({"routerModel": self.router_model, "error": e})),
+                            );
+                            (base, format!("router error: {e}"), true)
+                        }
+                    }
+                }
+            }
+        };
+        let routing = {
+            let mut r = self.routing.lock().unwrap();
+            r.model = model.clone();
+            r.reason = reason;
+            r.auto = auto;
+            r.usage = usage;
+            if resolved_deep.is_some() {
+                r.deep_model = resolved_deep;
+            }
+            r.clone()
+        };
+        self.set_model(model);
+        let requested = self.effort.lock().unwrap().0;
+        let (resolution, changed) = self.apply_effort(requested);
+        if changed {
+            emit(self.effort_event(&resolution));
+        }
+        tracing::info!(session_id = %self.session_id, depth = routing.depth.as_str(), model = %routing.model, reason = %routing.reason, "model routed");
+        emit(AgentEvent::ModelRouted { routing: serde_json::to_value(&routing).unwrap_or_default() });
+    }
+}
+
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
+        self.dynamic.prompted.store(true, Ordering::Relaxed);
         self.run_generation.fetch_add(1, Ordering::Relaxed);
         if self.scope().task_id.is_none() {
             self.issues.subscribe(crate::issues::ScopeKey::Session(self.id.clone()), self.owner.clone(), self.issue_targets.clone());
@@ -85,8 +272,8 @@ impl SessionHandle {
         let msg = Message::user_text(text);
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
-        let effort = self.agent.config.reasoning.map(|l| l.as_str()).unwrap_or("-");
-        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), model = %self.agent.config.model, reasoning_effort = effort);
+        let effort = self.agent.config.reasoning.get().map(|l| l.as_str()).unwrap_or("-");
+        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), model = %self.agent.config.model.get(), reasoning_effort = effort);
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let disposition = self.agent.submit_with(msg, mode, move |new| {
@@ -99,7 +286,7 @@ impl SessionHandle {
                         output += a.usage.output;
                         reasoning_tokens += a.usage.reasoning;
                         if a.api.is_some() || this.agent.config.provider.id() == "anthropic" {
-                            *this.last_call.lock().unwrap() = Some((a.api, a.reasoning_effort));
+                            *this.dynamic.last_call.lock().unwrap() = Some((a.api, a.reasoning_effort));
                         }
                         stop = Some(a.stop_reason);
                         if let Some(e) = &a.error_message {
@@ -127,25 +314,81 @@ impl SessionHandle {
         disposition
     }
 
-    /// 实际生效的推理强度：有调用记录时取最近一次真正发送的值，否则取会话解析后的值。
+    /// 实际生效的推理强度：上次修改之后有调用记录时取最近一次真正发送的值（含运行时降级），否则取会话解析后的值。
     pub fn effective_effort(&self) -> Option<ThinkingLevel> {
-        match *self.last_call.lock().unwrap() {
+        match *self.dynamic.last_call.lock().unwrap() {
             Some((_, e)) => e,
-            None => self.agent.config.reasoning,
+            None => self.agent.config.reasoning.get(),
         }
     }
 
     /// 最近一次调用实际使用的 API（还没调用过时为 None）。
     pub fn effective_api(&self) -> Option<agent_ai::Api> {
-        self.last_call.lock().unwrap().and_then(|(a, _)| a)
+        self.dynamic.last_call.lock().unwrap().and_then(|(a, _)| a)
+    }
+
+    /// 调用方/配置请求的推理强度（解析前）。
+    pub fn requested_effort(&self) -> Option<ThinkingLevel> {
+        self.dynamic.effort.lock().unwrap().0
+    }
+
+    /// 当前模型
+    pub fn model(&self) -> String {
+        self.agent.config.model.get()
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.dynamic.provider_id
+    }
+
+    /// 修改会话推理强度（粘性，从下一次模型调用生效，运行中也一样）；按当前模型的 top-3 规则解析。
+    pub fn set_reasoning_effort(&self, requested: Option<ThinkingLevel>) -> EffortChange {
+        let (resolution, _) = self.dynamic.apply_effort(requested);
+        self.agent.emit(self.dynamic.effort_event(&resolution));
+        EffortChange { requested: resolution.requested, effective: resolution.effective, adjusted: resolution.adjusted, allowed: self.dynamic.allowed_efforts() }
+    }
+
+    /// 只能在第一次 prompt 之前修改 depth。
+    pub fn set_depth(&self, depth: Depth) -> Result<()> {
+        if self.dynamic.prompted.load(Ordering::Relaxed) {
+            bail!(DepthLocked);
+        }
+        self.dynamic.routing.lock().unwrap().depth = depth;
+        self.dynamic.plan();
+        let requested = self.requested_effort();
+        let (resolution, changed) = self.dynamic.apply_effort(requested);
+        if changed {
+            self.agent.emit(self.dynamic.effort_event(&resolution));
+        }
+        Ok(())
+    }
+
+    pub fn routing(&self) -> Routing {
+        self.dynamic.routing.lock().unwrap().clone()
+    }
+
+    /// reasoningEffort（实际值）/ requestedReasoningEffort / effortAdjusted / allowedEfforts / routing
+    pub fn effort_fields(&self) -> serde_json::Map<String, serde_json::Value> {
+        let (requested, adjusted) = self.dynamic.effort.lock().unwrap().clone();
+        let value = serde_json::json!({
+            "reasoningEffort": self.effective_effort(),
+            "requestedReasoningEffort": requested,
+            "effortAdjusted": adjusted,
+            "allowedEfforts": self.dynamic.allowed_efforts(),
+            "routing": self.routing(),
+        });
+        match value {
+            serde_json::Value::Object(map) => map,
+            _ => unreachable!(),
+        }
     }
 
     pub fn set_request_id(&self, request_id: String) {
-        self.issue_scope.lock().unwrap().request_id = Some(request_id);
+        self.dynamic.issue_scope.lock().unwrap().request_id = Some(request_id);
     }
 
     pub fn scope(&self) -> IssueScope {
-        self.issue_scope.lock().unwrap().clone()
+        self.dynamic.issue_scope.lock().unwrap().clone()
     }
 
     pub fn report_issue(&self, severity: Severity, kind: &str, component: &str, message: &str, details: serde_json::Value) {
@@ -211,8 +454,10 @@ pub struct SessionRequest {
     pub append_system_prompt: Option<String>,
     /// 覆盖 profile 的默认模型；受 profile.allowedModels 限制
     pub model: Option<String>,
-    /// 推理强度 none|minimal|low|medium|high|xhigh；模型不支持时忽略并记 warn 日志
+    /// 推理强度 none|minimal|low|medium|high|xhigh|max 或 provider 的小写名称；按模型 top-3 规则解析（钳制时记 warn）
     pub reasoning_effort: Option<ThinkingLevel>,
+    /// standard | deep | auto（显式 model 时忽略）；默认 profile.autoRoute ? auto : standard
+    pub depth: Option<Depth>,
     /// OpenAI API：auto | chat | responses（覆盖 profile.api）
     pub api: Option<agent_ai::Api>,
     /// 只能从 profile 已启用的工具里再收窄
@@ -220,6 +465,18 @@ pub struct SessionRequest {
     #[serde(default)]
     pub caller_tools: Vec<CallerToolSpec>,
 }
+
+/// 第一次 prompt 之后不能再修改 depth（路由不会重新进行）。
+#[derive(Debug)]
+pub struct DepthLocked;
+
+impl std::fmt::Display for DepthLocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("depth can only be set before the first prompt (model routing is decided once per session)")
+    }
+}
+
+impl std::error::Error for DepthLocked {}
 
 #[derive(Debug)]
 pub struct TooManySessions;
@@ -355,7 +612,7 @@ pub struct Hub {
     http: reqwest::Client,
     #[cfg(test)]
     pub(crate) callback_timeout: Option<Duration>,
-    models_cache: tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<ModelInfo>)>>,
+    models_cache: Arc<ModelsCache>,
 }
 
 fn expand_tools(names: &[String]) -> Result<Vec<String>> {
@@ -547,7 +804,7 @@ impl Hub {
         if self.store.save_task(&task).is_err() {
             return None;
         }
-        h.issue_scope.lock().unwrap().task_id = Some(task.task_id.clone());
+        h.dynamic.issue_scope.lock().unwrap().task_id = Some(task.task_id.clone());
         self.store.tasks.lock().unwrap().insert(task.task_id.clone(), task.clone());
         let issue_targets: Vec<_> = targets.iter().filter(|t| t.wants("issues")).cloned().collect();
         if !issue_targets.is_empty() {
@@ -560,7 +817,7 @@ impl Hub {
 
     pub fn unsubscribe_task(&self, task_id: &str, session: &SessionHandle) {
         self.issues.unsubscribe(&crate::issues::ScopeKey::Task(task_id.into()));
-        let mut scope = session.issue_scope.lock().unwrap();
+        let mut scope = session.dynamic.issue_scope.lock().unwrap();
         // A newer task may already have replaced the scope during the grace period.
         if scope.task_id.as_deref() == Some(task_id) {
             scope.task_id = None;
@@ -673,6 +930,7 @@ impl Hub {
             tools.push(Arc::new(tool));
         }
 
+        let explicit = req.model.is_some();
         let model = match req.model {
             Some(m) if !Config::model_allowed(p, &m) => {
                 bail!("model '{m}' is not allowed in profile '{profile_name}' (allowedModels)")
@@ -680,16 +938,55 @@ impl Hub {
             Some(m) => m,
             None => p.model.clone().unwrap_or_else(|| self.config.default_model.clone()),
         };
+        let provider_id = select_provider(req.provider.as_deref(), p.provider.as_deref(), &model, &self.default_provider).to_string();
+        let model = if explicit || p.model.is_some() { model } else { self.default_model_for(&provider_id) };
         if !Config::model_allowed(p, &model) {
             bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
         }
-        let provider_id = select_provider(req.provider.as_deref(), p.provider.as_deref(), &model, &self.default_provider);
+        let provider_id = provider_id.as_str();
         let provider = self.provider(provider_id)?;
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
-        let reasoning = agent_ai::resolve_effort(provider_id, &model, requested_effort).effective;
+        let deep_spec = self.deep_model_spec(p, provider_id);
+        let depth = req.depth.unwrap_or(if p.auto_route { Depth::Auto } else { Depth::Standard });
+        let dynamic = Arc::new(SessionDynamic {
+            session_id: id.clone(),
+            provider_id: provider_id.into(),
+            provider: provider.clone(),
+            model: Shared::new(model.clone()),
+            reasoning: Shared::new(None),
+            effort: Mutex::new((requested_effort, None)),
+            routing: Mutex::new(Routing {
+                depth,
+                model: model.clone(),
+                base_model: model.clone(),
+                deep_model: deep_spec.clone(),
+                auto: false,
+                reason: "explicit model".into(),
+                usage: None,
+                decided: false,
+                explicit,
+            }),
+            deep_spec,
+            router_model: p.router_model.clone().unwrap_or_else(|| model.clone()),
+            catalog: self.models_cache.clone(),
+            issues: self.issues.clone(),
+            issue_scope: Mutex::new(IssueScope {
+                client: Some(client.name.clone()),
+                session_id: Some(id.clone()),
+                profile: Some(profile_name.clone()),
+                model: Some(model.clone()),
+                provider: Some(provider_id.into()),
+                ..Default::default()
+            }),
+            last_call: Mutex::new(None),
+            prompted: AtomicBool::new(false),
+        });
+        dynamic.plan();
+        dynamic.apply_effort(requested_effort);
+        let hook = dynamic.clone();
         let config = LoopConfig {
             provider,
-            model,
+            model: dynamic.model.clone(),
             system_prompt: Some(crate::prompt::build(crate::prompt::PromptInput {
                 custom: req.system_prompt.as_deref().or(p.system_prompt.as_deref()),
                 append: &[p.append_system_prompt.as_deref().unwrap_or(""), req.append_system_prompt.as_deref().unwrap_or("")],
@@ -699,7 +996,7 @@ impl Hub {
                 load_context_files: p.load_context_files,
             })),
             tools,
-            reasoning,
+            reasoning: dynamic.reasoning.clone(),
             api: if provider_id == "openai" { req.api.or(p.api).unwrap_or(self.config.default_api) } else { agent_ai::Api::Auto },
             steering: Default::default(),
             follow_up: Default::default(),
@@ -708,20 +1005,13 @@ impl Hub {
             token_budget: p.token_budget,
             llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
+            before_run: Some(Arc::new(move |messages, emit| Box::pin(hook.clone().route_first_run(messages, emit)))),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
             run_generation: std::sync::atomic::AtomicU64::new(0),
-            issue_scope: Mutex::new(IssueScope {
-                client: Some(client.name.clone()),
-                session_id: Some(id.clone()),
-                profile: Some(profile_name.clone()),
-                model: Some(config.model.clone()),
-                provider: Some(provider_id.into()),
-                ..Default::default()
-            }),
             caller_tools,
             observing: AtomicBool::new(false),
             id: id.clone(),
@@ -729,8 +1019,7 @@ impl Hub {
             profile: profile_name,
             cwd,
             agent: Agent::new(config, vec![]),
-            requested_effort,
-            last_call: Mutex::new(None),
+            dynamic,
             store: Mutex::new(store),
             last_activity: Mutex::new(Instant::now()),
             idle_ttl: Duration::from_secs(if ephemeral { self.config.chat_session_ttl_secs } else { self.config.session_idle_ttl_secs }),
@@ -832,17 +1121,12 @@ impl Hub {
         if let Some(id) = filter {
             self.provider(id)?;
         }
-        let mut cache = self.models_cache.lock().await;
         let mut result = vec![];
         for (id, provider) in &self.providers {
             if filter.is_some_and(|f| f != id) {
                 continue;
             }
-            if !cache.get(id).is_some_and(|(t, _)| t.elapsed() < Duration::from_secs(600)) {
-                let models = provider.list_models().await.map_err(|e| anyhow::anyhow!("provider {id}: {e}"))?;
-                cache.insert(id.clone(), (Instant::now(), models));
-            }
-            for model in &cache[id].1 {
+            for model in &cached_models(&self.models_cache, id, &**provider).await? {
                 if all || id != "openai" || (agent_ai::models::is_chat_model(&model.id) && !agent_ai::models::is_snapshot(&model.id)) {
                     result.push(ProviderModel { provider: id.clone(), model: model.clone() });
                 }
@@ -857,7 +1141,7 @@ impl Hub {
             return "n/a";
         }
         match cfg.api {
-            agent_ai::Api::Auto => agent_ai::default_api(&cfg.model).as_str(),
+            agent_ai::Api::Auto => agent_ai::default_api(&cfg.model.get()).as_str(),
             a => a.as_str(),
         }
     }
@@ -871,13 +1155,46 @@ impl Hub {
         select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&self.config.default_model), &self.default_provider)
     }
 
+    /// 没有请求/配置模型时 provider 的默认模型：providers.<id>.defaultModel > （anthropic 且全局 defaultModel 不是 Claude 时）claude-opus-5-5 > defaultModel。
+    pub fn default_model_for(&self, provider_id: &str) -> String {
+        if let Some(model) = self.config.providers.get(provider_id).and_then(|p| p.default_model.clone()) {
+            return model;
+        }
+        if provider_id == "anthropic" && !self.config.default_model.starts_with("claude-") {
+            return crate::config::DEFAULT_CLAUDE_MODEL.into();
+        }
+        self.config.default_model.clone()
+    }
+
+    /// profile 的基础模型（与会话创建时的选择一致）。
+    pub fn profile_model(&self, p: &Profile) -> String {
+        p.model.clone().unwrap_or_else(|| self.default_model_for(self.profile_provider(p)))
+    }
+
+    /// profile 配置的深度模型；anthropic profile 默认固定为 claude-fable-5-1。
+    pub fn deep_model_spec(&self, p: &Profile, provider_id: &str) -> Option<String> {
+        p.deep_model.clone().or_else(|| (provider_id == "anthropic").then(|| crate::config::DEFAULT_CLAUDE_DEEP_MODEL.into()))
+    }
+
+    /// 会话视图（POST/GET/PATCH /v1/sessions）。
+    pub fn session_view(&self, h: &SessionHandle) -> serde_json::Value {
+        let mut view = serde_json::json!({
+            "sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "provider": h.provider_id(), "model": h.model(),
+            "api": h.effective_api().map(|a| a.as_str()).unwrap_or_else(|| self.effective_api(&h.agent.config)),
+            "isStreaming": h.agent.is_running(),
+            "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+        });
+        view.as_object_mut().unwrap().extend(h.effort_fields());
+        view
+    }
+
     pub fn tool_names(&self) -> Vec<String> {
         self.registry.names()
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn config() -> Config {
@@ -965,7 +1282,7 @@ mod tests {
         assert_eq!(hub.list_models_filtered(false, Some("faux")).await.unwrap().len(), 1);
         let h = hub.create_session(&hub.config.clients[0], SessionRequest { provider: Some("anthropic".into()), model: Some("gpt-4.1".into()), ..Default::default() }).unwrap();
         assert_eq!(h.agent.config.provider.id(), "anthropic");
-        assert_eq!(h.agent.config.reasoning, Some(ThinkingLevel::High));
+        assert_eq!(h.agent.config.reasoning.get(), Some(ThinkingLevel::High));
         assert_eq!(h.agent.config.api, agent_ai::Api::Auto);
         assert_eq!(hub.effective_api(&h.agent.config), "n/a");
         assert_eq!(h.scope().provider.as_deref(), Some("anthropic"));
@@ -982,6 +1299,220 @@ mod tests {
         assert_eq!(text, "echo: hello");
         assert_eq!(h.effective_effort(), None); // Non-OpenAI messages still record the actual thinking level.
         assert_eq!(h.effective_api(), None);
+    }
+
+    /// 记录每次请求的 provider（回复与 faux 相同）；可指定模型目录。
+    pub(crate) struct RecordingProvider {
+        pub id: &'static str,
+        pub seen: Arc<Mutex<Vec<agent_ai::Request>>>,
+        pub models: Vec<&'static str>,
+    }
+    impl Provider for RecordingProvider {
+        fn id(&self) -> &str {
+            self.id
+        }
+        fn stream(&self, req: agent_ai::Request, cancel: tokio_util::sync::CancellationToken) -> agent_ai::EventStream {
+            self.seen.lock().unwrap().push(req.clone());
+            FauxProvider.stream(req, cancel)
+        }
+        fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<ModelInfo>, String>> {
+            let models = self.models.iter().map(|id| agent_ai::models::info_for(id.to_string(), Some("anthropic".into()), None)).collect();
+            Box::pin(async move { Ok(models) })
+        }
+    }
+
+    type Seen = Arc<Mutex<Vec<agent_ai::Request>>>;
+
+    /// default profile 走 anthropic（记录请求的 faux 实现），issues 可查询。
+    fn claude_hub(models: Vec<&'static str>, edit: impl FnOnce(&mut Profile)) -> (Arc<Hub>, Seen) {
+        let mut hub = Hub::new(config(), "faux", None, None).unwrap();
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        let seen = Seen::default();
+        inner.providers.insert("anthropic".into(), Arc::new(RecordingProvider { id: "anthropic", seen: seen.clone(), models }));
+        inner.issues = Reporter::new(&inner.config.alerts, None, vec![]);
+        let profile = inner.config.profiles.get_mut("default").unwrap();
+        profile.provider = Some("anthropic".into());
+        edit(profile);
+        (hub, seen)
+    }
+
+    async fn prompt_and_wait(h: &Arc<SessionHandle>, text: &str) {
+        let mut rx = h.subscribe();
+        h.submit(text.into(), None);
+        settled(&mut rx).await;
+    }
+
+    fn is_router(req: &agent_ai::Request) -> bool {
+        req.system_prompt.as_deref() == Some(crate::routing::ROUTER_SYSTEM_PROMPT)
+    }
+
+    #[tokio::test]
+    async fn claude_default_model_and_overrides() {
+        let (hub, _) = claude_hub(vec![], |_| {});
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest::default()).unwrap();
+        assert_eq!(h.model(), crate::config::DEFAULT_CLAUDE_MODEL);
+        assert_eq!(h.routing().deep_model.as_deref(), Some(crate::config::DEFAULT_CLAUDE_DEEP_MODEL));
+        assert_eq!(h.routing().depth, Depth::Standard);
+        let (mut hub, _) = claude_hub(vec![], |_| {});
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        inner.config.providers.insert("anthropic".into(), crate::config::ProviderConfig { default_model: Some("claude-sonnet-5-5".into()), ..Default::default() });
+        let client = hub.config.clients[0].clone();
+        assert_eq!(hub.create_session(&client, SessionRequest::default()).unwrap().model(), "claude-sonnet-5-5");
+        let (hub, _) = claude_hub(vec![], |p| p.model = Some("claude-haiku-5-5".into()));
+        assert_eq!(hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap().model(), "claude-haiku-5-5");
+        // 非 anthropic profile 没有默认深度模型
+        let hub = Hub::new(config(), "faux", None, None).unwrap();
+        assert_eq!(hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap().routing().deep_model, None);
+    }
+
+    #[tokio::test]
+    async fn explicit_model_wins_and_static_depths() {
+        let (hub, seen) = claude_hub(vec![], |p| {
+            p.model = Some("claude-sonnet-4-6".into());
+            p.reasoning_effort = Some(ThinkingLevel::Medium);
+        });
+        let client = &hub.config.clients[0];
+        let explicit = hub.create_session(client, SessionRequest { model: Some("claude-opus-4-6".into()), depth: Some(Depth::Deep), ..Default::default() }).unwrap();
+        prompt_and_wait(&explicit, "hello").await;
+        let routing = explicit.routing();
+        assert_eq!((routing.model.as_str(), routing.reason.as_str(), routing.depth, routing.decided), ("claude-opus-4-6", "explicit model", Depth::Deep, true));
+        assert_eq!(seen.lock().unwrap().last().unwrap().model, "claude-opus-4-6");
+
+        let deep = hub.create_session(client, SessionRequest { depth: Some(Depth::Deep), ..Default::default() }).unwrap();
+        // 固定 id 的深度模型在创建时就生效；effort medium 在 fable 上被钳制到 high
+        assert_eq!(deep.model(), "claude-fable-5-1");
+        assert_eq!(deep.effective_effort(), Some(ThinkingLevel::High));
+        assert_eq!(deep.effort_fields()["effortAdjusted"], "clamped to allowed top-three levels");
+        prompt_and_wait(&deep, "hello").await;
+        let last = seen.lock().unwrap().last().unwrap().clone();
+        assert_eq!((last.model.as_str(), last.reasoning), ("claude-fable-5-1", Some(ThinkingLevel::High)));
+        assert_eq!(deep.routing().base_model, "claude-sonnet-4-6");
+        assert_eq!(deep.routing().reason, "depth deep");
+
+        let standard = hub.create_session(client, SessionRequest::default()).unwrap();
+        assert_eq!(standard.effective_effort(), Some(ThinkingLevel::Medium));
+        assert!(standard.effort_fields()["effortAdjusted"].is_null());
+        // 第一次 prompt 之前可以改 depth
+        standard.set_depth(Depth::Deep).unwrap();
+        assert_eq!(standard.model(), "claude-fable-5-1");
+        standard.set_depth(Depth::Standard).unwrap();
+        prompt_and_wait(&standard, "hello").await;
+        assert_eq!(seen.lock().unwrap().last().unwrap().model, "claude-sonnet-4-6");
+        assert!(standard.set_depth(Depth::Deep).unwrap_err().is::<DepthLocked>());
+        assert!(!seen.lock().unwrap().iter().any(is_router));
+    }
+
+    #[tokio::test]
+    async fn auto_routing_uses_router_once() {
+        for (prompt, expected_model, reason) in
+            [(r#"{"deep":true,"reason":"open-ended design"}"#, "claude-fable-5-1", "router: open-ended design"), (r#"{"deep":false,"reason":"small edit"}"#, "claude-sonnet-4-6", "router: small edit")]
+        {
+            let (hub, seen) = claude_hub(vec![], |p| {
+                p.model = Some("claude-sonnet-4-6".into());
+                p.auto_route = true;
+                p.router_model = Some("claude-haiku-4-5".into());
+            });
+            let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+            assert_eq!(h.routing().depth, Depth::Auto);
+            assert!(!h.routing().decided);
+            let mut rx = h.subscribe();
+            prompt_and_wait(&h, prompt).await;
+            let mut routed = None;
+            while let Ok(event) = rx.try_recv() {
+                if let AgentEvent::ModelRouted { routing } = event {
+                    routed = Some(routing);
+                }
+            }
+            assert_eq!(routed.unwrap()["model"], expected_model);
+            let routing = h.routing();
+            assert_eq!((routing.model.as_str(), routing.reason.as_str(), routing.auto), (expected_model, reason, true));
+            assert!(routing.usage.is_some());
+            {
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 2);
+                assert!(is_router(&seen[0]));
+                assert_eq!((seen[0].model.as_str(), seen[0].max_tokens, seen[0].tools.len()), ("claude-haiku-4-5", Some(crate::routing::ROUTER_MAX_TOKENS), 0));
+                assert_eq!(seen[0].reasoning, Some(ThinkingLevel::Low));
+                assert_eq!(seen[1].model, expected_model);
+            }
+            // 第二次 prompt 不再路由
+            prompt_and_wait(&h, r#"{"deep":true,"reason":"again"}"#).await;
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), 3);
+            assert!(!is_router(&seen[2]));
+            assert_eq!(seen[2].model, expected_model);
+            assert_eq!(h.routing().reason, reason);
+        }
+    }
+
+    #[tokio::test]
+    async fn router_garbage_falls_back_to_standard_and_reports_issue() {
+        let (hub, seen) = claude_hub(vec![], |p| {
+            p.model = Some("claude-sonnet-4-6".into());
+            p.auto_route = true;
+        });
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+        prompt_and_wait(&h, "hello there").await;
+        let routing = h.routing();
+        assert_eq!(routing.model, "claude-sonnet-4-6");
+        assert!(routing.reason.starts_with("router error: "), "{}", routing.reason);
+        assert_eq!(seen.lock().unwrap()[0].model, "claude-sonnet-4-6"); // routerModel defaults to the base model
+        hub.issues.flush(Duration::from_secs(2)).await;
+        let issues = hub.issues.recent(Some("default"), 0, 100);
+        let issue = issues.iter().find(|e| e.kind == "routing_error").expect("routing issue");
+        assert_eq!(issue.severity, Severity::Warn);
+        assert_eq!(issue.scope.session_id.as_deref(), Some(h.id.as_str()));
+        assert!(!serde_json::to_string(issue).unwrap().contains("hello there"));
+    }
+
+    #[tokio::test]
+    async fn latest_alias_resolves_from_catalog_at_first_prompt() {
+        let catalog = vec!["claude-fable-5", "claude-fable-5-20260101", "claude-fable-5-1", "claude-opus-5-5"];
+        let (hub, seen) = claude_hub(catalog, |p| p.deep_model = Some("latest:claude-fable".into()));
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { depth: Some(Depth::Deep), ..Default::default() }).unwrap();
+        assert_eq!(h.model(), "claude-opus-5-5");
+        assert_eq!(h.routing().deep_model.as_deref(), Some("latest:claude-fable"));
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(h.routing().model, "claude-fable-5-1");
+        assert_eq!(h.routing().deep_model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(seen.lock().unwrap().last().unwrap().model, "claude-fable-5-1");
+
+        let (hub, _) = claude_hub(vec!["claude-opus-5-5"], |p| p.deep_model = Some("latest:claude-fable".into()));
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { depth: Some(Depth::Deep), ..Default::default() }).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(h.routing().model, "claude-opus-5-5");
+        assert!(h.routing().reason.contains("no model matches latest:claude-fable"), "{}", h.routing().reason);
+    }
+
+    #[tokio::test]
+    async fn effort_changes_apply_to_next_call_and_clamp() {
+        let (hub, seen) = claude_hub(vec![], |p| p.model = Some("claude-sonnet-4-6".into()));
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { reasoning_effort: Some(ThinkingLevel::High), ..Default::default() }).unwrap();
+        let mut rx = h.subscribe();
+        let change = h.set_reasoning_effort(Some(ThinkingLevel::Low));
+        assert_eq!(
+            change,
+            EffortChange {
+                requested: Some(ThinkingLevel::Low),
+                effective: Some(ThinkingLevel::Medium),
+                adjusted: Some("clamped to allowed top-three levels".into()),
+                allowed: vec![ThinkingLevel::Medium, ThinkingLevel::High, ThinkingLevel::Max]
+            }
+        );
+        match rx.try_recv().unwrap() {
+            AgentEvent::EffortChanged { requested, effective, adjusted } => {
+                assert_eq!((requested, effective), (Some(ThinkingLevel::Low), Some(ThinkingLevel::Medium)));
+                assert!(adjusted.is_some());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(seen.lock().unwrap().last().unwrap().reasoning, Some(ThinkingLevel::Medium));
+        h.set_reasoning_effort(Some(ThinkingLevel::Max));
+        prompt_and_wait(&h, "hello").await;
+        assert_eq!(seen.lock().unwrap().last().unwrap().reasoning, Some(ThinkingLevel::Max));
+        assert_eq!(h.requested_effort(), Some(ThinkingLevel::Max));
     }
 
     #[tokio::test]

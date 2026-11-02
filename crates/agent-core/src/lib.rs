@@ -9,7 +9,7 @@ pub mod event;
 pub mod tool;
 
 pub use agent::{Agent, Disposition};
-pub use agent_loop::{run_loop, LoopConfig};
+pub use agent_loop::{run_loop, BeforeRun, Emit, LoopConfig, Shared};
 pub use event::AgentEvent;
 pub use tool::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 

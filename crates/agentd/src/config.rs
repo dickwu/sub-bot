@@ -63,6 +63,16 @@ pub struct Profile {
     pub allow_caller_tools: bool,
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
+    /// 深度模型（depth=deep 或自动路由判定为 deep 时使用）。anthropic profile 默认固定为 `claude-fable-5-1`；
+    /// 也可写 `latest:<prefix>`，按 provider 模型目录解析为该前缀下版本号最新的模型。
+    #[serde(default)]
+    pub deep_model: Option<String>,
+    /// 默认 depth=auto（第一次 prompt 时用 routerModel 做一次分类）；false 时默认 standard。
+    #[serde(default)]
+    pub auto_route: bool,
+    /// 自动路由分类用的模型；默认是 profile 的基础模型。
+    #[serde(default)]
+    pub router_model: Option<String>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -285,6 +295,9 @@ pub struct Config {
 pub struct ProviderConfig {
     pub api_key_file: Option<PathBuf>,
     pub base_url: Option<String>,
+    /// 该 provider 在没有配置/请求模型时的默认模型（anthropic 默认 `claude-opus-5-5`）
+    #[serde(default)]
+    pub default_model: Option<String>,
 }
 
 pub fn validate_provider(id: &str) -> anyhow::Result<()> {
@@ -323,6 +336,11 @@ fn default_chat_timeout_secs() -> u64 {
 fn default_model() -> String {
     "gpt-4.1-mini".into()
 }
+
+/// provider=anthropic 且没有配置/请求模型时使用的默认 Claude 模型。
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
+/// anthropic profile 的默认深度模型（固定版本；需要跟随最新版时显式配置 `latest:claude-fable`）。
+pub const DEFAULT_CLAUDE_DEEP_MODEL: &str = "claude-fable-5-1";
 
 /// URL errors deliberately omit the input (it may contain credentials).
 pub fn webhook_url(value: &str) -> Option<reqwest::Url> {
@@ -505,6 +523,9 @@ impl Config {
         let registry = agent_tools::ToolRegistry::with_builtins();
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            if let Some(deep) = &profile.deep_model {
+                anyhow::ensure!(!deep.trim().is_empty() && deep.strip_prefix("latest:").is_none_or(|p| !p.trim().is_empty()), "profile '{name}': deepModel must be a model id or latest:<prefix>");
+            }
             for tool in &profile.tools {
                 let tools = match tool.strip_prefix("preset:") {
                     Some(preset) => agent_tools::preset(preset).ok_or_else(|| anyhow::anyhow!("profile '{name}': unknown preset '{preset}'"))?,
@@ -551,6 +572,9 @@ impl Config {
                 allow_system_prompt_override: true,
                 allow_caller_tools: true,
                 max_turns: 30,
+                deep_model: None,
+                auto_route: false,
+                router_model: None,
             },
         );
         Config {
@@ -724,6 +748,24 @@ mod tests {
         std::fs::remove_file(dir.join("secret")).unwrap();
         assert_eq!(Config::load(&path).unwrap_err().to_string(), "cannot read webhookSecretFile");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn routing_fields_parse_validate_and_example_config_deserializes() {
+        let cfg: Config = serde_json::from_str(r#"{"providers":{"anthropic":{"defaultModel":"claude-sonnet-5-5"}},"profiles":{"p":{"workspaceRoots":["."],"deepModel":"latest:claude-fable","autoRoute":true,"routerModel":"claude-haiku-5-5"}}}"#).unwrap();
+        let p = &cfg.profiles["p"];
+        assert_eq!((p.deep_model.as_deref(), p.auto_route, p.router_model.as_deref()), (Some("latest:claude-fable"), true, Some("claude-haiku-5-5")));
+        assert_eq!(cfg.providers["anthropic"].default_model.as_deref(), Some("claude-sonnet-5-5"));
+        cfg.validate().unwrap();
+        let defaults: Config = serde_json::from_str(r#"{"profiles":{"p":{"workspaceRoots":["."]}}}"#).unwrap();
+        assert_eq!((defaults.profiles["p"].deep_model.as_deref(), defaults.profiles["p"].auto_route), (None, false));
+        for bad in ["latest:", " ", "latest: "] {
+            let mut invalid = cfg.clone();
+            invalid.profiles.get_mut("p").unwrap().deep_model = Some(bad.into());
+            assert!(invalid.validate().unwrap_err().to_string().contains("deepModel"));
+        }
+        let example: Config = serde_json::from_str(include_str!("../../../sub-bot.example.json")).unwrap();
+        assert_eq!(example.profiles["claude"].deep_model.as_deref(), Some(DEFAULT_CLAUDE_DEEP_MODEL));
     }
 
     #[test]

@@ -47,9 +47,9 @@ struct Cli {
     /// OpenAI API：auto（默认：gpt-5.4+/gpt-6.x/o 系列走 Responses，其余走 Chat Completions）| chat | responses。serve：全局默认；rpc/run：本会话
     #[arg(long, global = true, env = "SUB_BOT_API")]
     api: Option<agent_ai::Api>,
-    /// openai | faux（faux 不联网，用于测试）
-    #[arg(long, global = true, default_value = "openai", env = "SUB_BOT_PROVIDER")]
-    provider: String,
+    /// openai | anthropic | faux; models 时作为筛选，其它命令作为默认/会话覆盖
+    #[arg(long, global = true, env = "SUB_BOT_PROVIDER")]
+    provider: Option<String>,
     /// 日志级别（RUST_LOG 优先），如 info、debug、agentd=debug,agent_ai=trace
     #[arg(long, global = true, default_value = "info", env = "SUB_BOT_LOG")]
     log_level: String,
@@ -71,6 +71,9 @@ struct Cli {
     /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile > OPENAI_API_KEY
     #[arg(long, global = true)]
     openai_key_file: Option<PathBuf>,
+    /// Anthropic key: CLI > ANTHROPIC_API_KEY_FILE > providers.anthropic.apiKeyFile > ANTHROPIC_API_KEY
+    #[arg(long, global = true)]
+    anthropic_key_file: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -225,7 +228,7 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir)).await;
+        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir), cli.provider.as_deref()).await;
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -237,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
         previous(info);
     }));
     let _log_guard = logging::init(&cli.log_level, cli.log_dir.as_deref(), &cli.log_format)?;
-    tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, arch = std::env::consts::ARCH, provider = %cli.provider, "sub-bot starting");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, arch = std::env::consts::ARCH, provider = ?cli.provider, "sub-bot starting");
     let load = |fallback_token: &str| -> anyhow::Result<config::Config> {
         match &cli.config {
             Some(p) => config::Config::load(p),
@@ -264,10 +267,21 @@ async fn main() -> anyhow::Result<()> {
     }
     install_reporter(&loaded, &cli);
     let new_hub = |cfg: config::Config| {
-        if matches!(cli.cmd, Cmd::Serve { .. }) {
-            hub::Hub::with_reporter(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref(), issues::global().expect("installed reporter"), hub::StoreMode::Persistent)
+        let provider = cli.provider.clone().or_else(|| cfg.default_provider.clone()).unwrap_or_else(|| "openai".into());
+        let mode = if matches!(cli.cmd, Cmd::Serve { .. }) { hub::StoreMode::Persistent } else { hub::StoreMode::Memory };
+        if cli.anthropic_key_file.is_some() {
+            hub::Hub::with_provider_keys(
+                cfg,
+                &provider,
+                cli.session_dir.clone(),
+                hub::KeyFiles { openai: cli.openai_key_file.as_deref(), anthropic: cli.anthropic_key_file.as_deref() },
+                issues::global().expect("installed reporter"),
+                mode,
+            )
+        } else if matches!(cli.cmd, Cmd::Serve { .. }) {
+            hub::Hub::with_reporter(cfg, &provider, cli.session_dir.clone(), cli.openai_key_file.as_deref(), issues::global().expect("installed reporter"), mode)
         } else {
-            hub::Hub::new(cfg, &cli.provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())
+            hub::Hub::new(cfg, &provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())
         }
     };
     // Construct before dispatch so initialization failures get the short synchronous alert path.
@@ -295,7 +309,8 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req = |profile: Option<String>| hub::SessionRequest { profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
+    let session_req =
+        |profile: Option<String>| hub::SessionRequest { provider: cli.provider.clone(), profile, model: cli.model.clone(), reasoning_effort: cli.reasoning_effort, api: cli.api, ..Default::default() };
     match cli.cmd {
         Cmd::Issues { ref command } => match command {
             IssuesCmd::Test { severity, message } => {
@@ -381,21 +396,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Models { all, ref profile, json } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let mut list = hub.list_models(all).await?;
+            let mut list = hub.list_models_filtered(all, cli.provider.as_deref()).await?;
             if let Some(name) = profile {
                 let p = hub.config.profiles.get(name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
-                list.retain(|m| config::Config::model_allowed(p, &m.id));
+                list.retain(|m| config::Config::model_allowed(p, &m.model.id));
             }
             if json {
                 println!("{}", serde_json::to_string_pretty(&list)?);
             } else {
                 for m in &list {
-                    let efforts = match (m.reasoning, m.reasoning_efforts.is_empty()) {
+                    let efforts = match (m.model.reasoning, m.model.reasoning_efforts.is_empty()) {
                         (Some(false), _) => "-".to_string(),
-                        (_, false) => m.reasoning_efforts.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(","),
+                        (_, false) => m.model.reasoning_efforts.iter().map(|l| l.as_str()).collect::<Vec<_>>().join(","),
                         _ => "?".to_string(),
                     };
-                    println!("{:<32} {}", m.id, efforts);
+                    println!("{:<12} {:<32} {}", m.provider, m.model.id, efforts);
                 }
                 eprintln!("{} models (reasoning efforts: '-' = unsupported, '?' = unknown, passed through)", list.len());
             }
@@ -407,6 +422,20 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_cli_options_are_optional_and_global() {
+        let cli = Cli::try_parse_from(["sub-bot", "models"]).unwrap();
+        assert!(cli.provider.is_none());
+        for args in [
+            vec!["sub-bot", "models", "--provider", "anthropic", "--anthropic-key-file", "claude.key"],
+            vec!["sub-bot", "--provider", "anthropic", "--anthropic-key-file", "claude.key", "ask", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+            assert_eq!(cli.anthropic_key_file.as_deref(), Some(std::path::Path::new("claude.key")));
+        }
+    }
 
     #[test]
     fn startup_failure_exposes_only_typed_lock_error_through_context() {

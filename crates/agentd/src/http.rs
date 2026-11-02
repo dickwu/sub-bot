@@ -148,13 +148,14 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
     let list: Vec<_> = c
         .profiles
         .iter()
-        .filter_map(|n| st.hub.config.profiles.get(n).map(|p| json!({"name": n, "model": p.model.clone().unwrap_or_else(|| st.hub.config.default_model.clone()), "allowedModels": p.allowed_models, "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort), "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})))
+        .filter_map(|n| st.hub.config.profiles.get(n).map(|p| json!({"name": n, "provider": st.hub.profile_provider(p), "model": p.model.clone().unwrap_or_else(|| st.hub.config.default_model.clone()), "allowedModels": p.allowed_models, "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort), "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})))
         .collect();
     Ok(Json(json!({"client": c.name, "profiles": list, "registeredTools": st.hub.tool_names()})).into_response())
 }
 
 #[derive(Deserialize, Default)]
 struct ModelsQuery {
+    provider: Option<String>,
     /// 只返回该 profile 允许的模型
     profile: Option<String>,
     /// 不过滤（包含 embedding、语音、快照等）
@@ -164,15 +165,18 @@ struct ModelsQuery {
 
 /// 实时模型列表（来自 provider 的 /v1/models，缓存 10 分钟），附带推断的推理强度。
 async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Query<ModelsQuery>) -> ApiResult {
-    let mut list = st.hub.list_models(q.all).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
+    if let Some(id) = &q.provider {
+        st.hub.provider(id).map_err(|e| bad_request(e.to_string()))?;
+    }
+    let mut list = st.hub.list_models_filtered(q.all, q.provider.as_deref()).await.map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
     if let Some(name) = &q.profile {
         if !c.profiles.contains(name) {
             return Err(bad_request(format!("profile '{name}' is not allowed for this client")));
         }
         let p = st.hub.config.profiles.get(name).ok_or_else(|| bad_request(format!("unknown profile '{name}'")))?;
-        list.retain(|m| Config::model_allowed(p, &m.id));
+        list.retain(|m| Config::model_allowed(p, &m.model.id));
     }
-    Ok(Json(json!({"provider": st.hub.provider_id(), "models": list})).into_response())
+    Ok(Json(json!({"models": list})).into_response())
 }
 
 async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: Option<Json<SessionRequest>>) -> ApiResult {
@@ -586,6 +590,28 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
+    #[tokio::test]
+    async fn unloaded_provider_is_400_and_catalog_and_profiles_include_provider() {
+        let mut hub = Hub::new(config(), "faux", None, None).unwrap();
+        Arc::get_mut(&mut hub).unwrap().providers.remove("anthropic");
+        let app = test_router(hub);
+        let expected = "provider anthropic is not configured (set --anthropic-key-file / ANTHROPIC_API_KEY_FILE / providers.anthropic.apiKeyFile / ANTHROPIC_API_KEY)";
+        for (path, body) in [("/v1/sessions", json!({"provider": "anthropic"})), ("/v1/chat", json!({"message": "hello", "session": {"model": "claude-sonnet-4-5"}}))] {
+            let (status, response) = request(&app, "POST", path, Some("test-token"), body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(response["error"], expected);
+        }
+        let (status, response) = request(&app, "GET", "/v1/models?provider=anthropic", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(response["error"], expected);
+        let (status, response) = request(&app, "GET", "/v1/models?provider=faux", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["models"][0]["provider"], "faux");
+        let (status, response) = request(&app, "GET", "/v1/profiles", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(response["profiles"][0]["provider"], "faux");
+    }
+
     async fn start_async(app: &Router, body: Value) -> Value {
         let req = Request::builder().method("POST").uri("/v1/chat").header("content-type", "application/json").header("authorization", "Bearer test-token").body(Body::from(body.to_string())).unwrap();
         let response = app.clone().oneshot(req).await.unwrap();
@@ -738,7 +764,7 @@ mod tests {
         let mut cfg = config();
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
-        Arc::get_mut(&mut hub).unwrap().provider = Arc::new(PanicProvider);
+        Arc::get_mut(&mut hub).unwrap().providers.insert("faux".into(), Arc::new(PanicProvider));
         Arc::get_mut(&mut hub).unwrap().issues = crate::issues::Reporter::new(&hub.config.alerts, None, vec![]);
         let app = router(AppState { hub: hub.clone() });
         let started = start_async(&app, json!({"message":"hello", "async":true})).await;

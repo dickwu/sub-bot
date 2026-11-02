@@ -4,10 +4,45 @@
 
 - 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
-- OpenAI API key 只从环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
+- OpenAI / Anthropic API key 从文件或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.6.1。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）、grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.6.1。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+
+## Claude (Anthropic)
+
+同一服务可同时加载 `openai`、`anthropic` 和离线 `faux`。例如在现有配置中加入：
+
+```json
+{
+  "defaultProvider": "openai",
+  "providers": {
+    "openai": { "apiKeyFile": "keys/openai.key" },
+    "anthropic": { "apiKeyFile": "keys/anthropic.key" }
+  },
+  "profiles": {
+    "claude": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "reasoningEffort": "high",
+      "workspaceRoots": ["./work"]
+    }
+  }
+}
+```
+
+将 `claude` 加入调用方的 `clients[].profiles`。密钥文件建议 `chmod 600`；所有配置中的 `apiKeyFile` 相对路径都相对于配置文件目录。
+
+- Anthropic key 优先级：`--anthropic-key-file` > `ANTHROPIC_API_KEY_FILE` > `providers.anthropic.apiKeyFile` > `ANTHROPIC_API_KEY`。
+- OpenAI key 优先级保持不变：`--openai-key-file` > `OPENAI_API_KEY_FILE` > `apiKeyFile` / `providers.openai.apiKeyFile` > `OPENAI_API_KEY`。顶层 `apiKeyFile` 仍只代表 OpenAI，两个配置别名若同时设置必须一致。
+- 可选 `providers.<id>.baseUrl`；`OPENAI_BASE_URL` / `ANTHROPIC_BASE_URL` 环境变量优先于配置。
+- 选择顺序：会话 JSON `provider` > profile `provider` > 有效模型名以 `claude-` 开头时推断 Anthropic > 默认 provider。默认 provider 为显式 `--provider`（或 `SUB_BOT_PROVIDER`）> `defaultProvider` > `openai`。`run` / `rpc` / `ask` 的显式 `--provider` 也作为会话覆盖；已有 sessionId 的 ask 继续原会话。
+- 启动必须能加载默认 provider，以及 profile / 默认模型引用或推断的 provider；缺少 key 即安全失败。其它 provider 有 key 来源则加载，无来源则跳过。后续会话选择未加载 provider 返回 400，并提示配置来源；`faux` 始终可用。
+- `api` / `defaultApi` 仅用于 OpenAI。Anthropic 的 `reasoningEffort` 原样作为 thinking level 传入 provider，不使用 OpenAI 模型能力降级规则。
+
+`sub-bot models --json` 与 `GET /v1/models` 合并所有已加载 provider 的目录，每个模型都有 `provider` 字段。`models --provider anthropic` / `/v1/models?provider=anthropic` 只查询指定 provider；对话模型 / 日期快照过滤仅作用于 OpenAI，`--all` / `?all=true` 关闭过滤。`/v1/profiles` 返回每个 profile 解析后的 provider。LLM issue 的 scope 包含 provider，所有加载的 key 都加入 reporter 脱敏列表。
+
+> 集成分支说明：此分支的 `agent-ai/anthropic.rs` 是明确标记的最小 stub（调用返回 `anthropic stub`）；实际 Anthropic 网络实现由 v070-a 合并替换。
 
 ## 持久化、重启恢复与 issue 路由
 
@@ -255,7 +290,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 - **`sub-bot.example.json` 里的 `tokenSha256` 是占位符，必须替换**。配置里只存 token 的 SHA-256，不存原文；加载时要求恰好 64 个十六进制字符，并拒绝未知 profile 引用、空 `workspaceRoots`、未知工具或预设。
 - 全局参数（也可以用环境变量设置）：
   - `--config`（`SUB_BOT_CONFIG`）
-  - `--provider openai|faux`
+  - `--provider openai|anthropic|faux`
   - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
   - `--reasoning-effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh`
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
@@ -266,14 +301,14 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 ## 模型与推理强度
 
 ```bash
-sub-bot models                       # 实时调用 OpenAI /v1/models，只列可对话的模型（不含日期快照）
+sub-bot models                       # 合并已加载 provider 的模型；OpenAI 默认去掉非对话模型和日期快照
 sub-bot models --all --json          # 全部模型，JSON 输出
 sub-bot --config sub-bot.json models --profile coder   # 只列 coder 的 allowedModels 允许的
 sub-bot --model gpt-5.4-mini --reasoning-effort high run "解释一下这个仓库的结构"
 sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 ```
 
-`models` 的第二列是推理强度可选值：`-` 表示该模型不支持 `reasoning_effort`（如 gpt-4.1、gpt-4o），`?` 表示未知（原样传给 OpenAI）。
+`models` 的三列分别是 provider、模型 id、推理强度可选值：`-` 表示该模型不支持 `reasoning_effort`（如 gpt-4.1、gpt-4o），`?` 表示未知（原样传给 OpenAI）。
 
 选择优先级：
 - 模型：请求/命令行的 `model` > profile 的 `model` > `defaultModel`。如果 profile 设置了 `allowedModels`，不在列表里的模型会被拒绝（HTTP 400）
@@ -310,7 +345,7 @@ sub-bot --model gpt-5-mini --reasoning-effort minimal run --json "say hi"
 |---|---|
 | `GET /v1/health` | 健康检查（无需鉴权） |
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`） |
-| `GET /v1/models?profile=&all=` | 实时模型列表（缓存 10 分钟），每项带 `reasoning` / `reasoningEfforts`；`profile` 只返回该 profile 允许的 |
+| `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts`；`profile` 只返回该 profile 允许的 |
 | `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, cwd, model, api, reasoningEffort, requestedReasoningEffort, tools}` |
 | `GET /v1/sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |
 | `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
@@ -427,7 +462,7 @@ sub-bot 按以下顺序查找 OpenAI key，取第一个非空的：
 3. 配置文件里的 `apiKeyFile`
 4. `OPENAI_API_KEY` 环境变量
 
-key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不到、为空或中间含空白时会明确报错，但报错不会包含文件内容。文件权限对 group/other 可读时会打一条警告，建议 `chmod 600`。日志只记录 key 的来源（变量名或路径），不记录 key。`ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` 已登记在同一套机制里，供以后的 Anthropic provider 使用。
+key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不到、为空或中间含空白时会明确报错，但报错不会包含文件内容。文件权限对 group/other 可读时会打一条警告，建议 `chmod 600`。日志只记录 key 的来源（变量名或路径），不记录 key。`ANTHROPIC_API_KEY` / `ANTHROPIC_API_KEY_FILE` 使用同一套机制，优先级见上方 Claude (Anthropic) 节。
 
 **bash 工具的环境变量**：bash 子进程启动时总会剔除 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`、`SUB_BOT_TOKEN` 及对应的 `*_FILE` 变量，`allow` 也无法放行。其它变量由 profile 的 `shellEnv` 决定：默认 `inherit` 会继承其余变量；`allowlist` 只保留 `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、`LANG`、`LC_*`、`TERM`、`TZ`、`TMPDIR` 等基础变量和 `allow` 里的变量。如果你的环境里还有别的密钥（如 `AWS_*`、`GITHUB_TOKEN`），请写进 `deny`，或者直接用 `allowlist`。
 

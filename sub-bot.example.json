@@ -1,10 +1,16 @@
 {
   "dataDir": "/var/lib/sub-bot",
   "shutdownGraceSecs": 10,
+  "defaultProvider": "openai",
   "defaultModel": "gpt-4.1",
   "defaultReasoningEffort": "low",
   "defaultApi": "auto",
   "apiKeyFile": "/etc/sub-bot/openai.key",
+  "providers": {
+    "anthropic": {
+      "apiKeyFile": "/etc/sub-bot/anthropic.key"
+    }
+  },
   "alerts": {
     "webhookUrl": [
       "https://ops.example.com/sub-bot/issues",
@@ -20,6 +26,12 @@
     "queueCapacity": 1000
   },
   "profiles": {
+    "claude": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-4-5",
+      "reasoningEffort": "high",
+      "workspaceRoots": ["./work"]
+    },
     "coder": {
       "model": "gpt-5.4-mini",
       "allowedModels": [
@@ -100,6 +112,7 @@
       "tokenSha256": "REPLACE_ME: output of `sub-bot hash-token <a long random token for dev-bot>`",
       "profiles": [
         "coder",
+        "claude",
         "reviewer",
         "docs-writer"
       ]

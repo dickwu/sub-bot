@@ -4,6 +4,7 @@
 //! - `openai`：OpenAI provider，按模型选择 Chat Completions（`api/openai-completions.ts`）或 Responses API（`responses.rs`，`api/openai-responses.ts`）
 //! - `secrets`：`Secret`（打码、析构清零）、provider key 加载（文件优先）与子进程需剔除的密钥变量清单
 //! - `faux`：离线假 provider，用于测试（对应 `providers/faux.ts`）
+pub mod anthropic; // STUB - replaced by v070-a
 pub mod faux;
 pub mod models;
 pub mod openai;

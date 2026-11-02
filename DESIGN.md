@@ -11,6 +11,15 @@
 
 ---
 
+## 多 provider 集成（v070-b）
+
+- Hub 持有按 id 索引的 provider registry；每个 Agent 的 LoopConfig 持有选定 provider 的 Arc，不依赖服务全局单一 provider。选择顺序为 session.provider > profile.provider > 有效模型 `claude-` 推断 > CLI/config 默认（最终 openai）。已建会话不会因后续请求而换 provider。
+- 启动计算 needed 集合：默认 provider + 默认模型推断 + 每个 profile 的显式/推断选择。needed 缺 key 即失败；其它 provider 有来源才加载，无来源静默跳过（debug）。faux 无需 key、始终注册。显式配置但无效的 key 文件仍是错误，不降级到低优先级来源。
+- `providers.<id>` 保存 apiKeyFile/baseUrl；顶层 apiKeyFile 是 OpenAI 别名，两者冲突拒绝。key 文件按配置目录解析，CLI 文件 > provider FILE 环境变量 > 配置文件 > provider key 环境变量。base URL 环境变量优先于配置。Hub 加载时只记录 key_source，并将所有 key 注册到共享 Reporter 的脱敏列表。
+- 模型目录按 provider 独立缓存 10 分钟，输出扁平模型信息 + provider；筛选只请求选定 provider，OpenAI 对话/快照过滤不影响其它 provider。目录请求失败整体返回错误（不返回不完整目录）。profiles 暴露解析后的 provider；LLM issue scope 带 provider，用于归因和去重。
+- 非 OpenAI 忽略 API 选择，reasoning 作为 thinking level 原样传入。AnthropicProvider 使用与 OpenAI 相同的 `with_stream_idle_timeout(Secret, Option<String>, Duration)` 构造接口；此分支仅保留 `// STUB - replaced by v070-a` 实现，合并后替换，无需改 hub。
+- ask 的同步 SSE 错误、异步提交/轮询 HTTP 错误包含服务端 JSON error；非 JSON 错误保留 HTTP 状态摘要。
+
 ## v0.6.1 流式客户端与可靠性改进
 
 - `ask` 同步使用 SSE，实时输出文本 delta；`--json` 逐事件输出 NDJSON，异步轮询保持不变。

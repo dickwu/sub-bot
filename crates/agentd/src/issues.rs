@@ -40,6 +40,8 @@ pub struct IssueScope {
     pub profile: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,7 +191,7 @@ pub struct Reporter {
     capacity: usize,
     window: Duration,
     alerts: Vec<ResolvedTarget>,
-    secrets: Vec<String>,
+    secrets: Mutex<Vec<String>>,
     log_path: Option<PathBuf>,
     io_errors: AtomicU64,
     inflight: AtomicUsize,
@@ -220,7 +222,7 @@ impl Reporter {
             capacity: cfg.queue_capacity.max(1),
             window: Duration::from_secs(cfg.dedup_window_secs),
             alerts: cfg.resolved.clone(),
-            secrets,
+            secrets: Mutex::new(secrets),
             log_path: log_dir.map(|p| p.join("issues.log")),
             io_errors: AtomicU64::new(0),
             inflight: AtomicUsize::new(0),
@@ -254,18 +256,32 @@ impl Reporter {
         });
         r
     }
+    pub fn add_secret(&self, secret: String) {
+        self.secrets.lock().unwrap().push(secret);
+    }
+
     fn sanitize(&self, mut event: IssueEvent) -> IssueEvent {
-        event.message = redact(&event.message, &self.secrets).chars().take(500).collect();
+        let secrets = self.secrets.lock().unwrap();
+        event.message = redact(&event.message, &secrets).chars().take(500).collect();
         for text in [&mut event.kind, &mut event.component] {
-            *text = redact(text, &self.secrets).chars().take(200).collect();
+            *text = redact(text, &secrets).chars().take(200).collect();
         }
-        for text in [&mut event.scope.request_id, &mut event.scope.client, &mut event.scope.session_id, &mut event.scope.task_id, &mut event.scope.profile, &mut event.scope.model, &mut event.tool]
-            .into_iter()
-            .flatten()
+        for text in [
+            &mut event.scope.request_id,
+            &mut event.scope.client,
+            &mut event.scope.session_id,
+            &mut event.scope.task_id,
+            &mut event.scope.profile,
+            &mut event.scope.model,
+            &mut event.scope.provider,
+            &mut event.tool,
+        ]
+        .into_iter()
+        .flatten()
         {
-            *text = redact(text, &self.secrets).chars().take(200).collect();
+            *text = redact(text, &secrets).chars().take(200).collect();
         }
-        clean_details(&mut event.details, &self.secrets);
+        clean_details(&mut event.details, &secrets);
         if serde_json::to_vec(&event.details).map_or(true, |v| v.len() > 2048) {
             event.details = json!({"truncated": true});
         }

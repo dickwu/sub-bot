@@ -15,6 +15,7 @@ use std::{
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Profile {
+    pub provider: Option<String>,
     /// 替换默认编码 agent 前言（对应 pi `customPrompt` / `--system-prompt`）
     pub system_prompt: Option<String>,
     /// 追加到系统提示末尾（对应 pi `appendSystemPrompt`）
@@ -229,6 +230,9 @@ pub struct TrustLoopback {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
+    pub default_provider: Option<String>,
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
     pub data_dir: Option<PathBuf>,
     pub unix_socket: Option<PathBuf>,
     pub unix_socket_mode: Option<String>,
@@ -274,6 +278,18 @@ pub struct Config {
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderConfig {
+    pub api_key_file: Option<PathBuf>,
+    pub base_url: Option<String>,
+}
+
+pub fn validate_provider(id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(matches!(id, "openai" | "anthropic" | "faux"), "unknown provider {id}");
+    Ok(())
 }
 
 fn default_shutdown_grace() -> u64 {
@@ -436,6 +452,13 @@ impl Config {
                 cfg.api_key_file = Some(dir.join(f));
             }
         }
+        for provider in cfg.providers.values_mut() {
+            if let Some(file) = &mut provider.api_key_file {
+                if file.is_relative() {
+                    *file = path.parent().unwrap_or_else(|| Path::new(".")).join(&*file);
+                }
+            }
+        }
         for client in &mut cfg.clients {
             if let Some(file) = &mut client.webhook_secret_file {
                 if file.is_relative() {
@@ -463,6 +486,12 @@ impl Config {
     /// 只做结构/注册表校验，不访问工作目录或网络。
     pub fn validate(&self) -> anyhow::Result<()> {
         self.socket_mode()?;
+        for id in self.default_provider.iter().chain(self.providers.keys()).chain(self.profiles.values().filter_map(|p| p.provider.as_ref())) {
+            validate_provider(id)?;
+        }
+        if let (Some(top), Some(alias)) = (&self.api_key_file, self.providers.get("openai").and_then(|p| p.api_key_file.as_ref())) {
+            anyhow::ensure!(top == alias, "apiKeyFile and providers.openai.apiKeyFile must match");
+        }
         for mapping in &self.local_clients {
             anyhow::ensure!(
                 usize::from(mapping.uid.is_some()) + usize::from(mapping.username.is_some()) + usize::from(mapping.any) == 1,
@@ -503,6 +532,7 @@ impl Config {
         profiles.insert(
             "default".into(),
             Profile {
+                provider: None,
                 system_prompt: None,
                 append_system_prompt: None,
                 model: None,
@@ -524,6 +554,8 @@ impl Config {
             },
         );
         Config {
+            default_provider: None,
+            providers: BTreeMap::new(),
             data_dir: None,
             unix_socket: None,
             unix_socket_mode: None,
@@ -771,6 +803,41 @@ mod tests {
             invalid["clients"][0]["tokenSha256"] = serde_json::json!(hash);
             std::fs::write(&path, invalid.to_string()).unwrap();
             assert_eq!(Config::load(&path).unwrap_err().to_string(), "client 'bot': tokenSha256 must be exactly 64 hex characters");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn provider_config_paths_aliases_and_validation() {
+        let dir = std::env::temp_dir().join(format!("sub-bot-provider-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let mut value = serde_json::json!({
+            "defaultProvider": "anthropic",
+            "apiKeyFile": "keys/openai",
+            "providers": {
+                "openai": {"apiKeyFile": "keys/openai", "baseUrl": "http://localhost:9000"},
+                "anthropic": {"apiKeyFile": "keys/anthropic", "baseUrl": "http://localhost:9001"}
+            },
+            "profiles": {"claude": {"provider": "anthropic", "model": "claude-sonnet-4-5", "workspaceRoots": ["."]}}
+        });
+        std::fs::write(&path, value.to_string()).unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.profiles["claude"].provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.providers["anthropic"].api_key_file, Some(dir.join("keys/anthropic")));
+        assert_eq!(cfg.providers["openai"].api_key_file, cfg.api_key_file);
+        assert_eq!(cfg.providers["anthropic"].base_url.as_deref(), Some("http://localhost:9001"));
+        value["providers"]["openai"]["apiKeyFile"] = "different".into();
+        std::fs::write(&path, value.to_string()).unwrap();
+        assert!(Config::load(&path).unwrap_err().to_string().contains("must match"));
+        for invalid in [
+            serde_json::json!({"defaultProvider": "unknown", "profiles": {}}),
+            serde_json::json!({"providers": {"unknown": {}}, "profiles": {}}),
+            serde_json::json!({"profiles": {"p": {"provider": "unknown", "workspaceRoots": ["."]}}}),
+        ] {
+            let cfg: Config = serde_json::from_value(invalid).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains("unknown provider"));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

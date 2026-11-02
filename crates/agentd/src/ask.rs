@@ -33,6 +33,7 @@ pub struct Client {
     url: String,
     token: Option<axum::http::HeaderValue>,
     http: reqwest::Client,
+    provider: Option<String>,
 }
 
 impl Client {
@@ -60,7 +61,7 @@ impl Client {
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Self { socket, url, token, http })
+        Ok(Self { socket, url, token, http, provider: None })
     }
 
     async fn response(&self, method: axum::http::Method, path: &str, body: Option<&Value>) -> anyhow::Result<(axum::http::StatusCode, axum::body::Body, tokio::task::JoinSet<()>)> {
@@ -98,15 +99,19 @@ impl Client {
         use http_body_util::BodyExt;
         let (status, body, _connections) = self.response(method, path, body).await?;
         let bytes = body.collect().await?.to_bytes();
-        Ok((status, serde_json::from_slice(&bytes).map_err(|_| anyhow::anyhow!("invalid server JSON"))?))
+        let value = serde_json::from_slice(&bytes).map_err(|_| if status.is_success() { anyhow::anyhow!("invalid server JSON") } else { http_error(status, None) })?;
+        Ok((status, value))
     }
 
     pub async fn ask_stream(&self, message: &str, profile: Option<&str>, session: Option<&str>, timeout_secs: u64, mut on_event: impl FnMut(&str, &Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
         use http_body_util::BodyExt;
         let request = async {
-            let body = json!({"message": message, "session": {"profile": profile}, "sessionId": session, "stream": true});
+            let body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session, "stream": true});
             let (status, mut body, _connections) = self.response(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
-            anyhow::ensure!(status.is_success(), "server returned HTTP {status}");
+            if !status.is_success() {
+                let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
+                return Err(http_error(status, serde_json::from_slice::<Value>(&bytes).ok().as_ref()));
+            }
             let mut parser = SseParser::default();
             let mut outcome = StreamOutcome::default();
             while let Some(frame) = body.frame().await {
@@ -138,20 +143,31 @@ impl Client {
     }
 
     async fn ask_async_inner(&self, message: &str, profile: Option<&str>, session: Option<&str>) -> anyhow::Result<Value> {
-        let body = json!({"message": message, "session": {"profile": profile}, "sessionId": session, "async": true});
+        let body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session, "async": true});
         let (status, response) = self.request(axum::http::Method::POST, "/v1/chat", Some(&body)).await?;
-        anyhow::ensure!(status.is_success(), "server returned HTTP {status}");
+        if !status.is_success() {
+            return Err(http_error(status, Some(&response)));
+        }
         let id = response["taskId"].as_str().ok_or_else(|| anyhow::anyhow!("missing taskId"))?;
         let id = uuid::Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("invalid taskId"))?;
         let path = format!("/v1/tasks/{id}");
         loop {
             let (status, task) = self.request(axum::http::Method::GET, &path, None).await?;
-            anyhow::ensure!(status.is_success(), "server returned HTTP {status}");
+            if !status.is_success() {
+                return Err(http_error(status, Some(&task)));
+            }
             if task["status"] != "running" {
                 return Ok(task);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+}
+
+fn http_error(status: axum::http::StatusCode, body: Option<&Value>) -> anyhow::Error {
+    match body.and_then(|v| v["error"].as_str()) {
+        Some(message) => anyhow::anyhow!("server returned HTTP {status}: {message}"),
+        None => anyhow::anyhow!("server returned HTTP {status}"),
     }
 }
 
@@ -253,7 +269,7 @@ impl StreamOutcome {
     }
 }
 
-pub async fn run(args: &Ask, data_dir: PathBuf) -> anyhow::Result<()> {
+pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let mut message = args.message.clone();
     if message == "-" {
@@ -269,7 +285,8 @@ pub async fn run(args: &Ask, data_dir: PathBuf) -> anyhow::Result<()> {
         crate::config::prepare_temp_data_dir(&default_socket, false)?;
     }
     let socket = args.socket.clone().or_else(|| (args.url.is_none() && default_socket.exists()).then_some(default_socket));
-    let client = Client::new(socket, args.url.clone(), token.as_deref())?;
+    let mut client = Client::new(socket, args.url.clone(), token.as_deref())?;
+    client.provider = provider.map(str::to_owned);
     if !args.asynchronous {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
@@ -408,6 +425,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn server_json_error_is_included_for_sync_and_async() {
+        let app = Router::new().route("/v1/chat", post(|| async { (axum::http::StatusCode::BAD_REQUEST, axum::Json(json!({"error": "unknown profile 'missing'"}))) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Client::new(None, Some(format!("http://{}", listener.local_addr().unwrap())), None).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let expected = "server returned HTTP 400 Bad Request: unknown profile 'missing'";
+        assert_eq!(client.ask_stream("hi", Some("missing"), None, 5, |_, _| Ok(())).await.unwrap_err().to_string(), expected);
+        assert_eq!(client.ask_async("hi", Some("missing"), None, 5).await.unwrap_err().to_string(), expected);
+        server.abort();
     }
 
     #[tokio::test]

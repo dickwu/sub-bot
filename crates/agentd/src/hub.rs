@@ -3,13 +3,13 @@ use crate::{
     issues::{IssueEvent, IssueScope, Reporter, Severity},
     webhook::{DeliveryState, DeliveryStatus, RetryPolicy, WebhookTarget},
 };
-use agent_ai::{faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
+use agent_ai::{anthropic::AnthropicProvider, faux::FauxProvider, models::reasoning_support, openai::OpenAiProvider, Message, ModelInfo, Provider, ReasoningSupport, ThinkingLevel};
 use agent_core::{Agent, AgentEvent, AgentTool, LoopConfig};
 use agent_session::Session;
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
 use anyhow::{bail, Result};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -86,7 +86,7 @@ impl SessionHandle {
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
         let effort = self.agent.config.reasoning.map(|l| l.as_str()).unwrap_or("-");
-        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, model = %self.agent.config.model, reasoning_effort = effort);
+        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), model = %self.agent.config.model, reasoning_effort = effort);
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let disposition = self.agent.submit_with(msg, mode, move |new| {
@@ -202,6 +202,7 @@ impl SessionHandle {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRequest {
+    pub provider: Option<String>,
     pub profile: Option<String>,
     /// 会话工作目录：绝对路径或相对 profile 第一个 workspaceRoot；必须落在某个 workspaceRoot 内
     pub cwd: Option<PathBuf>,
@@ -325,7 +326,8 @@ pub enum StoreMode {
 pub struct Hub {
     pub config: Config,
     pub issues: Arc<Reporter>,
-    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) providers: BTreeMap<String, Arc<dyn Provider>>,
+    default_provider: String,
     registry: ToolRegistry,
     session_dir: Option<PathBuf>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
@@ -334,7 +336,7 @@ pub struct Hub {
     http: reqwest::Client,
     #[cfg(test)]
     pub(crate) callback_timeout: Option<Duration>,
-    models_cache: tokio::sync::Mutex<Option<(std::time::Instant, Vec<ModelInfo>)>>,
+    models_cache: tokio::sync::Mutex<BTreeMap<String, (Instant, Vec<ModelInfo>)>>,
 }
 
 /// 按模型能力处理推理强度：不支持则忽略（warn），取值不支持则换成最接近的（warn），未知模型原样发送。
@@ -382,6 +384,62 @@ fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(Path
     Ok((cwd, root.clone()))
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct ProviderModel {
+    pub provider: String,
+    #[serde(flatten)]
+    pub model: ModelInfo,
+}
+
+#[derive(Default)]
+pub struct KeyFiles<'a> {
+    pub openai: Option<&'a std::path::Path>,
+    pub anthropic: Option<&'a std::path::Path>,
+}
+
+pub fn select_provider<'a>(requested: Option<&'a str>, profile: Option<&'a str>, model: &str, default: &'a str) -> &'a str {
+    requested.or(profile).unwrap_or_else(|| if model.starts_with("claude-") { "anthropic" } else { default })
+}
+
+fn not_configured(id: &str) -> String {
+    let upper = id.to_ascii_uppercase();
+    format!("provider {id} is not configured (set --{id}-key-file / {upper}_API_KEY_FILE / providers.{id}.apiKeyFile / {upper}_API_KEY)")
+}
+
+fn load_providers(config: &Config, default: &str, files: KeyFiles<'_>, issues: &Reporter, getenv: impl Fn(&str) -> Option<String>) -> Result<BTreeMap<String, Arc<dyn Provider>>> {
+    crate::config::validate_provider(default)?;
+    let mut needed = BTreeSet::from([default, select_provider(None, None, &config.default_model, default)]);
+    for p in config.profiles.values() {
+        needed.insert(select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&config.default_model), default));
+    }
+    let mut providers: BTreeMap<String, Arc<dyn Provider>> = BTreeMap::new();
+    providers.insert("faux".into(), Arc::new(FauxProvider));
+    for pk in agent_ai::secrets::PROVIDER_KEYS {
+        let id = pk.provider;
+        let cli_file = if id == "openai" { files.openai } else { files.anthropic };
+        let settings = config.providers.get(id);
+        let config_file = settings.and_then(|p| p.api_key_file.as_deref()).or_else(|| if id == "openai" { config.api_key_file.as_deref() } else { None });
+        let present = cli_file.is_some() || config_file.is_some() || [pk.env, pk.file_env].iter().any(|var| getenv(var).is_some_and(|s| !s.trim().is_empty()));
+        if !present && !needed.contains(id) {
+            tracing::debug!(provider = id, "provider not configured; skipping");
+            continue;
+        }
+        anyhow::ensure!(present, "{}", not_configured(id));
+        let (key, source) = agent_ai::secrets::load_provider_key(pk, cli_file, config_file, &getenv).map_err(anyhow::Error::msg)?;
+        issues.add_secret(key.expose().to_owned());
+        tracing::info!(provider = id, key_source = %source, "api key loaded");
+        let base_url = getenv(&format!("{}_BASE_URL", id.to_ascii_uppercase())).filter(|s| !s.trim().is_empty()).or_else(|| settings.and_then(|p| p.base_url.clone()));
+        let timeout = Duration::from_secs(config.stream_idle_timeout_secs);
+        let provider: Arc<dyn Provider> = match id {
+            "openai" => Arc::new(OpenAiProvider::with_stream_idle_timeout(key, base_url, timeout)),
+            "anthropic" => Arc::new(AnthropicProvider::with_stream_idle_timeout(key, base_url, timeout)),
+            _ => unreachable!("known provider key"),
+        };
+        providers.insert(id.into(), provider);
+    }
+    Ok(providers)
+}
+
 impl Hub {
     /// In-memory journals for standalone commands; session history remains independently configurable.
     /// `openai_key_file`：命令行 `--openai-key-file`。key 的加载顺序见 `agent_ai::secrets::load_provider_key`。
@@ -397,19 +455,12 @@ impl Hub {
         issues: Arc<Reporter>,
         store_mode: StoreMode,
     ) -> Result<Arc<Self>> {
+        Self::with_provider_keys(config, provider_name, session_dir, KeyFiles { openai: openai_key_file, anthropic: None }, issues, store_mode)
+    }
+
+    pub fn with_provider_keys(config: Config, provider_name: &str, session_dir: Option<PathBuf>, files: KeyFiles<'_>, issues: Arc<Reporter>, store_mode: StoreMode) -> Result<Arc<Self>> {
         config.validate()?;
-        let provider: Arc<dyn Provider> = match provider_name {
-            "faux" => Arc::new(FauxProvider),
-            "openai" => {
-                let pk = agent_ai::secrets::provider_key("openai").expect("openai key spec");
-                let (key, source) = agent_ai::secrets::load_provider_key(pk, openai_key_file, config.api_key_file.as_deref(), |k| std::env::var(k).ok())
-                    .map_err(|e| anyhow::anyhow!("{e} (or use --provider faux)"))?;
-                // 只记录来源（变量名/路径），不记录 key
-                tracing::info!(provider = "openai", key_source = %source, "api key loaded");
-                Arc::new(OpenAiProvider::with_stream_idle_timeout(key, std::env::var("OPENAI_BASE_URL").ok(), std::time::Duration::from_secs(config.stream_idle_timeout_secs)))
-            }
-            other => bail!("unknown provider {other}"),
-        };
+        let providers = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok())?;
         let registry = ToolRegistry::with_builtins();
         let store = match store_mode {
             StoreMode::Memory => crate::store::Store::memory(),
@@ -450,7 +501,8 @@ impl Hub {
             issues,
             store,
             config,
-            provider,
+            providers,
+            default_provider: provider_name.into(),
             registry,
             session_dir,
             sessions: Mutex::new(HashMap::new()),
@@ -629,10 +681,12 @@ impl Hub {
         if !Config::model_allowed(p, &model) {
             bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
         }
+        let provider_id = select_provider(req.provider.as_deref(), p.provider.as_deref(), &model, &self.default_provider);
+        let provider = self.provider(provider_id)?;
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
-        let reasoning = resolve_effort(&model, requested_effort);
+        let reasoning = if provider_id == "openai" { resolve_effort(&model, requested_effort) } else { requested_effort };
         let config = LoopConfig {
-            provider: self.provider.clone(),
+            provider,
             model,
             system_prompt: Some(crate::prompt::build(crate::prompt::PromptInput {
                 custom: req.system_prompt.as_deref().or(p.system_prompt.as_deref()),
@@ -644,7 +698,7 @@ impl Hub {
             })),
             tools,
             reasoning,
-            api: req.api.or(p.api).unwrap_or(self.config.default_api),
+            api: if provider_id == "openai" { req.api.or(p.api).unwrap_or(self.config.default_api) } else { agent_ai::Api::Auto },
             steering: Default::default(),
             follow_up: Default::default(),
             max_turns: p.max_turns,
@@ -653,7 +707,7 @@ impl Hub {
             llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, cwd = %cwd.display(), model = %config.model, reasoning_effort = config.reasoning.map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -663,6 +717,7 @@ impl Hub {
                 session_id: Some(id.clone()),
                 profile: Some(profile_name.clone()),
                 model: Some(config.model.clone()),
+                provider: Some(provider_id.into()),
                 ..Default::default()
             }),
             caller_tools,
@@ -767,23 +822,36 @@ impl Hub {
     }
 
     /// 实时模型列表（缓存 10 分钟）。`all=false` 时只保留可用于对话的模型并去掉日期快照。
-    pub async fn list_models(&self, all: bool) -> Result<Vec<ModelInfo>> {
+    pub async fn list_models(&self, all: bool) -> Result<Vec<ProviderModel>> {
+        self.list_models_filtered(all, None).await
+    }
+
+    pub async fn list_models_filtered(&self, all: bool, filter: Option<&str>) -> Result<Vec<ProviderModel>> {
+        if let Some(id) = filter {
+            self.provider(id)?;
+        }
         let mut cache = self.models_cache.lock().await;
-        let fresh = cache.as_ref().filter(|(t, _)| t.elapsed() < std::time::Duration::from_secs(600)).map(|(_, m)| m.clone());
-        let models = match fresh {
-            Some(m) => m,
-            None => {
-                let m = self.provider.list_models().await.map_err(|e| anyhow::anyhow!(e))?;
-                *cache = Some((std::time::Instant::now(), m.clone()));
-                m
+        let mut result = vec![];
+        for (id, provider) in &self.providers {
+            if filter.is_some_and(|f| f != id) {
+                continue;
             }
-        };
-        Ok(if all || self.provider.id() != "openai" { models } else { models.into_iter().filter(|m| agent_ai::models::is_chat_model(&m.id) && !agent_ai::models::is_snapshot(&m.id)).collect() })
+            if !cache.get(id).is_some_and(|(t, _)| t.elapsed() < Duration::from_secs(600)) {
+                let models = provider.list_models().await.map_err(|e| anyhow::anyhow!("provider {id}: {e}"))?;
+                cache.insert(id.clone(), (Instant::now(), models));
+            }
+            for model in &cache[id].1 {
+                if all || id != "openai" || (agent_ai::models::is_chat_model(&model.id) && !agent_ai::models::is_snapshot(&model.id)) {
+                    result.push(ProviderModel { provider: id.clone(), model: model.clone() });
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// 会话预计使用的 API（auto 按模型解析；非 OpenAI provider 返回 "n/a"）。运行时若被迫切换，以消息里的 `api` 为准。
     pub fn effective_api(&self, cfg: &LoopConfig) -> &'static str {
-        if self.provider.id() != "openai" {
+        if cfg.provider.id() != "openai" {
             return "n/a";
         }
         match cfg.api {
@@ -792,8 +860,13 @@ impl Hub {
         }
     }
 
-    pub fn provider_id(&self) -> &str {
-        self.provider.id()
+    pub fn provider(&self, id: &str) -> Result<Arc<dyn Provider>> {
+        crate::config::validate_provider(id)?;
+        self.providers.get(id).cloned().ok_or_else(|| anyhow::anyhow!(not_configured(id)))
+    }
+
+    pub fn profile_provider<'a>(&'a self, p: &'a Profile) -> &'a str {
+        select_provider(None, p.provider.as_deref(), p.model.as_deref().unwrap_or(&self.config.default_model), &self.default_provider)
     }
 
     pub fn tool_names(&self) -> Vec<String> {
@@ -810,6 +883,101 @@ mod tests {
         cfg.data_dir = Some(std::env::temp_dir().join(format!("sub-bot-state-{}", uuid::Uuid::new_v4())));
         cfg.profiles.get_mut("default").unwrap().load_context_files = false;
         cfg
+    }
+
+    #[test]
+    fn provider_selection_precedence() {
+        for (request, profile, model, default, expected) in [
+            (Some("faux"), Some("openai"), "claude-sonnet-4-5", "openai", "faux"),
+            (None, Some("faux"), "claude-sonnet-4-5", "openai", "faux"),
+            (None, None, "claude-sonnet-4-5", "faux", "anthropic"),
+            (None, None, "gpt-4.1", "faux", "faux"),
+            (None, None, "unknown", "openai", "openai"),
+        ] {
+            assert_eq!(select_provider(request, profile, model, default), expected);
+        }
+    }
+
+    #[test]
+    fn needed_keys_fail_and_unneeded_providers_are_skipped() {
+        let mut cfg = config();
+        let load = |cfg: &Config, default| load_providers(cfg, default, KeyFiles::default(), &Reporter::noop(), |_| None);
+        assert!(load(&cfg, "openai").err().unwrap().to_string().contains("provider openai is not configured"));
+        assert_eq!(load(&cfg, "faux").unwrap().keys().cloned().collect::<Vec<_>>(), ["faux"]);
+        cfg.profiles.get_mut("default").unwrap().provider = Some("anthropic".into());
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+        cfg.profiles.get_mut("default").unwrap().provider = None;
+        cfg.profiles.get_mut("default").unwrap().model = Some("claude-sonnet-4-5".into());
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+        cfg.profiles.get_mut("default").unwrap().model = None;
+        cfg.default_model = "claude-sonnet-4-5".into();
+        assert_eq!(load(&cfg, "faux").err().unwrap().to_string(), not_configured("anthropic"));
+    }
+
+    #[tokio::test]
+    async fn optional_keys_load_and_all_loaded_keys_are_redacted() {
+        let cfg = config();
+        let reporter = Reporter::new(&cfg.alerts, None, vec![]);
+        let providers = load_providers(&cfg, "faux", KeyFiles::default(), &reporter, |var| match var {
+            "OPENAI_API_KEY" => Some("test-openai-value".into()),
+            "ANTHROPIC_API_KEY" => Some("test-anthropic-value".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(providers.len(), 3);
+        reporter.report(IssueEvent::new(Severity::Error, "llm_auth", "llm", "test-anthropic-value test-openai-value").details(serde_json::json!({"diagnostic": "test-anthropic-value"})));
+        reporter.flush(Duration::from_secs(1)).await;
+        let events = reporter.recent(None, 0, 100);
+        assert_eq!(events[0].message, "[redacted] [redacted]");
+        assert_eq!(events[0].details["diagnostic"], "[redacted]");
+    }
+
+    struct CatalogProvider(&'static str);
+    impl Provider for CatalogProvider {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn stream(&self, req: agent_ai::Request, cancel: tokio_util::sync::CancellationToken) -> agent_ai::EventStream {
+            FauxProvider.stream(req, cancel)
+        }
+        fn list_models(&self) -> futures::future::BoxFuture<'_, Result<Vec<ModelInfo>, String>> {
+            Box::pin(async { Ok(["gpt-4.1", "gpt-4.1-2025-04-14", "text-embedding-3-small"].into_iter().map(|id| agent_ai::models::info_for(id.into(), None, None)).collect()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn merged_catalog_filters_only_openai_and_sessions_use_selected_provider() {
+        let mut cfg = config();
+        cfg.profiles.get_mut("default").unwrap().reasoning_effort = Some(ThinkingLevel::High);
+        cfg.profiles.get_mut("default").unwrap().api = Some(agent_ai::Api::Chat);
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        let inner = Arc::get_mut(&mut hub).unwrap();
+        inner.providers.insert("openai".into(), Arc::new(CatalogProvider("openai")));
+        inner.providers.insert("anthropic".into(), Arc::new(CatalogProvider("anthropic")));
+        let models = hub.list_models(false).await.unwrap();
+        assert_eq!(models.len(), 5);
+        let json = serde_json::to_value(&models).unwrap();
+        assert_eq!(json[0]["provider"], "anthropic");
+        assert_eq!(json[0]["id"], "gpt-4.1");
+        assert_eq!(hub.list_models_filtered(true, Some("openai")).await.unwrap().len(), 3);
+        assert_eq!(hub.list_models_filtered(false, Some("faux")).await.unwrap().len(), 1);
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { provider: Some("anthropic".into()), model: Some("gpt-4.1".into()), ..Default::default() }).unwrap();
+        assert_eq!(h.agent.config.provider.id(), "anthropic");
+        assert_eq!(h.agent.config.reasoning, Some(ThinkingLevel::High));
+        assert_eq!(h.agent.config.api, agent_ai::Api::Auto);
+        assert_eq!(hub.effective_api(&h.agent.config), "n/a");
+        assert_eq!(h.scope().provider.as_deref(), Some("anthropic"));
+        let mut events = h.subscribe();
+        h.submit("hello".into(), None);
+        let mut text = String::new();
+        while let Ok(event) = events.recv().await {
+            match event {
+                AgentEvent::MessageEnd { message: Message::Assistant(a) } => text = a.text(),
+                AgentEvent::AgentSettled { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "echo: hello");
     }
 
     #[tokio::test]

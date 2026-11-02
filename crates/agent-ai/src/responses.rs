@@ -187,7 +187,7 @@ impl StreamState {
             return Err("OpenAI responses stream ended without response.completed".into());
         }
         if !self.thinking.is_empty() {
-            self.msg.content.push(Content::Thinking { thinking: std::mem::take(&mut self.thinking) });
+            self.msg.content.push(Content::Thinking { thinking: std::mem::take(&mut self.thinking), signature: None });
         }
         if !self.text.is_empty() {
             self.msg.content.push(Content::Text { text: std::mem::take(&mut self.text) });

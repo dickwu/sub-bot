@@ -101,6 +101,9 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
 
 /// 能否用 Chat Completions 对话（排除 embedding / 语音 / 图像 / realtime / 仅 Responses API 的 codex、pro、deep-research 等）。
 pub fn is_chat_model(id: &str) -> bool {
+    if id.starts_with("claude-") {
+        return true;
+    }
     let chat_prefix = id.starts_with("gpt-") || id.starts_with("chatgpt-") || id == "chat-latest" || (id.len() > 1 && id.starts_with('o') && id.as_bytes()[1].is_ascii_digit());
     const EXCLUDE: &[&str] = &[
         "embedding",
@@ -145,6 +148,15 @@ pub fn model_matches(pattern: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn claude_models_are_chat_models() {
+        for id in ["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-opus-4-6"] {
+            assert!(is_chat_model(id));
+            assert!(!is_deprecated(id));
+            assert!(!is_snapshot(id)); // Anthropic dated IDs must remain visible in the default catalogue.
+        }
+    }
+
     #[test]
     fn capabilities() {
         assert_eq!(reasoning_support("gpt-4.1-mini"), ReasoningSupport::Unsupported);

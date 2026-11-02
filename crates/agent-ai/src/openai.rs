@@ -1,8 +1,8 @@
 //! OpenAI provider：Chat Completions（对应 pi `api/openai-completions.ts`）和 Responses API（`api/openai-responses.ts`，见 `responses.rs`）。
 //! 按 `Request.api` 选择；`auto` 时由 `models::default_api` 按模型决定。
+use crate::retry::{retry_after, CallError};
 use crate::{models::default_api, provider::*, types::*};
 use futures::StreamExt;
-use rand::Rng;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -234,85 +234,10 @@ struct CallCtx {
     api_cache: Arc<Mutex<HashMap<String, Api>>>,
 }
 
-struct CallError {
-    reason: String,
-    transient: bool,
-    retry_after: Option<Duration>,
-}
-
-impl CallError {
-    fn transport(error: reqwest::Error) -> Self {
-        Self { transient: error.is_connect() || error.is_timeout() || error.is_request() || error.is_body(), reason: redact(&error.to_string()), retry_after: None }
-    }
-}
-
-impl From<String> for CallError {
-    fn from(reason: String) -> Self {
-        let transient = reason.starts_with("stream idle timeout ")
-            || reason == "response headers timeout after 120s"
-            || reason == "stream body read error"
-            || reason == "OpenAI stream ended without finish_reason (connection dropped?)"
-            || reason == "OpenAI responses stream ended without response.completed";
-        Self { reason, transient, retry_after: None }
-    }
-}
-
-fn retry_after(value: &str) -> Option<Duration> {
-    let value = value.trim();
-    value
-        .parse::<u64>()
-        .ok()
-        .map(Duration::from_secs)
-        .or_else(|| httpdate::parse_http_date(value).ok().map(|date| date.duration_since(std::time::SystemTime::now()).unwrap_or_default()))
-        .map(|delay| delay.min(crate::MAX_RETRY_AFTER))
-}
-
-/// A fresh parser/message per attempt. Forward deltas immediately, but never retry once
-/// any tool event has escaped. The outer cancellation select drops requests and sleeps.
 async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
     let max_retries = req.llm_max_retries.unwrap_or(3);
-    for retry in 0..=max_retries {
-        let (attempt_tx, mut rx) = mpsc::channel(64);
-        let mut tool_started = false;
-        let forward = |ev: &AssistantEvent, tool_started: &mut bool| {
-            *tool_started |= matches!(ev, AssistantEvent::ToolcallStart { .. } | AssistantEvent::ToolcallDelta { .. } | AssistantEvent::ToolcallEnd { .. });
-        };
-        let result = {
-            let call = run(ctx, req.clone(), api, attempt_tx, attempt);
-            tokio::pin!(call);
-            loop {
-                tokio::select! {
-                    Some(ev) = rx.recv() => {
-                        forward(&ev, &mut tool_started);
-                        if tx.send(ev).await.is_err() { return Err("consumer closed".into()); }
-                    },
-                    result = &mut call => break result,
-                }
-            }
-        };
-        // run may finish with events still buffered; inspect these before deciding safety.
-        while let Ok(ev) = rx.try_recv() {
-            forward(&ev, &mut tool_started);
-            if tx.send(ev).await.is_err() {
-                return Err("consumer closed".into());
-            }
-        }
-        match result {
-            Ok(message) => return Ok(message),
-            Err(error) if error.transient && !tool_started && retry < max_retries => {
-                let base = Duration::from_secs(1u64 << retry.min(5));
-                let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=250));
-                let delay = (base + jitter).min(Duration::from_secs(30)).max(error.retry_after.unwrap_or_default());
-                tracing::warn!(issue = "typed", attempt = retry + 1, delay_ms = delay.as_millis() as u64, "retrying transient LLM failure; discarding partial message");
-                if tx.send(AssistantEvent::Retry { attempt: retry + 1, reason: error.reason }).await.is_err() {
-                    return Err("consumer closed".into());
-                }
-                tokio::time::sleep(delay).await;
-            }
-            Err(error) => return Err(error.reason),
-        }
-    }
-    unreachable!("retry loop always returns on its last attempt")
+    let mut state = (ctx, req, api, attempt);
+    crate::retry::run_with_retries(&mut state, max_retries, tx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3))).await
 }
 
 /// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。

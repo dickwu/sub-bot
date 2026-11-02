@@ -138,6 +138,23 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_secrets_cannot_be_allowed() {
+        let names = ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_FILE"];
+        for mode in [EnvMode::Inherit, EnvMode::Allowlist] {
+            let policy = ShellEnv { mode, allow: vec!["ANTHROPIC_*".into()], deny: vec![] };
+            let plan = policy.plan(vars(&names));
+            assert!(plan.set.is_empty());
+            if mode == EnvMode::Inherit {
+                for name in names {
+                    assert!(plan.remove.contains(&OsString::from(name)));
+                }
+            } else {
+                assert!(plan.clear);
+            }
+        }
+    }
+
+    #[test]
     fn parses_config() {
         let e: ShellEnv = serde_json::from_str(r#"{"mode":"allowlist","allow":["CARGO_*"]}"#).unwrap();
         assert_eq!(e.mode, EnvMode::Allowlist);

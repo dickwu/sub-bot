@@ -9,9 +9,22 @@ pub fn now_ms() -> i64 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Content {
-    Text { text: String },
-    Thinking { thinking: String },
-    Image { data: String, mime_type: String },
+    Text {
+        text: String,
+    },
+    Thinking {
+        thinking: String,
+        /// Anthropic signature, required when replaying extended thinking.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    RedactedThinking {
+        data: String,
+    },
+    Image {
+        data: String,
+        mime_type: String,
+    },
     ToolCall(ToolCall),
 }
 
@@ -39,10 +52,16 @@ pub struct Usage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write: u64,
     pub total_tokens: u64,
     /// 推理 token（包含在 output 里）
     #[serde(default)]
     pub reasoning: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -704,6 +704,8 @@ pub struct Hub {
     cooldowns: Arc<Cooldowns>,
     default_provider: String,
     registry: ToolRegistry,
+    /// MCP 服务器（profile 的 `mcpServers`）；serve / run / rpc 启动时由 main 调用 `start`
+    pub(crate) mcp: Arc<crate::mcp::McpManager>,
     /// 会话 JSONL 根目录（每个 client 一个子目录）；None = 不持久化
     pub(crate) session_dir: Option<PathBuf>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
@@ -942,6 +944,7 @@ impl Hub {
         let keychain = timed_keychain(Arc::new(SystemKeychain), config.keychain_timeout_secs, agent_ai::keychain::WAIT_HINT_GRACE, issues.clone());
         let LoadedProviders { providers, unavailable } = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok(), &keychain, &ManagedStore::system())?;
         let registry = ToolRegistry::with_builtins();
+        let mcp = Arc::new(crate::mcp::McpManager::new(&config, issues.clone())?);
         let store = match store_mode {
             StoreMode::Memory => crate::store::Store::memory(),
             StoreMode::Persistent => crate::store::Store::open(&config.data_dir().join("state"), Duration::from_secs(config.task_ttl_secs))?,
@@ -986,6 +989,7 @@ impl Hub {
             cooldowns: Default::default(),
             default_provider: provider_name.into(),
             registry,
+            mcp,
             session_dir,
             sessions: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
@@ -1129,7 +1133,8 @@ impl Hub {
         let allowed = expand_tools(&p.tools)?;
         let selected = match req.tools {
             Some(t) => {
-                if let Some(bad) = t.iter().find(|n| !allowed.contains(n)) {
+                // `mcp__…` 名字（可带 `*`）选择 MCP 工具，由 McpManager::session_tools 校验
+                if let Some(bad) = t.iter().find(|n| !allowed.contains(n) && !crate::mcp::tool::is_mcp_name(n)) {
                     bail!("tool '{bad}' is not enabled in profile '{profile_name}'");
                 }
                 t
@@ -1147,7 +1152,8 @@ impl Hub {
 
         let (cwd, root) = resolve_cwd(p, req.cwd.as_deref())?;
         let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone(), shell_env: p.shell_env.clone() };
-        let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&selected, &ctx)?;
+        let (requested_mcp, builtin): (Vec<String>, Vec<String>) = selected.iter().cloned().partition(|n| crate::mcp::tool::is_mcp_name(n));
+        let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&builtin, &ctx)?;
         let caller_tools: Vec<String> = req.caller_tools.iter().map(|t| t.name.clone()).collect();
         for spec in req.caller_tools {
             if tools.iter().any(|t| t.name() == spec.name) {
@@ -1179,6 +1185,13 @@ impl Hub {
             None => self.profile_account(p, provider_id).to_string(),
         };
         let provider = self.session_provider(p, provider_id, &account)?;
+        // MCP 工具（会话创建时的快照）；只有 Anthropic 的工具结果支持图片
+        for tool in self.mcp.session_tools(&profile_name, &requested_mcp, provider_id == "anthropic")? {
+            if tools.iter().any(|t| t.name() == tool.name()) {
+                bail!("caller tool '{}' collides with an MCP tool", tool.name());
+            }
+            tools.push(tool);
+        }
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
         let deep_spec = self.deep_model_spec(p, provider_id);
         let depth = req.depth.unwrap_or(if p.auto_route { Depth::Auto } else { Depth::Standard });

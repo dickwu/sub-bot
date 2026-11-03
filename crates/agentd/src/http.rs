@@ -112,6 +112,7 @@ fn router(st: AppState) -> Router {
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
         .route("/v1/profiles", get(profiles))
+        .route("/v1/mcp", get(crate::mcp::http_status))
         .route("/v1/models", get(models))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st)
@@ -280,7 +281,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
                     "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
                         "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
-                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
             })
         })
         .collect();

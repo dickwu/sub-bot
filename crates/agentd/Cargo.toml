@@ -10,6 +10,13 @@ repository.workspace = true
 name = "sub-bot"
 path = "src/main.rs"
 
+# 测试辅助：手写 JSON-RPC 的假 MCP 服务器（stdio），只供 tests/mcp_cli.rs 通过 CARGO_BIN_EXE_sub-bot-fake-mcp 使用，不随发布包分发
+[[bin]]
+name = "sub-bot-fake-mcp"
+path = "tests/support/fake_mcp.rs"
+test = false
+doc = false
+
 [dependencies]
 agent-ai.workspace = true
 agent-core.workspace = true
@@ -19,6 +26,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tokio-stream.workspace = true
 futures.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 axum.workspace = true
@@ -38,6 +46,12 @@ httpdate = "1"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
+# MCP 客户端（官方 Rust SDK）。stdio 子进程由 mcp.rs 自己 spawn（进程组 + 退出状态），经 transport-async-rw 接入；
+# streamable HTTP 用 rmcp 的 reqwest 0.13 客户端，TLS 为 rustls + ring + webpki-roots（不引入 openssl / aws-lc）
+rmcp = { version = "3.8", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -45,3 +59,5 @@ libc = "0.2"
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
+# 进程内 streamable HTTP MCP 服务器（只用于测试 HTTP 传输）
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"] }

@@ -42,6 +42,20 @@
     "dedupWindowSecs": 60,
     "queueCapacity": 1000
   },
+  "mcpServers": {
+    "fs": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/var/lib/sub-bot/work"],
+      "tools": ["read_*", "list_*", "search_files", "get_file_info"]
+    },
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headersFromEnv": {"Authorization": "GITHUB_MCP_AUTHORIZATION"},
+      "startupTimeoutSecs": 30,
+      "callTimeoutSecs": 120,
+      "required": false
+    }
+  },
   "profiles": {
     "claude": {
       "provider": "anthropic",
@@ -74,6 +88,7 @@
       "allowSystemPromptOverride": true,
       "allowCallerTools": true,
       "api": "auto",
+      "mcpServers": ["fs", {"name": "github", "tools": ["get_*", "list_*", "search_*"]}],
       "shellEnv": {
         "mode": "inherit",
         "deny": [

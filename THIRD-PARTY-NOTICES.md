@@ -45,7 +45,7 @@ THE SOFTWARE.
 
 ## Other dependencies
 
-其余依赖（tokio、serde、reqwest、regex、以及上述 crate 的传递依赖如 `bstr`、`memchr`、`walkdir`、`same-file`、
+其余依赖（tokio、serde、reqwest、regex、MCP 官方 Rust SDK `rmcp`（Apache-2.0）、rustls / webpki-roots、以及上述 crate 的传递依赖如 `bstr`、`memchr`、`walkdir`、`same-file`、
 `encoding_rs` 等）均在各自的许可证下使用（以 MIT / Apache-2.0 为主，另有 Unlicense、BSD-3-Clause、ISC 等）；完整列表见 `Cargo.lock`，
 可用 `cargo tree` 或 [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) /
 [`cargo-deny`](https://github.com/EmbarkStudios/cargo-deny) 生成许可证清单。

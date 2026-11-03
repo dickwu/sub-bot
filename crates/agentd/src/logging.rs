@@ -14,7 +14,8 @@ pub fn default_log_dir() -> Option<PathBuf> {
 fn build_filter(rust_log: Option<&str>, level: &str) -> EnvFilter {
     let mut filter = rust_log.and_then(|value| EnvFilter::try_new(value).ok()).unwrap_or_else(|| EnvFilter::new(level));
     // 始终最后添加，覆盖用户的同名指令，避免请求头（包括 Authorization）进入日志。
-    for directive in ["hyper=warn", "hyper_util=warn", "reqwest=warn", "h2=warn", "rustls=warn", "tower=warn"] {
+    // rmcp（MCP SDK）的 debug 日志含完整 JSON-RPC 消息（工具参数 / 结果），同样压到 warn；MCP 的生命周期日志由 agentd::mcp 输出。
+    for directive in ["hyper=warn", "hyper_util=warn", "reqwest=warn", "h2=warn", "rustls=warn", "tower=warn", "rmcp=warn"] {
         filter = filter.add_directive(directive.parse().expect("valid suppression directive"));
     }
     filter

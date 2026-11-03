@@ -164,7 +164,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_context` 含压缩）、header `meta` 与 `session_info` 元数据、按 id 查找、崩溃修复；`agentd/src/sessions.rs`：`ContextHooks` 逐条写入、按需恢复、列表/purge | ✅ 读写与恢复；fork/分支切换在 M2 |
 | `core/compaction/*` | `agent-session/src/compaction.rs`（估计、切点、序列化与提示词，纯函数）+ `agentd/src/compaction.rs`（配置、摘要调用）；模型调用前经 `ContextHooks::before_call` 自动压缩，`POST /v1/sessions/{id}/compact` / RPC `compact` 手动压缩 | ✅ |
 | `core/skills.ts`、`extensions/`、`prompt-templates.ts` | `agent-resources` crate（只做 skills 和 prompt templates；扩展改成 MCP 或回调） | M4 |
-| `mcp/`（pi-mcp）、`core/mcp-servers.ts` | `agent-mcp` crate（可以基于 `rmcp`），MCP 工具注册进 `ToolRegistry` | M4 |
+| `mcp/`（pi-mcp）、`core/mcp-servers.ts` | 已实现：`agentd/src/mcp.rs`（基于官方 SDK `rmcp`；stdio / streamable HTTP），按 profile 的 `mcpServers` 把 `mcp__<server>__<tool>` 加进会话工具 | M4 |
 | `modes/rpc/*` | `agentd/src/rpc.rs`：stdio JSONL，命令和响应格式与 `rpc-types.ts` 一致 | ✅ 部分命令 |
 | `core/sdk.ts` / `AgentSession` | `agentd/src/hub.rs`：`Hub::create_session` 校验 profile、工具白名单和 cwd，并组装 Agent、工具、系统提示和存储 | ✅ |
 | （pi 没有）多 bot 的 HTTP 服务 | `agentd/src/http.rs`（axum + SSE）和 `config.rs`（profiles、clients、token 哈希） | ✅ |

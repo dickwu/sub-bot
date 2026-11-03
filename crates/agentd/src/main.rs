@@ -25,6 +25,7 @@ mod local;
 #[cfg(test)]
 mod local_tests;
 mod logging;
+mod mcp;
 mod probe;
 mod prompt;
 mod routing;
@@ -176,6 +177,24 @@ enum Cmd {
         #[command(subcommand)]
         command: keys::KeysCmd,
     },
+    /// MCP 服务器诊断
+    Mcp {
+        #[command(subcommand)]
+        command: McpCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCmd {
+    /// 按配置连接 MCP 服务器，打印服务器（传输、状态、server 名/版本、连接耗时、最近错误）与工具后退出；任一失败 ⇒ 非零退出码
+    List {
+        /// 只连接该 profile 引用的服务器（默认：配置里定义的全部服务器）
+        #[arg(long)]
+        profile: Option<String>,
+        /// 输出 JSON（含清洗后的 inputSchema）
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// 会话账号（run / rpc / ask / probe-efforts 各自的参数；不做成全局参数，避免与 `keys --account` 冲突，
@@ -227,6 +246,12 @@ fn startup_failure(error: Option<&anyhow::Error>) -> (String, issues::IssueEvent
         let message = keychain.to_string();
         event.message = message.clone();
         event = event.details(serde_json::json!({"reason": "keychain"}));
+        (message, event)
+    } else if let Some(mcp) = error.and_then(|e| e.downcast_ref::<mcp::McpStartupError>()) {
+        // 只含服务器名与失败原因（已脱敏；不含请求头 / 环境变量的值）
+        let message = mcp.to_string();
+        event.message = message.clone();
+        event = event.details(serde_json::json!({"reason": "mcp_server", "server": mcp.server}));
         (message, event)
     } else if let Some(key_config) = error.and_then(|e| e.downcast_ref::<hub::KeyConfigError>()) {
         // provider 未配置 / key 未找到 / 必需账号未声明：只含 provider、账号、环境变量名与配置路径，不含 key
@@ -345,6 +370,10 @@ async fn main() -> anyhow::Result<()> {
     if let Cmd::ProbeEfforts(ref args) = cli.cmd {
         return probe::run(&cli, &loaded, args).await;
     }
+    if let Cmd::Mcp { command: McpCmd::List { ref profile, json } } = cli.cmd {
+        // 诊断命令：不构造 Hub、不加载 provider key、不发告警
+        return mcp::list_cli(&loaded, profile.as_deref(), json).await;
+    }
     install_reporter(&loaded, &cli);
     // 会话持久化（serve / run / rpc）：--no-persist-sessions > --session-dir > 配置 persistSessions/sessionDir > <dataDir>/sessions
     let session_dir = match cli.cmd {
@@ -385,7 +414,15 @@ async fn main() -> anyhow::Result<()> {
                 cfg.default_api = api;
             }
         }
-        match new_hub(cfg) {
+        // serve / run / rpc：启动时并行连接 MCP 服务器（required 失败 ⇒ 启动失败）
+        let started = match new_hub(cfg) {
+            Ok(hub) if matches!(cli.cmd, Cmd::Serve { .. } | Cmd::Run { .. } | Cmd::Rpc { .. }) => match hub.mcp.start().await {
+                Ok(()) => Ok(hub),
+                Err(e) => Err(anyhow::Error::new(e)),
+            },
+            other => other,
+        };
+        match started {
             Ok(hub) => Some(hub),
             Err(error) => {
                 let (message, event) = startup_failure(Some(&error));
@@ -426,7 +463,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -437,7 +474,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Rpc { ref profile, depth, ref account, ref resume } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            rpc::run(hub, session_req(profile.clone(), depth, account), resume.clone()).await?;
+            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account), resume.clone()).await;
+            hub.mcp.shutdown().await;
+            result?;
         }
         Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
@@ -502,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
                     _ => {}
                 }
             }
+            hub.mcp.shutdown().await;
             let last = last.ok_or_else(|| anyhow::anyhow!("no assistant reply"))?;
             if json {
                 // reasoningEffort / api 是实际发送给模型的值（运行时降级后），requestedReasoningEffort 是请求值
@@ -861,6 +901,17 @@ mod tests {
         }
         let long = Cli::command().render_long_help().to_string();
         assert!(long.contains("apiKeyKeychain") && long.contains("受管存储"), "{long}");
+    }
+
+    #[test]
+    fn startup_failure_exposes_typed_mcp_error_and_mcp_cli_parses() {
+        let error = anyhow::Error::new(mcp::McpStartupError { server: "github".into(), reason: "timed out after 30s (startupTimeoutSecs)".into() }).context("sensitive context");
+        let (message, event) = startup_failure(Some(&error));
+        assert_eq!(message, "required MCP server 'github' failed to start: timed out after 30s (startupTimeoutSecs)");
+        assert_eq!((event.message.as_str(), event.kind.as_str()), (message.as_str(), "startup_failed"));
+        assert_eq!(event.details, serde_json::json!({"reason": "mcp_server", "server": "github"}));
+        let Cmd::Mcp { command: McpCmd::List { profile, json } } = Cli::try_parse_from(["sub-bot", "mcp", "list", "--profile", "coder", "--json"]).unwrap().cmd else { panic!("mcp list") };
+        assert_eq!((profile.as_deref(), json), (Some("coder"), true));
     }
 
     #[test]

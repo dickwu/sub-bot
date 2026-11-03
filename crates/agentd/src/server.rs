@@ -55,6 +55,7 @@ pub async fn serve(hub: Arc<Hub>, bind: Option<SocketAddr>) -> anyhow::Result<()
     shutdown.cancel();
     // abort_all bounds session settlement, reporter flush and store flush by shutdownGraceSecs.
     hub.abort_all().await;
+    hub.mcp.shutdown().await;
     // Idle SSE subscribers must not hold shutdown (and socket cleanup) forever.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         while let Some(result) = servers.join_next().await {

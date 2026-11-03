@@ -5,6 +5,7 @@
 - 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
 - OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
+- 可选的 MCP 客户端：profile 通过 `mcpServers` 挂载 stdio / streamable HTTP MCP 服务器，工具以 `mcp__<server>__<tool>` 提供给模型，崩溃自动重启，见「MCP 服务器」
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
@@ -383,6 +384,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "keychainTimeoutSecs": 30,                  // 每次 macOS Keychain 读取的等待上限（>= 1），见「Keychain 读取超时」
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
   "toolApproval": "never",                    // 可选：未设置 toolApproval 的 profile 使用的工具审批策略，默认 never，见「工具调用审批」
+  "mcpServers": {                             // 可选：MCP 服务器定义（stdio command 或 HTTP url），profile 通过 mcpServers 引用，见「MCP 服务器」
+    "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/code"]}
+  },
   "profiles": {
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
@@ -400,6 +404,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
       "toolApproval": "never",                 // 可选：never（默认）| always | {default, tools, bash, timeoutSecs, onTimeout}，见「工具调用审批」
+      "mcpServers": ["fs"],                    // 可选：MCP 服务器（全局名字 / {name, tools} 收窄 / 内联定义）；不填 = 没有 MCP 工具
       "maxTurns": 50,
       "contextWindow": null,                   // 可选：覆盖模型上下文窗口（token，>= 1000），用于自动压缩阈值
       "compaction": {"thresholdPct": 70},      // 可选：覆盖全局 compaction 的部分字段
@@ -569,7 +574,8 @@ sub-bot ask --effort high "解释这个仓库"
 | 方法和路径 | 说明 |
 |---|---|
 | `GET /v1/health` | 健康检查（无需鉴权） |
-| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`） |
+| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`；`tools` 含当前可用的 MCP 工具名，另有 `mcpServers`） |
+| `GET /v1/mcp` | 当前 bot 的 profile 引用的 MCP 服务器：`{servers: [{name, transport, status, required, serverName, serverVersion, connectMs, connectedAt, restarts, lastError, toolCount, tools: [{name, mcpName, description}]}], profiles: {<profile>: [server…]}}`，见「MCP 服务器」 |
 | `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
 | `GET /v1/sessions?limit=` | 列出自己的会话（内存 + 已持久化，按 ID 去重，按 `updatedAt` 倒序，`limit` 默认 50、最大 1000）：`{sessions: [{sessionId, profile, provider, account, model, cwd, createdAt, updatedAt, messageCount, inMemory, running, persisted, ephemeral, title}]}`，时间为 Unix 毫秒 |
 | `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?, toolApproval?}`（未知字段返回 400；`toolApproval` 只能收紧 profile 策略，会随会话持久化，恢复后仍生效），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, pendingApprovals, persisted, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
@@ -1072,7 +1078,7 @@ profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相�
 
 - **形状**：`"never"`（默认，不审批）| `"always"`（每次工具调用都要审批，超时 300 秒、超时拒绝）| 对象 `{default, tools, bash, timeoutSecs, onTimeout}`。顶层 `toolApproval` 是全局默认，profile 自己的 `toolApproval` 优先（不合并）。
   - `default`：`allow`（默认）| `ask` | `deny`，没有规则命中时使用。
-  - `tools`：工具名或 glob（`*` 匹配任意字符）→ `allow|ask|deny`。精确名优先，其次是字面字符最多（最具体）的 glob，同样具体时取最严格的动作。以后的 MCP 工具名为 `mcp__<server>__<tool>`，可以写 `mcp__*`、`mcp__github__*`。
+  - `tools`：工具名或 glob（`*` 匹配任意字符）→ `allow|ask|deny`。精确名优先，其次是字面字符最多（最具体）的 glob，同样具体时取最严格的动作。MCP 工具名为 `mcp__<server>__<tool>`，可以写 `mcp__*`、`mcp__github__*`（见「MCP 服务器」）。
   - `bash`：`{allow, ask, deny}` 命令模式，对 bash 的 `command`（trim 并把连续空白折叠成一个空格后）做 glob 匹配，`*` 匹配任意字符（含空格和 `/`），没有 `*` 时要求完全相等。判定顺序 **deny > ask > allow**：任一片段（或整条命令）命中 deny ⇒ deny；否则命中 ask ⇒ ask；否则**每个片段**都命中 allow ⇒ allow；都不满足 ⇒ 回落到 `tools.bash` / `default`（所以 `"tools": {"bash": "deny"}` + `bash.allow` = “只允许这几条命令”）。
   - 片段按 shell 控制符切分：`;` `&&` `||` `|` `&` 换行，以及 `` ` `` `$(` `(` `)`（`2>&1`、`>&2`、`&>` 是重定向，不切）。不解析引号，所以 `git commit -m "a; b"` 会被切开、不会命中 allow（宁可多问）。含命令替换（`` ` `` / `$(` / `<(` / `>(`）的命令**永远不会命中 allow**，但 deny/ask 会检查替换里的片段（`echo $(rm -rf ~)` 命中 `rm -rf *`）。重定向是片段的一部分：`echo *` 也会放行 `echo x > file`，请写更窄的模式。
   - `timeoutSecs`：等待调用方决定的秒数，默认 300，范围 1..=86400；`onTimeout`：`deny`（默认）| `allow`。
@@ -1126,6 +1132,114 @@ profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相�
 - INFO：`approval required`（tool、tool_call_id、reason、timeout_secs）、`approval resolved`（decision、by、approved、wait_ms）、`tool call denied by policy`、HTTP/RPC 的 `approval decision accepted`；DEBUG：`tool call allowed by policy`（reason）与 `approval args`（参数 JSON，截断到 500 字符）。参数原文只在 DEBUG 级别出现。
 - WARN：`approval timed out`，并上报一条 warn issue `approval_timeout`（component `tool`、`tool` 字段、details `{toolCallId, approved}`），沿用 issue 的去重窗口，不会刷屏；不会再生成重复的 `log_warn`。拒绝不算工具失败，不产生 `tool_error`。
 
+## MCP 服务器
+
+sub-bot 可以作为 **MCP（Model Context Protocol）客户端**（基于官方 Rust SDK [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk)）连接外部 MCP 服务器，把它们的工具按 profile 提供给模型。支持 stdio（子进程）和 streamable HTTP 两种传输；目前只接入 **tools**（不含 resources / prompts / sampling / elicitation / OAuth 登录）。profile 没有 `mcpServers` 时不会有任何 MCP 工具，也不会启动任何 MCP 服务器（向后兼容）。
+
+### 配置
+
+全局 `mcpServers` 是“名字 → 服务器定义”的表；profile 的 `mcpServers` 列出它要用的服务器：
+
+```json
+{
+  "mcpServers": {
+    "fs": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/home/me/code"]},
+    "github": {
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headersFromEnv": {"Authorization": "GITHUB_MCP_AUTHORIZATION"},
+      "tools": ["get_*", "list_*", "search_*"],
+      "callTimeoutSecs": 60
+    },
+    "internal": {"url": "https://mcp.internal.example/mcp", "headers": {"X-Api-Key": "${INTERNAL_MCP_KEY}"}, "required": true}
+  },
+  "profiles": {
+    "coder": {
+      "workspaceRoots": ["/home/me/code"],
+      "mcpServers": [
+        "fs",
+        "internal",
+        {"name": "github", "tools": ["get_issue", "search_code"]},
+        {"name": "local", "command": "/opt/mcp/my-server", "args": ["--stdio"], "env": {"API_TOKEN": "${MY_TOKEN}"}, "cwd": "mcp-data", "startupTimeoutSecs": 10}
+      ],
+      "toolApproval": {"tools": {"mcp__*": "ask", "mcp__fs__*": "allow", "mcp__github__get_*": "allow"}}
+    },
+    "reviewer": {"workspaceRoots": ["/home/me/code"], "tools": ["preset:readonly"]}
+  },
+  "clients": [{"name": "dev-bot", "tokenSha256": "<sha256>", "profiles": ["coder", "reviewer"]}]
+}
+```
+
+服务器定义（`command` 与 `url` 二选一）：
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `command` / `args` | – | stdio：可执行文件（按 `PATH` 查找）与参数，如 `npx -y @modelcontextprotocol/server-filesystem /path` |
+| `env` | `{}` | stdio：额外环境变量，值可写 `${VAR}` 引用 sub-bot 自己的环境变量。子进程继承 sub-bot 的环境，但与 `bash` 默认策略一样**剔除内置密钥变量**（各 provider 的 key、`*_FILE`、`SUB_BOT_TOKEN` 等） |
+| `cwd` | sub-bot 的 cwd | stdio：工作目录；相对路径相对配置文件目录 |
+| `url` | – | streamable HTTP 端点（http/https；不能带 `user:password@`） |
+| `headers` | `{}` | HTTP 请求头；值可写 `${VAR}`，如 `"Authorization": "Bearer ${GITHUB_TOKEN}"` |
+| `headersFromEnv` | `{}` | 请求头名 → 环境变量名，整个值取自该变量（密钥不必写进配置文件）。`Accept`、`Content-Type`、`Mcp-Session-Id`、`Mcp-Protocol-Version`、`Last-Event-Id` 由传输层管理，不能配置 |
+| `enabled` | `true` | `false` ⇒ 不启动、不提供工具 |
+| `startupTimeoutSecs` | `30` | 连接超时（spawn / HTTP 握手 + `initialize` + `tools/list` 全部分页），1..=600 |
+| `callTimeoutSecs` | `120` | 单次 `tools/call` 超时，1..=3600 |
+| `tools` | 全部 | 工具 allow-list：服务器上的原始工具名，支持 `*` 通配 |
+| `required` | `false` | `true` ⇒ 启动时连不上则 `serve` / `run` / `rpc` 直接失败；`false` ⇒ 告警并继续（没有它的工具） |
+
+profile `mcpServers` 的每一项：
+- `"name"`：引用全局定义；
+- `{"name": "x", "tools": [...]}`（没有 `command` / `url`）：引用全局定义，并在服务器 allow-list 之上**再收窄**工具（引用只能设置 `tools`）；
+- `{"name": "x", "command": ... | "url": ..., ...}`：内联定义，字段同上。内联名字必须全局唯一（不能与全局定义或其它 profile 的内联定义重名；需要共享时放到全局 `mcpServers`）。
+
+校验（配置加载时）：服务器名必须匹配 `[A-Za-z0-9_-]{1,32}` 且不含 `__`；未知引用、重复、内联撞名、`command`/`url` 同时设置或都没有、URL 非 http/https 或带凭据、非法请求头名、`${...}` 语法错误、超时越界都会报错，例如 `profile 'coder': mcpServers: unknown server 'gh' (define it in the global mcpServers)`、`mcpServers.github: set only one of command (stdio) / url (streamable HTTP)`。`${VAR}` / `headersFromEnv` 引用的环境变量**在连接时**解析：缺失只让该服务器连接失败（`environment variable GITHUB_MCP_AUTHORIZATION (headersFromEnv.Authorization) is not set`）。
+
+只有被某个 profile 引用的服务器才会在 `serve` / `run` / `rpc` 启动时连接；同一服务器被多个 profile 引用时共享一个连接（一个子进程）。
+
+### 工具命名、schema 与结果
+
+- 模型看到的工具名是 `mcp__<server>__<tool>`。provider 要求 `^[a-zA-Z0-9_-]{1,64}$`：原名里的其它字符替换为 `_`（`files.read` ⇒ `mcp__fs__files_read`）；超过 64 字符时截断并加 `_` + 8 位十六进制哈希（原名的 SHA-256，稳定）；清洗后撞名的工具同样加哈希后缀。sub-bot 保存映射，调用时用原名。`GET /v1/mcp` / `mcp list` 里 `name` 是暴露名，`mcpName` 是原名。
+- 描述用服务器提供的 `description`（没有时用 `title`，再没有就生成 `MCP tool '<tool>' from server '<server>'`）。`inputSchema` 会清洗成 OpenAI 与 Anthropic 都接受的形状：顶层强制 `type: "object"` 并补 `properties`，去掉顶层 `$schema` 以及两家都拒绝的顶层 `oneOf` / `anyOf` / `allOf` / `not` / `enum` / `const`，`required` 只保留字符串；顶层不是对象的 schema 换成宽松的空对象 schema。嵌套部分原样保留。
+- 结果映射：`text` ⇒ 文本；`image` ⇒ Anthropic 会话原样作为图片交给模型，其它 provider（工具结果只支持文本）换成占位文本 `[image: image/png, N bytes]`；`audio` ⇒ `[audio: mime, N bytes]`；嵌入 `resource` ⇒ `[resource: uri]` + 文本内容（二进制只给占位）；`resource_link` ⇒ `[resource link: name <uri>]`；没有 content 时用 `structuredContent` 的 JSON。文本合计最多 50,000 字节（超出附截断提示）。结果 `details` 为 `{mcp: {server, tool}, structuredContent?, truncated?}`。
+- `isError: true` ⇒ 工具错误结果（`tool_execution_end.isError: true`），模型继续；JSON-RPC 错误 ⇒ `MCP server '<server>' rejected tool '<tool>': <message> (code N)`。
+- 超时 ⇒ `MCP tool '<tool>' on server '<server>' timed out after Ns (callTimeoutSecs)`；会话 abort ⇒ `aborted`。两种情况都会向服务器发送 `notifications/cancelled`。
+- 调用方创建会话时的 `tools` 只限制内置工具；若其中写了 `mcp__…` 名字（支持 `*`，如 `["read", "mcp__github__get_*"]`），MCP 工具也只保留匹配的，不属于 profile 服务器的名字 ⇒ 400 `tool '…' is not enabled in profile '…'`。调用方回调工具与 MCP 工具重名 ⇒ 400。
+- 会话的 MCP 工具在**创建会话时**快照（只包含当时已连接服务器的工具）；会话恢复时重新按当前状态构建。
+
+### 生命周期、崩溃与重启
+
+- **启动**：`serve` / `run` / `rpc` 启动时并行连接所有被引用的服务器，每个最多 `startupTimeoutSecs`。每个服务器记一条 INFO：传输、连接耗时、`initialize` 返回的服务器名/版本、工具数。stdio 子进程在独立进程组里运行，stderr 逐行以 DEBUG 写入日志（保留最后 20 行，最后 5 行附在错误 / issue 里）。
+- **启动失败**：`required: true` ⇒ 启动失败，退出信息为 `required MCP server '<name>' failed to start: <原因>`（`startup_failed` fatal issue，details `{reason: "mcp_server", server}`）；否则 WARN + `mcp_server_failed` issue，继续运行，之后新建会话时若退避时间已过会在后台重试连接。
+- **崩溃 / 断线**：stdio 进程退出或 HTTP 连接失败时，进行中的调用返回明确错误，例如 `MCP server 'fs' exited (exit status: 1); restarting`（附 stderr 最后几行）或 `MCP server 'github' connection failed (...); restarting`，并记 WARN + `mcp_server_crashed` issue（空闲时进程退出也会立即上报）。**下一次使用**该服务器的工具时自动重启，退避 1 秒、2 秒、5 秒（之后保持 5 秒），每 5 分钟最多重启 5 次；超过上限 ⇒ `MCP server '<name>' is unavailable: restart limit reached (5 attempts in 5 min); last error: …`，窗口过去后可再次重启。重启失败同样记 `mcp_server_failed`（`phase: "restart"`）。
+- **`notifications/tools/list_changed`**：重新拉取工具列表（INFO `MCP tool list changed; refreshed`）；已存在的会话保持创建时的工具快照，之后新建的会话使用新列表。
+- **退出**：`serve` 关闭、`run` / `rpc` 结束时关闭连接，向 stdio 子进程的进程组发送 SIGTERM，2 秒后 SIGKILL。
+- HTTP 传输：TLS 为 rustls + ring + webpki-roots（不依赖 OpenSSL），不跟随重定向（避免请求头被带到别的主机），连接超时 30 秒。
+
+### 审批
+
+MCP 工具与内置工具一样走 `toolApproval`：`tools` 里可以写 `mcp__*`、`mcp__github__*` 或具体的暴露名（精确名优先于 glob）。默认策略不变：`"never"`（或没有命中规则且 `default: allow`）⇒ 直接执行。例如 `{"tools": {"mcp__*": "ask", "mcp__github__get_*": "allow", "mcp__github__delete_*": "deny"}}`。
+
+### 可见性与诊断
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7878/v1/mcp
+# {"servers":[{"name":"github","transport":"http","status":"ready","required":false,"serverName":"github-mcp-server","serverVersion":"1.2.0",
+#   "connectMs":412,"connectedAt":1767225600000,"restarts":0,"lastError":null,"toolCount":2,
+#   "tools":[{"name":"mcp__github__get_issue","mcpName":"get_issue","description":"…"}, …]}],
+#  "profiles":{"coder":["fs","internal","github","local"]}}
+
+sub-bot --config sub-bot.json mcp list                    # 连接配置里的全部服务器，打印状态与工具后退出
+sub-bot --config sub-bot.json mcp list --profile coder --json   # 只连 coder 引用的服务器；JSON 含清洗后的 inputSchema
+```
+
+- `GET /v1/mcp`：调用方可用的 profile 引用的服务器（不含命令行、URL、请求头或环境变量）。`status`：`idle | connecting | ready | failed | crashed | disabled`；`lastError` 已脱敏。
+- `GET /v1/profiles`：每个 profile 的 `tools` 追加当前可用的 MCP 工具名，另有 `mcpServers`；`GET /v1/sessions/{id}` 的 `tools` 包含会话的 MCP 工具。
+- `sub-bot mcp list [--profile p] [--json]`：不加载 provider key、不发告警；任一服务器连接失败 ⇒ 非零退出码。
+
+### 日志与问题上报
+
+- INFO：`starting MCP servers`、`MCP server connected`（server、transport、connect_ms、server_name、server_version、tools、pid）、`restarting MCP server`、`MCP tool list changed; refreshed`；DEBUG：`MCP server stderr`（每行）、`MCP tool call finished`（elapsed_ms、is_error）、工具名映射、allow-list 过滤；WARN：`MCP server startup failed; continuing without its tools` / `MCP server restart failed; …`、`MCP server crashed; will restart on next use`、`MCP tool call timed out`。
+- issue（component `mcp`，warn）：`mcp_server_failed`（details `{server, transport, phase: "startup"|"restart", required}`）、`mcp_server_crashed`（details `{server, transport, reason, stderr}`）；这些 WARN 不会再重复生成 `log_warn`。
+- 请求头与 `env` 的值从不写入日志、状态或 issue（展开后的值登记到 issue 脱敏列表）；rmcp 自身的日志（含完整 JSON-RPC 消息、工具参数）被压到 warn，与 hyper / reqwest 一样不受 `RUST_LOG` 影响。
+
 ## 工具资源上限
 
 - `bash`：通过 `sh -c` 运行，独立进程组；取消、超时或清理时杀掉整个进程组（含子孙进程）。`timeoutSecs` 默认 120 秒，最多 1800 秒，等待输出管道 EOF 也计入超时。stdout/stderr 各捕获 256 KiB（合计 512 KiB），继续排空超出的输出并报告丢弃字节数；返回文本最多 50,000 字节（另加状态/截断提示）。
@@ -1134,11 +1248,13 @@ profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相�
 - `grep`：每行最多 500 字符，`limit` 默认 100 / 最多 1000 条匹配行，`context` 最多 20，返回文本最多 50,000 字节；`find`：`limit` 默认 200 / 最多 5000 条路径，返回文本最多 50,000 字节。均附截断提示，支持取消。
 - `http_fetch`：响应体最多读取 2 MiB，返回文本最多 50,000 字节，超出附截断提示；连接超时 15 秒，总超时 60 秒（含响应体读取），支持取消。
 - 调用方 `callback`：响应体最多 1 MiB，超出报错；总超时 120 秒（含响应体读取），支持取消。
+- MCP 工具：结果文本合计最多 50,000 字节，超出附截断提示；单次调用超时 `callTimeoutSecs`（默认 120 秒），支持取消（发送 `notifications/cancelled`）。
 
 ## 安全提示
 
 - 默认只监听 `127.0.0.1`。如果要跨机器访问，请放在带 TLS 的反向代理后面。
 - 受管 key 目录（Linux `~/.config/sub-bot/keys`）必须是当前用户所有、权限 0700 的真实目录，key 文件为 0600；`sub-bot keys set` 遇到不满足的已有目录会拒绝写入而不是修改权限。
+- MCP stdio 服务器以 sub-bot 的用户权限运行，不受 `workspaceRoots` 限制；只配置可信的服务器，用 `tools` allow-list 与 `toolApproval`（如 `"mcp__*": "ask"`）把关。
 - `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。需要人工把关时用 `toolApproval`（如 `"tools": {"bash": "ask"}` 加 `bash.allow` 白名单）；它是防误操作的护栏，不是沙箱。
 
 ## 许可证 / License

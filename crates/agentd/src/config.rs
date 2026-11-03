@@ -91,6 +91,9 @@ pub struct Profile {
     /// 覆盖全局 `compaction`（逐字段）
     #[serde(default)]
     pub compaction: Option<crate::compaction::CompactionConfig>,
+    /// 该 profile 可用的 MCP 服务器：全局 `mcpServers` 的名字、`{name, tools}`（引用并收窄工具）或内联定义；不填 = 没有 MCP 工具
+    #[serde(default)]
+    pub mcp_servers: Vec<crate::mcp::ProfileMcpServer>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -318,6 +321,9 @@ pub struct Config {
     /// 上下文压缩默认设置（profile 的 `compaction` 逐字段覆盖）
     #[serde(default)]
     pub compaction: crate::compaction::CompactionConfig,
+    /// MCP 服务器定义（名字 → stdio `command` / HTTP `url`）；profile 通过 `mcpServers` 引用，见 mcp/config.rs
+    #[serde(default)]
+    pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -626,6 +632,7 @@ impl Config {
             }
         }
         cfg.alerts.resolve(path.parent())?;
+        crate::mcp::config::resolve_paths(&mut cfg.mcp_servers, &mut cfg.profiles, path.parent().unwrap_or_else(|| Path::new(".")));
         cfg.validate()?;
         Ok(cfg)
     }
@@ -690,6 +697,7 @@ impl Config {
                 }
             }
         }
+        crate::mcp::config::plan(&self.mcp_servers, &self.profiles)?;
         validate_targets(&self.alerts.webhook_url)?;
         for client in &self.clients {
             validate_targets(&client.webhook_url)?;
@@ -848,6 +856,7 @@ impl Config {
                 tool_approval: None,
                 context_window: None,
                 compaction: None,
+                mcp_servers: vec![],
             },
         );
         Config {
@@ -886,6 +895,7 @@ impl Config {
             session_dir: None,
             persist_sessions: None,
             compaction: Default::default(),
+            mcp_servers: BTreeMap::new(),
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],
         }

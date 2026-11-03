@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.2] - 2026-11-03
+
+### Fixed
+- **One HTTP request reported as two issues**: an unauthenticated request (401) wrote the same issue id twice to `issues.log` — first `count: 1`, a few ms later `count: 2` — and a dedup summary was delivered at the end of the window. The `auth` middleware's WARN `unauthorized request …` and the per-request access log WARN `request finished status=401` both became `log_warn` issues from `sub_bot::http` with the same dedup key, so the access log was counted as a repeat of the auth failure (any other 4xx in the same window was folded in too). The access log no longer acts as an issue source on its own: 4xx `request finished` lines are marked `issue = "none"` (client errors; the caller already gets the reason, and the cases that matter — 401, 409 session rehydration failure, 429 `session_limit` — have their own issue), and 5xx lines are marked `issue = "fallback"`: they are reported only when nothing more specific was reported for that request (e.g. `session rehydration failed`, `session purge failed`, `list models failed`, a typed `run_timeout` on 504). One 401 now yields exactly one issue with `count: 1` and no summary.
+- **MCP tool call timeout reported twice**: the `MCP tool call timed out` WARN became a `log_warn` issue in addition to the session's `tool_timeout` issue for the same failure; it is now a typed (diagnostic-only) log line.
+- **Issue redaction masked plain words**: the `Bearer <value>` pattern matched ordinary text, turning `unauthorized request (missing or unknown bearer token)` into `… missing or unknown [redacted]`. `Bearer` values are now masked only when they look like a credential (>= 8 chars containing a digit or symbol such as `-._~+/=`, or >= 20 chars), so phrases like `bearer token`, `api key`, `token expired`, `Authorization header missing` stay readable. Still masked: `Authorization: Bearer …` (also `Basic` / `Token` schemes), `Bearer sk-…`, JWTs, `sk-…`, GitHub tokens (`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_`; arbitrary `gh*_` identifiers no longer), `api_key|api key|token|secret|password|authorization = <value>` assignments including JSON (`"api_key":"…"`), and configured secret values.
+
+### Docs
+- README (Keychain / LaunchAgent): what to do after `brew upgrade` (re-authorize with `keys check` in a GUI terminal, then `launchctl kickstart -k`), why skipping it leaves the service in a restart loop, and a sample `com.dickwu.sub-bot` LaunchAgent plist.
+
 ## [0.10.1] - 2026-11-03
 
 ### Fixed

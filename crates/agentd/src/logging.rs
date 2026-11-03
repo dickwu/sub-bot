@@ -4,7 +4,13 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use tracing_appender::{non_blocking::WorkerGuard, rolling};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
+use tracing_subscriber::{
+    fmt,
+    layer::SubscriberExt,
+    registry::{LookupSpan, SpanRef},
+    util::SubscriberInitExt,
+    EnvFilter, Layer,
+};
 
 pub fn default_log_dir() -> Option<PathBuf> {
     // Linux: ~/.local/share/sub-bot/logs；macOS: ~/Library/Application Support/sub-bot/logs
@@ -51,14 +57,12 @@ pub fn init(level: &str, dir: Option<&Path>, format: &str) -> Result<Option<Work
 
 /// WARN/ERROR from our crates only; webhook/reporter diagnostics must never loop.
 struct IssuesLayer;
-impl<S: tracing::Subscriber> Layer<S> for IssuesLayer {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for IssuesLayer {
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
         let Some(reporter) = crate::issues::global() else {
             return;
         };
-        if let Some(issue) = issue_from_event(event) {
-            reporter.report(issue);
-        }
+        report_event(&reporter, event, &ctx);
     }
 }
 
@@ -66,35 +70,86 @@ impl<S: tracing::Subscriber> Layer<S> for IssuesLayer {
 #[cfg(test)]
 pub(crate) struct IssuesTo(pub std::sync::Arc<crate::issues::Reporter>);
 #[cfg(test)]
-impl<S: tracing::Subscriber> Layer<S> for IssuesTo {
-    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
-        if let Some(issue) = issue_from_event(event) {
-            self.0.report(issue);
+impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for IssuesTo {
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        report_event(&self.0, event, &ctx);
+    }
+}
+
+/// 日志事件可以用 `issue` 字段声明它和问题上报的关系：
+/// - `issue = "typed"`：同一事件已经由结构化来源（`Reporter::report`）上报，日志只做诊断；
+/// - `issue = "none"`：纯诊断/访问日志，永远不成为 issue（例如 4xx 的 `request finished`）；
+/// - `issue = "fallback"`：只有在所属 HTTP 请求里还没有更具体的 issue 时才上报（5xx 的 `request finished`）。
+///
+/// 其它值按普通字段处理。
+#[derive(Debug)]
+enum LogIssue {
+    Ignore,
+    Typed,
+    Report(crate::issues::IssueEvent),
+    Fallback(crate::issues::IssueEvent),
+}
+
+/// 标记：所属 HTTP 请求 span 里已经上报过 issue（日志派生或 typed）。
+struct RequestIssueReported;
+
+/// 事件所在的 HTTP 请求 span（http.rs `trace_request` 创建，名为 `http`）。
+fn request_span<'a, S: tracing::Subscriber + for<'l> LookupSpan<'l>>(event: &tracing::Event<'_>, ctx: &'a tracing_subscriber::layer::Context<'_, S>) -> Option<SpanRef<'a, S>> {
+    ctx.event_scope(event)?.find(|span| span.name() == "http" && span.metadata().target().ends_with("::http"))
+}
+
+fn report_event<S: tracing::Subscriber + for<'a> LookupSpan<'a>>(reporter: &crate::issues::Reporter, event: &tracing::Event<'_>, ctx: &tracing_subscriber::layer::Context<'_, S>) {
+    let mark = || {
+        if let Some(span) = request_span(event, ctx) {
+            span.extensions_mut().replace(RequestIssueReported);
+        }
+    };
+    match classify_event(event) {
+        LogIssue::Ignore => {}
+        LogIssue::Typed => mark(),
+        LogIssue::Report(issue) => {
+            mark();
+            reporter.report(issue);
+        }
+        LogIssue::Fallback(issue) => {
+            // 同一请求已经有更具体的 issue（例如 "session rehydration failed"）时，通用的访问日志不再重复上报。
+            if !request_span(event, ctx).is_some_and(|span| span.extensions().get::<RequestIssueReported>().is_some()) {
+                reporter.report(issue);
+            }
         }
     }
 }
 
-fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEvent> {
+fn classify_event(event: &tracing::Event<'_>) -> LogIssue {
     let meta = event.metadata();
     let target = meta.target();
     if !matches!(*meta.level(), tracing::Level::WARN | tracing::Level::ERROR)
         || !(target.starts_with("agent_") || target.starts_with("agentd") || target.starts_with("sub_bot"))
         || ["agentd::issues", "agentd::webhook", "sub_bot::issues", "sub_bot::webhook"].iter().any(|p| target.starts_with(p))
     {
-        return None;
+        return LogIssue::Ignore;
+    }
+    #[derive(Default, PartialEq)]
+    enum Marker {
+        #[default]
+        Report,
+        Typed,
+        None,
+        Fallback,
     }
     #[derive(Default)]
     struct Fields {
         message: String,
         fields: Vec<String>,
-        typed: bool,
+        marker: Marker,
     }
     impl tracing::field::Visit for Fields {
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            if field.name() == "issue" && value == "typed" {
-                self.typed = true;
-            } else {
-                self.record_debug(field, &value);
+            match (field.name(), value) {
+                ("issue", "typed") => self.marker = Marker::Typed,
+                ("issue", "none") => self.marker = Marker::None,
+                ("issue", "fallback") => self.marker = Marker::Fallback,
+                _ => self.record_debug(field, &value),
             }
         }
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
@@ -107,16 +162,23 @@ fn issue_from_event(event: &tracing::Event<'_>) -> Option<crate::issues::IssueEv
     }
     let mut fields = Fields::default();
     event.record(&mut fields);
-    // Keep the diagnostic log, but let the structured source report the issue once.
-    if fields.typed {
-        return None;
+    match fields.marker {
+        // Keep the diagnostic log, but let the structured source report the issue once.
+        Marker::Typed => return LogIssue::Typed,
+        Marker::None => return LogIssue::Ignore,
+        Marker::Report | Marker::Fallback => {}
     }
     if !fields.fields.is_empty() {
         fields.message.push(' ');
         fields.message.push_str(&fields.fields.join(" "));
     }
     let (severity, kind) = if *meta.level() == tracing::Level::ERROR { (crate::issues::Severity::Error, "log_error") } else { (crate::issues::Severity::Warn, "log_warn") };
-    Some(crate::issues::IssueEvent::new(severity, kind, target, fields.message))
+    let issue = crate::issues::IssueEvent::new(severity, kind, target, fields.message);
+    if fields.marker == Marker::Fallback {
+        LogIssue::Fallback(issue)
+    } else {
+        LogIssue::Report(issue)
+    }
 }
 
 /// 与 DefaultFields 输出相同，但类型不同，使每个 fmt 层拥有各自的 span 字段缓存。
@@ -141,7 +203,7 @@ mod tests {
         struct Capture(Arc<Mutex<Vec<crate::issues::IssueEvent>>>);
         impl<S: tracing::Subscriber> Layer<S> for Capture {
             fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-                if let Some(issue) = super::issue_from_event(event) {
+                if let super::LogIssue::Report(issue) = super::classify_event(event) {
                     self.0.lock().unwrap().push(issue);
                 }
             }
@@ -153,6 +215,8 @@ mod tests {
             tracing::warn!(target: "agent_core::run", issue = "typed", "typed warning");
             tracing::error!(target: "agent_ai::openai", issue = "typed", "typed error");
             tracing::warn!(target: "agentd::hub", issue = "typed", "typed assistant failure");
+            tracing::warn!(target: "agentd::http", issue = "none", status = 404, "access log");
+            tracing::error!(target: "agentd::http", issue = "fallback", status = 500, "fallback is decided per request span");
             tracing::warn!(target: "agentd::issues", "ignored");
             tracing::error!(target: "agentd::webhook", "ignored");
             tracing::warn!(target: "sub_bot::webhook", "ignored");
@@ -168,6 +232,38 @@ mod tests {
         assert!(issues[0].message.contains("attempts=3"));
         assert!(!issues[0].message.contains("private"));
         assert_eq!(issues[1].kind, "log_error");
+    }
+
+    /// `issue = "none"` 永不上报；`issue = "fallback"` 只在同一 HTTP 请求 span 里还没有其它 issue（含 typed）时上报。
+    #[tokio::test]
+    async fn request_fallback_is_reported_only_without_a_specific_issue() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let reporter = crate::issues::Reporter::new(&crate::config::AlertsConfig { dedup_window_secs: 0, ..Default::default() }, None, vec![]);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(super::IssuesTo(reporter.clone())), || {
+            let request = |path: &str| tracing::info_span!(target: "sub_bot::http", "http", path = %path);
+            // 只有通用访问日志：上报一次
+            request("/plain").in_scope(|| tracing::error!(target: "sub_bot::http", issue = "fallback", status = 502, "request finished"));
+            // 具体错误在前（日志派生）：访问日志不再上报；嵌套 span 里的事件也算
+            request("/specific").in_scope(|| {
+                tracing::info_span!("session_run").in_scope(|| tracing::error!(target: "sub_bot::http", error = "disk full", "session purge failed"));
+                tracing::error!(target: "sub_bot::http", issue = "fallback", status = 500, "request finished");
+            });
+            // typed（结构化来源已上报）同样抑制访问日志
+            request("/typed").in_scope(|| {
+                tracing::warn!(target: "sub_bot::http", issue = "typed", "chat timed out");
+                tracing::error!(target: "sub_bot::http", issue = "fallback", status = 504, "request finished");
+            });
+            // 4xx 访问日志永不上报；标记只属于各自的请求
+            request("/client-error").in_scope(|| tracing::warn!(target: "sub_bot::http", issue = "none", status = 400, "request finished"));
+            request("/after").in_scope(|| tracing::error!(target: "sub_bot::http", issue = "fallback", status = 503, "request finished"));
+        });
+        reporter.flush(std::time::Duration::from_secs(2)).await;
+        let messages: Vec<_> = reporter.recent(None, 0, 100).into_iter().map(|e| e.message).collect();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert!(messages[0].starts_with("request finished status=502"), "{messages:?}");
+        assert!(messages[1].starts_with("session purge failed"), "{messages:?}");
+        assert!(messages[2].starts_with("request finished status=503"), "{messages:?}");
+        assert!(!messages.iter().any(|m| m.contains("issue=")), "{messages:?}");
     }
 
     #[test]

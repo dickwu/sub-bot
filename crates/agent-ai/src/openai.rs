@@ -787,5 +787,10 @@ mod tests {
         let r = redact(r#"{"message":"Incorrect API key provided: sk-proj-abc***xyz. See"}"#);
         assert!(!r.contains("sk-"), "{r}");
         assert!(r.contains("[redacted]"));
+        // 只掩盖 sk- 形式的 key，普通短语保持可读
+        for text in ["missing or unknown bearer token", "invalid api key", "token expired", "risk-free task-runner"] {
+            assert_eq!(redact(text), text);
+        }
+        assert_eq!(redact("Authorization: Bearer sk-proj-abc123"), "Authorization: Bearer [redacted]");
     }
 }

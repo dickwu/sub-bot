@@ -124,19 +124,48 @@ pub fn report(event: IssueEvent) {
     }
 }
 
+/// `Bearer <value>` 里的 value 是否像凭据：至少 8 个字符，且含非字母字符（数字或 `-._~+/=*` 等：JWT、sk-…、
+/// gh*_…、base64/hex 不透明 token、被截断回显的 `abc***xyz`），或者长度 >= 20（无符号的长随机串）。
+/// "bearer token"、"Bearer authentication." 这类普通单词不算（句末标点先去掉）。
+fn credential_like(value: &str) -> bool {
+    let len = value.chars().count();
+    len >= 8 && (len >= 20 || value.chars().any(|c| !c.is_alphabetic()))
+}
+
 /// Central redaction, also used for retained webhook response snippets.
+///
+/// Masks configured secret values, `sk-…`, GitHub tokens, JWTs, `Bearer <credential>` and
+/// `api_key|token|secret|password|authorization = <value>` assignments (incl. JSON), but keeps
+/// plain phrases such as "missing or unknown bearer token", "api key", "token expired" readable.
 pub fn redact(input: &str, secrets: &[String]) -> String {
     static PATTERNS: OnceLock<Vec<regex::Regex>> = OnceLock::new();
+    static BEARER: OnceLock<regex::Regex> = OnceLock::new();
     let mut text = input.to_owned();
     for secret in secrets.iter().filter(|s| !s.is_empty()) {
         text = text.replace(secret, "[redacted]");
     }
+    // The value must look like a credential, not an English word ("bearer token").
+    let bearer = BEARER.get_or_init(|| regex::Regex::new(r#"(?i)\b(Bearer)\s+([^\s"'`(),;<>\[\]{}]+)"#).expect("valid bearer pattern"));
+    text = bearer
+        .replace_all(&text, |c: &regex::Captures<'_>| {
+            let value = &c[2];
+            let core = value.trim_end_matches(['.', ',', ':', '!', '?']);
+            if credential_like(core) {
+                format!("{} [redacted]{}", &c[1], &value[core.len()..])
+            } else {
+                c[0].to_owned()
+            }
+        })
+        .into_owned();
     let patterns = PATTERNS.get_or_init(|| {
         [
             r"(?i)\bsk-[a-z0-9_.*-]+",
-            r"(?i)\bgh[a-z0-9]*_[a-z0-9_]+",
-            r#"(?i)\bBearer\s+[^\s"\x27,;}]+"#,
-            r#"(?i)["']?(?:api[_-]?key|token|secret|password|authorization)["']?\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;}]+)"#,
+            // GitHub: ghp_ / gho_ / ghu_ / ghs_ / ghr_ and fine-grained github_pat_ (not arbitrary gh*_ identifiers).
+            r"(?i)\b(?:gh[pousr]_[a-z0-9_]{8,}|github_pat_[a-z0-9_]{8,})",
+            // JWT: base64url(header).base64url(payload).signature
+            r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*",
+            // Assignments, also JSON (`"api_key":"…"`) and `Authorization: Bearer|Basic|Token <value>`.
+            r#"(?i)["']?(?:api[_ -]?key|token|secret|password|authorization)["']?\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?(?:"[^"]*"|'[^']*'|[^\s,;}]+)"#,
         ]
         .into_iter()
         .filter_map(|p| regex::Regex::new(p).ok())
@@ -616,6 +645,57 @@ mod tests {
                 axum::serve(listener, app).await.unwrap();
             })),
         )
+    }
+
+    #[test]
+    fn redaction_keeps_plain_phrases_readable() {
+        for text in [
+            "unauthorized request (missing or unknown bearer token)",
+            "Bearer token expired",
+            "invalid bearer tokens.",
+            "Bearer authentication failed",
+            "api key missing; set an API key",
+            "token expired, refresh the token",
+            "Authorization header missing",
+            "secret rotation is due",
+            "max_tokens: 64001 > 64000, input_tokens=12",
+            "ghost_session closed",
+            "risk-free task-runner",
+        ] {
+            assert_eq!(redact(text, &[]), text);
+        }
+    }
+
+    #[test]
+    fn redaction_masks_real_secrets() {
+        let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        let cases = [
+            ("Authorization: Bearer abcDEF1234567890ghiJKL".to_string(), "abcDEF"),
+            ("authorization=Bearer abcDEF1234567890ghiJKL".to_string(), "abcDEF"),
+            ("curl -H 'Authorization: Bearer abcDEF1234567890' failed".to_string(), "abcDEF"),
+            ("sent Bearer sk-proj-abc123def456".to_string(), "abc123"),
+            (format!("rejected Bearer {jwt}"), "eyJhbGci"),
+            (format!("id_token {jwt}"), "dozjgNry"),
+            ("Bearer opaqueTokenWithoutDigitsXYZ".to_string(), "opaqueToken"),
+            ("Bearer abc***xyz".to_string(), "abc***"),
+            ("Bearer ghp_abcdefghijklmnop1234".to_string(), "abcdefghijklmnop"),
+            ("leaked ghp_abcdefghijklmnop1234 and github_pat_11ABCDEFG_xyz123456".to_string(), "abcdefghijklmnop"),
+            ("Incorrect API key provided: sk-proj-abc***xyz. See".to_string(), "sk-proj"),
+            ("token=tokvalue&x=1".to_string(), "tokvalue"),
+            ("access_token: abcdef".to_string(), "abcdef"),
+            ("password = 'hunter 2'".to_string(), "hunter"),
+            ("api key: plainvalue".to_string(), "plainvalue"),
+            (r#"{"api_key":"json-value","apiKey": "camel-value"}"#.to_string(), "-value"),
+            ("client secret configured-private-value echoed".to_string(), "configured-private-value"),
+        ];
+        for (text, secret) in cases {
+            let redacted = redact(&text, &["configured-private-value".into()]);
+            assert!(!redacted.contains(secret), "{text} -> {redacted}");
+            assert!(redacted.contains("[redacted]"), "{text} -> {redacted}");
+        }
+        // Readable context around a masked value is kept.
+        assert_eq!(redact("Authorization: Bearer abcDEF1234567890ghiJKL rejected", &[]), "[redacted] rejected");
+        assert_eq!(redact("got Bearer abcDEF1234567890. retry", &[]), "got Bearer [redacted]. retry");
     }
 
     #[tokio::test]

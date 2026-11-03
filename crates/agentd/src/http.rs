@@ -76,10 +76,13 @@ async fn trace_request(mut req: Request, next: Next) -> Response {
         let mut resp = next.run(req).await;
         let status = resp.status().as_u16();
         let ms = start.elapsed().as_millis() as u64;
+        // 访问日志不是具体问题：4xx 是调用方错误（响应里已有原因；401 等需要关注的情况由具体日志上报），永不成为 issue；
+        // 5xx 只在本请求里还没有更具体的 issue（如 "session rehydration failed"、typed 的超时）时作为兜底上报。
+        // 否则同一请求的两条 WARN/ERROR 共享去重键，会被合并成同一 issue 的 count 2（见 logging.rs `LogIssue`）。
         if status >= 500 {
-            tracing::error!(status, latency_ms = ms, "request finished");
+            tracing::error!(issue = "fallback", status, latency_ms = ms, "request finished");
         } else if status >= 400 {
-            tracing::warn!(status, latency_ms = ms, "request finished");
+            tracing::warn!(issue = "none", status, latency_ms = ms, "request finished");
         } else {
             tracing::info!(status, latency_ms = ms, "request finished");
         }
@@ -829,6 +832,40 @@ mod tests {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// 生产 IssuesLayer 规则下驱动真实 router：一个 401 请求只产生一条可读的 issue（v0.10.1 会出现同一 id 的 count 1 / count 2 两行）。
+    #[tokio::test]
+    async fn unauthorized_request_reports_exactly_one_readable_issue() {
+        use tracing_subscriber::layer::SubscriberExt;
+        for token in [None, Some("unknown-token"), Some("abcDEF1234567890ghijKLMN")] {
+            // Hub 在订阅之前创建，避免其启动日志混入。
+            let (app, _hub) = app(1);
+            let dir = std::env::temp_dir().join(format!("sub-bot-http-issues-{}", uuid::Uuid::new_v4()));
+            let reporter = crate::issues::Reporter::new(&crate::config::AlertsConfig::default(), Some(dir.clone()), vec![]);
+            let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(crate::logging::IssuesTo(reporter.clone())));
+            let (status, body) = request(&app, "GET", "/v1/sessions", token, json!({})).await;
+            assert_eq!((status, body), (StatusCode::UNAUTHORIZED, json!({"error": "unauthorized"})));
+            // 客户端错误（4xx）的访问日志本身不是 issue：有效 token 的 404 不产生任何 issue。
+            assert_eq!(request(&app, "GET", "/v1/sessions/missing", Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
+            drop(guard);
+            // 先让后台 drain 按生产路径处理（flush 会关闭去重窗口，掩盖 count 2 的症状），再 flush 确认没有摘要。
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            reporter.flush(std::time::Duration::from_secs(2)).await;
+            let recent = reporter.recent(None, 0, 100);
+            assert_eq!(recent.len(), 1, "{recent:?}");
+            assert_eq!(recent[0].count, 1);
+            assert_eq!(recent[0].kind, "log_warn");
+            assert!(recent[0].message.contains("unauthorized request (missing or unknown bearer token)"), "{}", recent[0].message);
+            let log = std::fs::read_to_string(dir.join("issues.log")).unwrap();
+            let lines: Vec<Value> = log.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+            assert_eq!(lines.len(), 1, "{log}");
+            assert_eq!(lines[0]["id"], recent[0].id.as_str());
+            assert_eq!(lines[0]["count"], 1);
+            assert!(lines[0]["message"].as_str().unwrap().contains("missing or unknown bearer token"), "{log}");
+            assert!(!log.contains("unknown-token") && !log.contains("abcDEF"));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
+> 状态：v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
 
 ## Claude (Anthropic)
 
@@ -296,6 +296,8 @@ v0.5.0 将运行异常统一为 `IssueEvent`，写入日志目录下的 **`issue
 `ts` 为 Unix 毫秒；severity 为 `warn | error | fatal`。作用域字段和 `tool` 可省略。
 运行侧来源（I2 接入）包括：LLM 错误、工具失败/超时、工具审批超时（`approval_timeout`）、run timeout / max_turns / token budget、abort、持久化 I/O、广播 lag、关闭时仍有在途工作、429 容量拒绝、调用方工具 callback 失败。核心还接入 webhook 最终投递失败、启动/配置失败、panic，以及本项目 crate 的 WARN/ERROR 日志（跳过 reporter/webhook 自身，防止循环）。
 
+日志派生的 issue（`log_warn` / `log_error`）规则：已由结构化来源上报的事件，其日志带 `issue="typed"`，不再重复生成 `log_warn`。HTTP 访问日志 `request finished` 本身不是问题来源：4xx（调用方错误，原因已在响应里）带 `issue="none"`，从不上报——需要关注的 4xx 有自己的 issue，例如 401 的 `unauthorized request (missing or unknown bearer token)`、409 的 `session rehydration failed`、429 的 `session_limit`；5xx 带 `issue="fallback"`，只有当该请求里还没有更具体的 issue（例如 `session purge failed`、`list models failed`、504 的 `run_timeout`）时才作为 `log_error` 兜底上报。因此一个请求只产生一条 issue（`count: 1`），不会因为访问日志与具体日志共享去重键而变成 `count: 2`（v0.10.1 及以前的问题）。
+
 ### 配置
 
 ```json
@@ -340,7 +342,7 @@ sub-bot --config sub-bot.json issues tail -n 20
 - `report()` 不等待网络或文件 I/O；队列默认 1000，满时丢弃最旧项，随后输出带丢弃计数的 `issues_dropped`。内存保留最近 1000 个已处理问题。
 - 同 `(kind, component, sessionId, client)` 在默认 60 秒窗口内首次立即发出，其余合并；窗口结束的摘要 `count = 被抑制次数 + 1`，**包含已经发出的首条，不应重复相加**。关闭 flush 会提前输出待发摘要。
 - 各目标独立签名、delivery ID 和重试，最多 32 个网络投递并发；慢目标不阻塞其它目标/问题队列。失败生成 `webhook_delivery_failed`，仅去 alerts 和 JSONL，不回到订阅者；失败问题自身的投递不会递归生成问题。外部失败回调只有 host，保守排除同 host 的 alert targets；issue 内部失败可精确排除原 URL。
-- 安全约定：来源不得传入 prompts/bodies/工具原文；details 递归剔除 prompt/content/body/text/messages/arguments/output 与密钥字段，掩盖 `sk-…`、Bearer、GitHub tokens、敏感 key=value 和已加载的 webhook secrets。message 最多 500 字符，details 超过 2 KiB 替换为 `{"truncated":true}`。不要将原始输入输出拼入自由文本 message；模式脱敏不能识别任意无标记的私密文本。
+- 安全约定：来源不得传入 prompts/bodies/工具原文；details 递归剔除 prompt/content/body/text/messages/arguments/output 与密钥字段，掩盖 `sk-…`、像凭据的 `Bearer <值>`（至少 8 个字符且含数字或 `-._~+/=` 等符号，或长度 >= 20；`Authorization: Bearer|Basic|Token …` 整体掩盖）、JWT、GitHub tokens（`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` / `github_pat_`）、敏感赋值（`api_key` / `api key` / `token` / `secret` / `password` / `authorization` 后跟 `:` 或 `=`，含 JSON `"api_key":"…"`）以及已加载的 API key 与 webhook secrets；普通短语如 `missing or unknown bearer token`、`api key`、`token expired`、`Authorization header missing` 保持原样（v0.10.1 及以前 `bearer token` 会被误掩盖为 `[redacted]`）。message 最多 500 字符，details 超过 2 KiB 替换为 `{"truncated":true}`。不要将原始输入输出拼入自由文本 message；模式脱敏不能识别任意无标记的私密文本。
 - JSONL I/O 失败只计数，不使服务失败；启动失败的同步告警最多等 5 秒，正常退出 flush 最多等 5 秒。panic 仅 best-effort 入队并调用原 hook；进程被强杀、超时退出或磁盘故障时不保证投递。问题不是持久化消息队列，接收端仍需按 delivery ID 幂等处理。
 
 ## 快速开始
@@ -874,9 +876,92 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
   ```
 
   解锁不会给新二进制授权：如果条目 ACL 不信任当前二进制（例如刚升级），ssh 下仍会失败，需要按上一条在 GUI 会话里授权一次。
-- **LaunchAgent（可用）vs LaunchDaemon（不可用）**：要让后台常驻的 `sub-bot serve` 使用 Keychain，请用 **LaunchAgent**：plist 放在 `~/Library/LaunchAgents/`，以登录用户身份在其会话中运行，能访问该用户（已解锁的）登录钥匙串，例如 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.sub-bot.plist`。**LaunchDaemon**（`/Library/LaunchDaemons/`，系统级、通常以 root 运行、不属于任何用户登录会话）没有登录钥匙串可用，Keychain 来源会失败——这种部署请改用 `apiKeyFile` 或 `keys set --file` 写出的 0600 key 文件。Homebrew tap 的 formula 没有提供服务定义，launchd plist 需要自己编写。
+- **LaunchAgent（可用）vs LaunchDaemon（不可用）**：要让后台常驻的 `sub-bot serve` 使用 Keychain，请用 **LaunchAgent**：plist 放在 `~/Library/LaunchAgents/`，以登录用户身份在其会话中运行，能访问该用户（已解锁的）登录钥匙串，示例 plist 与加载方式见下文「LaunchAgent 示例与 brew upgrade 之后」。**LaunchDaemon**（`/Library/LaunchDaemons/`，系统级、通常以 root 运行、不属于任何用户登录会话）没有登录钥匙串可用，Keychain 来源会失败——这种部署请改用 `apiKeyFile` 或 `keys set --file` 写出的 0600 key 文件。Homebrew tap 的 formula 没有提供服务定义，launchd plist 需要自己编写（可参考下文示例）。
 - **无头部署（ssh、LaunchDaemon、没有人看屏幕的机器）**：推荐直接用 `apiKeyFile`（或 `keys set --file` 写出的 0600 key 文件），完全绕开 Keychain 授权弹窗。
 - **启动失败即退出**：Keychain 读取只发生在启动阶段（不做运行期懒加载，避免服务运行中突然弹窗或挂起）。失败时 sub-bot 直接退出并上报 `startup_failed` issue，消息为上表中的 Keychain 错误文本（只含 service/account 名，不含 key）。同样，`provider ... is not configured`、`... API key not found for account ...`、`account '...' is not configured for provider ...` 这类 key 配置错误（只含 provider / 账号 / 环境变量名 / 配置路径）会原样显示，issue details 为 `{"reason": "key_config"}`；key 文件读取失败等其它错误只显示通用的 `service initialization failed (check provider and key configuration)`。部署 LaunchAgent 前先在 GUI 终端里跑一次 `sub-bot keys check`。
+
+### LaunchAgent 示例与 brew upgrade 之后
+
+示例 `~/Library/LaunchAgents/com.dickwu.sub-bot.plist`（把 `/Users/you` 换成自己的 home 目录）：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dickwu.sub-bot</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/sub-bot</string>
+    <string>--config</string>
+    <string>/Users/you/.config/sub-bot/sub-bot.json</string>
+    <string>--log-dir</string>
+    <string>/Users/you/Library/Logs/sub-bot</string>
+    <string>--log-level</string>
+    <string>info</string>
+    <string>serve</string>
+    <string>--bind</string>
+    <string>127.0.0.1:7878</string>
+    <string>--unix-socket</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/you</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/you</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>StandardOutPath</key>
+  <string>/Users/you/Library/Logs/sub-bot/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/you/Library/Logs/sub-bot/launchd.err.log</string>
+</dict>
+</plist>
+```
+
+- launchd 启动的进程 PATH 很短，`EnvironmentVariables` 里补上 Homebrew 路径，模型调用的 `bash` 工具才能找到 `git`、`cargo` 等命令；启动早期的错误（例如 Keychain 超时）在 `launchd.err.log` 里。
+- launchd **不展开 `~` 和 `$HOME`**，plist 里必须写绝对路径。Apple Silicon 上 Homebrew 的路径是 `/opt/homebrew/bin/sub-bot`，Intel Mac 是 `/usr/local/bin/sub-bot`（`brew --prefix` 可确认）。
+- `--config` / `--log-dir` / `--log-level` 是全局参数，可以写在 `serve` 前面；`--unix-socket` 不带值时监听 `<dataDir>/sub-bot.sock`（macOS 默认 `~/Library/Application Support/sub-bot/sub-bot.sock`），带路径则监听该路径。issues.log 也写在 `--log-dir` 指定的目录里。
+- 加载 / 查看 / 卸载：
+
+  ```bash
+  plutil -lint ~/Library/LaunchAgents/com.dickwu.sub-bot.plist
+  launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dickwu.sub-bot.plist
+  launchctl print gui/$(id -u)/com.dickwu.sub-bot | grep -E 'state|pid|last exit'
+  curl -s http://127.0.0.1:7878/v1/health          # {"ok":true}
+  launchctl bootout gui/$(id -u)/com.dickwu.sub-bot  # 卸载（修改 plist 后先 bootout 再 bootstrap）
+  ```
+
+**brew upgrade 之后**（每次升级都要做）：
+
+1. 在**这台 Mac 的图形界面终端**里（不是 ssh）执行：
+
+   ```bash
+   sub-bot keys check --provider anthropic
+   sub-bot keys check --provider openai
+   ```
+
+   出现 Keychain 授权对话框时点 **「始终允许」（Always Allow）**。每个 Keychain 条目单独授权（每个 provider / 账号一条），逐个点完。服务用了 `--config` 时（上面的 plist 就是），建议加上同样的参数——`sub-bot --config /Users/you/.config/sub-bot/sub-bot.json keys check --provider anthropic`——这样检查的正是服务启动时会读取的条目（命名账号、自定义 `apiKeyKeychain` service）；不带 `--config` 时按默认配置判断，服务实际使用的条目可能显示为 `skipped (not used by this configuration)` 而没有被读取、授权。每个条目输出一行，`<provider>/<account>: ok (…)` 表示新二进制已能读取；`FAILED: …` 见上文错误码对照。
+2. 然后重启后台服务，让它换到新二进制：
+
+   ```bash
+   launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot
+   ```
+
+为什么：
+- `brew upgrade` 只替换磁盘上的二进制，**不会重启服务**。在 `kickstart` 之前，老进程继续用旧二进制运行（新版本的修复都还没生效）；`-k` 先结束正在运行的实例再重新启动。
+- 新二进制对 Keychain 来说是另一个应用（见上文“brew 升级后 ACL 失效”），第一次读取 key 会弹授权对话框。如果跳过第 1 步就让服务重启（`kickstart`、重新登录、重启机器或进程崩溃），后台服务会等待这个没人点击的对话框，`keychainTimeoutSecs`（默认 30 秒）后以 `no answer from macOS Keychain …` 启动失败退出（上报 `startup_failed` issue）；`KeepAlive` 让 launchd 立即再拉起它（两次启动至少间隔 `ThrottleInterval` 10 秒），每次都同样等待、超时、退出——服务陷入重启循环，一直起不来。此时补做第 1 步即可：授权之后下一次自动重启就会成功（也可以再执行一次第 2 步立即重启）。
 
 ### Keychain 读取超时（v0.9.2）
 

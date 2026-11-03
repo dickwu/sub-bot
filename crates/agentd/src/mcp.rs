@@ -613,7 +613,8 @@ impl Server {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Err(_) => {
-                tracing::warn!(server = %self.name, tool, tool_call_id = call_id, timeout_secs = self.cfg.call_timeout_secs, "MCP tool call timed out");
+                // 会话层把这次工具失败上报为 tool_timeout issue（hub.rs report_event），这里只记诊断日志
+                tracing::warn!(issue = "typed", server = %self.name, tool, tool_call_id = call_id, timeout_secs = self.cfg.call_timeout_secs, "MCP tool call timed out");
                 anyhow::bail!("MCP tool '{tool}' on server '{}' timed out after {}s (callTimeoutSecs)", self.name, self.cfg.call_timeout_secs)
             }
             Ok(Ok(result)) => {

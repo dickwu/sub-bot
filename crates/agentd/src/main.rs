@@ -11,6 +11,9 @@
 compile_error!("sub-bot only supports macOS and Linux");
 
 mod accounts;
+#[cfg(test)]
+mod approval_tests;
+mod approvals;
 mod ask;
 mod config;
 mod http;
@@ -125,6 +128,10 @@ enum Cmd {
         json: bool,
         #[command(flatten)]
         account: AccountArg,
+        /// 自动批准 toolApproval 判定为 ask 的工具调用（deny 规则仍然生效）。不加时：交互终端里逐个询问，
+        /// 非交互（或 --json）时按 deny 处理并警告
+        #[arg(long)]
+        auto_approve: bool,
         prompt: String,
     },
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
@@ -413,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             rpc::run(hub, session_req(profile.clone(), depth, account)).await?;
         }
-        Cmd::Run { ref profile, depth, json, ref account, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone(), depth, account))?;
             let mut events = session.subscribe();
@@ -421,8 +428,26 @@ async fn main() -> anyhow::Result<()> {
             let mut last = None;
             let (mut total, mut turns, mut tool_calls) = (agent_ai::Usage::default(), 0usize, 0usize);
             let mut used: Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)> = None;
+            let interactive = !json && approvals::tty_available();
             loop {
                 match events.recv().await {
+                    Ok(AgentEvent::ApprovalRequired { call_id, tool, args, reason, .. }) => {
+                        let (decision, why) = if auto_approve {
+                            (approvals::Decision::Approve, "approved by --auto-approve".to_string())
+                        } else if interactive {
+                            let text = approvals::summary(&tool, &call_id, &args, &reason);
+                            match tokio::task::spawn_blocking(move || approvals::prompt_tty(&text)).await {
+                                Ok(Ok(true)) => (approvals::Decision::Approve, "approved at terminal".to_string()),
+                                _ => (approvals::Decision::Deny, "denied at terminal".to_string()),
+                            }
+                        } else {
+                            tracing::warn!(issue = "typed", tool = %tool, tool_call_id = %call_id, reason = %reason, "tool call requires approval but run is non-interactive; denying (use --auto-approve)");
+                            eprintln!("warning: tool {tool} requires approval ({reason}); denied because run is non-interactive (use --auto-approve)");
+                            (approvals::Decision::Deny, "non-interactive run (use --auto-approve)".to_string())
+                        };
+                        // 已超时/取消时忽略
+                        let _ = session.resolve_approval(&call_id, decision, Some(why));
+                    }
                     Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => {
                         turns += 1;
                         tool_calls += a.tool_calls().len();

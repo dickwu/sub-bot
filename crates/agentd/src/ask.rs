@@ -34,8 +34,28 @@ pub struct Ask {
     /// Account for a new session (session.account); must be allowed by the profile's allowedAccounts (HTTP 403 otherwise).
     #[command(flatten)]
     pub account: crate::AccountArg,
+    /// Approve every tool call that the server's toolApproval policy asks about (deny rules still apply).
+    #[arg(long, conflicts_with = "auto_deny")]
+    pub auto_approve: bool,
+    /// Deny every tool call that the server's toolApproval policy asks about.
+    #[arg(long)]
+    pub auto_deny: bool,
     /// Message, or - to read stdin.
     pub message: String,
+}
+
+/// 收到 `approval_required` 时 ask 怎么做。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalMode {
+    /// 不处理（--json：事件原样输出，由调用方决定）
+    #[default]
+    Ignore,
+    /// 非交互：在 stderr 提示如何批准，保持等待（超时按服务端 onTimeout）
+    Notify,
+    /// --auto-approve（true）/ --auto-deny（false）
+    Auto(bool),
+    /// 交互终端：在 /dev/tty 上询问 `Approve? [y/N]`
+    Prompt,
 }
 
 pub struct Client {
@@ -49,6 +69,7 @@ pub struct Client {
     depth: Option<crate::routing::Depth>,
     /// 新会话的账号（session.account）
     account: Option<String>,
+    approval: ApprovalMode,
 }
 
 impl Client {
@@ -76,7 +97,7 @@ impl Client {
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None, account: None })
+        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None, account: None, approval: ApprovalMode::Ignore })
     }
 
     async fn response(
@@ -139,6 +160,44 @@ impl Client {
         body
     }
 
+    /// 按 [`ApprovalMode`] 处理一次 approval_required（SSE 事件或 GET approvals 列表项，字段相同）。失败只在 stderr 提示。
+    async fn handle_approval(&self, session_id: Option<&str>, event: &Value) {
+        let (Some(call_id), Some(tool)) = (event["callId"].as_str(), event["tool"].as_str()) else { return };
+        let reason = event["reason"].as_str().unwrap_or_default();
+        let sid = session_id.and_then(|id| uuid::Uuid::parse_str(id).ok());
+        let (approve, why) = match self.approval {
+            ApprovalMode::Ignore => return,
+            ApprovalMode::Notify => {
+                match sid {
+                    Some(sid) => eprintln!(
+                        "[approval] {tool} (callId {call_id}) is waiting for approval: {reason}\n  approve with POST /v1/sessions/{sid}/approvals/{} {{\"decision\":\"approve\"}} or rerun with --auto-approve",
+                        crate::approvals::path_segment(call_id)
+                    ),
+                    None => eprintln!("[approval] {tool} (callId {call_id}) is waiting for approval: {reason}"),
+                }
+                return;
+            }
+            ApprovalMode::Auto(approve) => (approve, if approve { "approved by --auto-approve" } else { "denied by --auto-deny" }),
+            ApprovalMode::Prompt => {
+                let text = crate::approvals::summary(tool, call_id, &event["args"], reason);
+                let approve = matches!(tokio::task::spawn_blocking(move || crate::approvals::prompt_tty(&text)).await, Ok(Ok(true)));
+                (approve, if approve { "approved at terminal" } else { "denied at terminal" })
+            }
+        };
+        let Some(sid) = sid else {
+            eprintln!("[approval] cannot answer callId {call_id}: unknown session id");
+            return;
+        };
+        let path = format!("/v1/sessions/{sid}/approvals/{}", crate::approvals::path_segment(call_id));
+        let body = json!({"decision": if approve { "approve" } else { "deny" }, "reason": why});
+        match self.request(axum::http::Method::POST, &path, Some(&body)).await {
+            Ok((status, _)) if status.is_success() => {}
+            Ok((axum::http::StatusCode::CONFLICT, _)) => eprintln!("[approval] callId {call_id} was already resolved (timed out or aborted)"),
+            Ok((status, v)) => eprintln!("[approval] {}", http_error(status, Some(&v))),
+            Err(e) => eprintln!("[approval] {e}"),
+        }
+    }
+
     pub async fn ask_stream(&self, message: &str, profile: Option<&str>, session: Option<&str>, timeout_secs: u64, mut on_event: impl FnMut(&str, &Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
         use http_body_util::BodyExt;
         let request = async {
@@ -148,12 +207,15 @@ impl Client {
                 let bytes = axum::body::to_bytes(body, 64 * 1024).await.unwrap_or_default();
                 return Err(http_error(status, serde_json::from_slice::<Value>(&bytes).ok().as_ref()));
             }
-            if let Some(session_id) = headers.get("x-session-id").and_then(|value| value.to_str().ok()) {
-                let event = json!({"type": "session", "sessionId": session_id});
+            let mut session_id = session.map(str::to_owned);
+            if let Some(id) = headers.get("x-session-id").and_then(|value| value.to_str().ok()) {
+                session_id = Some(id.to_owned());
+                let event = json!({"type": "session", "sessionId": id});
                 on_event(&event.to_string(), &event)?;
             }
             let mut parser = SseParser::default();
             let mut outcome = StreamOutcome::default();
+            let mut approvals = vec![];
             while let Some(frame) = body.frame().await {
                 let frame = frame.map_err(|_| anyhow::anyhow!("cannot read server event stream"))?;
                 if let Some(bytes) = frame.data_ref() {
@@ -162,8 +224,14 @@ impl Client {
                         anyhow::ensure!(event.is_object(), "invalid server event JSON");
                         on_event(data, &event)?;
                         outcome.event(&event);
+                        if event["type"] == "approval_required" {
+                            approvals.push(event);
+                        }
                         Ok(())
                     })?;
+                    for event in approvals.drain(..) {
+                        self.handle_approval(session_id.as_deref(), &event).await;
+                    }
                     if outcome.settled {
                         return outcome.finish();
                     }
@@ -191,6 +259,8 @@ impl Client {
         let id = response["taskId"].as_str().ok_or_else(|| anyhow::anyhow!("missing taskId"))?;
         let id = uuid::Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("invalid taskId"))?;
         let path = format!("/v1/tasks/{id}");
+        let session_id = response["sessionId"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()).map(|s| s.to_string());
+        let mut handled = std::collections::HashSet::new();
         loop {
             let (status, task) = self.request(axum::http::Method::GET, &path, None).await?;
             if !status.is_success() {
@@ -198,6 +268,18 @@ impl Client {
             }
             if task["status"] != "running" {
                 return Ok(task);
+            }
+            // 异步模式没有事件流：轮询会话的等待审批
+            if let (false, Some(sid)) = (self.approval == ApprovalMode::Ignore, session_id.as_deref()) {
+                if let Ok((status, list)) = self.request(axum::http::Method::GET, &format!("/v1/sessions/{sid}/approvals"), None).await {
+                    for item in list["approvals"].as_array().filter(|_| status.is_success()).into_iter().flatten() {
+                        if let Some(call_id) = item["callId"].as_str() {
+                            if handled.insert(call_id.to_owned()) {
+                                self.handle_approval(Some(sid), item).await;
+                            }
+                        }
+                    }
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -330,6 +412,17 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
     client.effort = effort;
     client.depth = if args.deep { Some(crate::routing::Depth::Deep) } else { args.depth };
     client.account = args.account.account.clone();
+    client.approval = if args.auto_approve {
+        ApprovalMode::Auto(true)
+    } else if args.auto_deny {
+        ApprovalMode::Auto(false)
+    } else if args.json {
+        ApprovalMode::Ignore
+    } else if crate::approvals::tty_available() {
+        ApprovalMode::Prompt
+    } else {
+        ApprovalMode::Notify
+    };
     if !args.asynchronous {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
@@ -598,5 +691,88 @@ mod tests {
                 assert!(polls.load(Ordering::SeqCst) > 0);
             }
         }
+    }
+
+    #[test]
+    fn approval_flags_conflict() {
+        let crate::Cmd::Ask(ask) = crate::Cli::try_parse_from(["sub-bot", "ask", "--auto-approve", "hi"]).unwrap().cmd else { panic!("expected ask") };
+        assert!(ask.auto_approve && !ask.auto_deny);
+        assert!(crate::Cli::try_parse_from(["sub-bot", "ask", "--auto-approve", "--auto-deny", "hi"]).is_err());
+    }
+
+    /// 流式：收到 approval_required 后按 --auto-approve POST 决定；异步：轮询 approvals 列表并按 --auto-deny 决定。
+    #[tokio::test]
+    async fn auto_decisions_are_posted_for_stream_and_async() {
+        use axum::body::{Body, Bytes};
+        use axum::extract::Path;
+        use axum::response::IntoResponse;
+        let sid = uuid::Uuid::new_v4().to_string();
+        let decided = Arc::new(tokio::sync::Mutex::new(Vec::<(String, Value)>::new()));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let (d1, n1, d2, s1, seen) = (decided.clone(), notify.clone(), decided.clone(), sid.clone(), decided.clone());
+        let app = Router::new()
+            .route(
+                "/v1/chat",
+                post(move |Json(body): Json<Value>| {
+                    let (notify, sid) = (n1.clone(), s1.clone());
+                    async move {
+                        if body["async"] == true {
+                            return Json(json!({"taskId": uuid::Uuid::new_v4(), "sessionId": sid, "status": "running"})).into_response();
+                        }
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::convert::Infallible>>(4);
+                        tokio::spawn(async move {
+                            let ev = json!({"type": "approval_required", "callId": "call/1", "tool": "bash", "args": {"command": "ls"}, "reason": "r", "timeoutSecs": 300});
+                            tx.send(Ok(Bytes::from(format!("data: {ev}\n\n")))).await.unwrap();
+                            notify.notified().await;
+                            tx.send(Ok(Bytes::from_static(b"data: {\"type\":\"agent_settled\",\"aborted\":false}\n\n"))).await.unwrap();
+                        });
+                        axum::http::Response::builder().header("x-session-id", sid).body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx))).unwrap()
+                    }
+                }),
+            )
+            .route(
+                "/v1/sessions/{sid}/approvals/{call}",
+                post(move |Path((sid, call)): Path<(String, String)>, Json(body): Json<Value>| {
+                    let (decided, notify) = (d1.clone(), notify.clone());
+                    async move {
+                        decided.lock().await.push((format!("{sid}/{call}"), body));
+                        notify.notify_one();
+                        Json(json!({"resolved": true}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/sessions/{sid}/approvals",
+                get(move || {
+                    let decided = d2.clone();
+                    async move {
+                        let list = if decided.lock().await.len() < 2 { json!([{"callId": "c2", "tool": "write", "args": {}, "reason": "r"}]) } else { json!([]) };
+                        Json(json!({"approvals": list}))
+                    }
+                }),
+            )
+            .route(
+                "/v1/tasks/{id}",
+                get(move || {
+                    let decided = decided.clone();
+                    async move { Json(json!({"status": if decided.lock().await.len() < 2 { "running" } else { "succeeded" }})) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = Client::new(None, Some(format!("http://{}", listener.local_addr().unwrap())), None).unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        client.approval = ApprovalMode::Auto(true);
+        client.ask_stream("hi", None, None, 5, |_, _| Ok(())).await.unwrap();
+        client.approval = ApprovalMode::Auto(false);
+        let task = client.ask_async("hi", None, None, 5).await.unwrap();
+        assert_eq!(task["status"], "succeeded");
+        let seen = seen.lock().await.clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        // callId 按路径段编码（含 `/` 也能路由到同一端点，服务端解码回原值）
+        assert_eq!(seen[0].0, format!("{sid}/call/1"));
+        assert_eq!(seen[0].1, json!({"decision": "approve", "reason": "approved by --auto-approve"}));
+        assert_eq!(seen[1].0, format!("{sid}/c2"));
+        assert_eq!(seen[1].1, json!({"decision": "deny", "reason": "denied by --auto-deny"}));
+        server.abort();
     }
 }

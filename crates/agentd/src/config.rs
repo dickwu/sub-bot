@@ -82,6 +82,9 @@ pub struct Profile {
     /// 主账号 429 / 额度耗尽时依次切换的账号（覆盖账号级 fallbackAccounts）
     #[serde(default)]
     pub fallback_accounts: Option<Vec<String>>,
+    /// 工具调用审批："never"（默认）| "always" | `{default, tools, bash, timeoutSecs, onTimeout}`；不填用全局 toolApproval
+    #[serde(default)]
+    pub tool_approval: Option<agent_tools::ToolApproval>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -297,6 +300,9 @@ pub struct Config {
     /// 每个 client 的内存会话上限，0 不限制。
     #[serde(default = "default_max_sessions")]
     pub max_sessions_per_client: usize,
+    /// 未设置 toolApproval 的 profile 使用的工具审批策略；默认 "never"
+    #[serde(default)]
+    pub tool_approval: Option<agent_tools::ToolApproval>,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -632,8 +638,14 @@ impl Config {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
         let registry = agent_tools::ToolRegistry::with_builtins();
+        if let Some(policy) = &self.tool_approval {
+            policy.validate().map_err(anyhow::Error::msg)?;
+        }
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            if let Some(policy) = &profile.tool_approval {
+                policy.validate().map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?;
+            }
             self.validate_profile_accounts(name, profile)?;
             if let Some(deep) = &profile.deep_model {
                 anyhow::ensure!(!deep.trim().is_empty() && deep.strip_prefix("latest:").is_none_or(|p| !p.trim().is_empty()), "profile '{name}': deepModel must be a model id or latest:<prefix>");
@@ -803,6 +815,7 @@ impl Config {
                 account: None,
                 allowed_accounts: None,
                 fallback_accounts: None,
+                tool_approval: None,
             },
         );
         Config {
@@ -837,9 +850,15 @@ impl Config {
             session_idle_ttl_secs: default_session_idle_ttl(),
             chat_session_ttl_secs: default_chat_session_ttl(),
             max_sessions_per_client: default_max_sessions(),
+            tool_approval: None,
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],
         }
+    }
+
+    /// profile 实际使用的工具审批策略：profile.toolApproval > 全局 toolApproval > never。
+    pub fn tool_approval_of(&self, p: &Profile) -> agent_tools::ToolApproval {
+        p.tool_approval.clone().or_else(|| self.tool_approval.clone()).unwrap_or_default()
     }
 
     /// profile 是否允许使用该模型。
@@ -1395,5 +1414,67 @@ mod tests {
         cfg.validate().unwrap();
         assert_eq!(cfg.provider_accounts("openai").keys().map(String::as_str).collect::<Vec<_>>(), ["default", "personal", "proxy", "work"]);
         assert_eq!(cfg.profiles["claude-ci"].account.as_deref(), Some("ci"));
+    }
+
+    #[test]
+    fn tool_approval_parses_inherits_and_validates() {
+        use agent_tools::ToolApproval;
+        let base = serde_json::json!({
+            "toolApproval": "always",
+            "profiles": {
+                "inherit": {"workspaceRoots": ["."]},
+                "own": {"workspaceRoots": ["."], "toolApproval": {"default": "ask", "tools": {"read": "allow", "mcp__*": "deny"}, "bash": {"allow": ["git status*"]}, "timeoutSecs": 60, "onTimeout": "deny"}},
+                "off": {"workspaceRoots": ["."], "toolApproval": "never"}
+            },
+            "clients": []
+        });
+        let cfg: Config = serde_json::from_value(base.clone()).unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.tool_approval_of(&cfg.profiles["inherit"]), ToolApproval::Always);
+        assert_eq!(cfg.tool_approval_of(&cfg.profiles["off"]), ToolApproval::Never);
+        assert_eq!(cfg.tool_approval_of(&cfg.profiles["own"]).timeout_secs(), 60);
+        // 不配置 ⇒ never（向后兼容）
+        let fallback = Config::fallback("faux".into(), "t", PathBuf::from("."));
+        assert_eq!(fallback.tool_approval_of(&fallback.profiles["default"]), ToolApproval::Never);
+        for (pointer, value, expected) in [
+            ("/toolApproval", serde_json::json!("sometimes"), "toolApproval: unknown mode 'sometimes'"),
+            ("/profiles/own/toolApproval/timeoutSecs", serde_json::json!(0), "toolApproval.timeoutSecs must be between 1 and 86400"),
+            ("/profiles/own/toolApproval/default", serde_json::json!("maybe"), "unknown variant `maybe`"),
+            ("/profiles/own/toolApproval/onTimeout", serde_json::json!("ask"), "unknown variant `ask`, expected `allow` or `deny`"),
+            ("/profiles/own/toolApproval/tools", serde_json::json!({"rm -rf": "deny"}), "toolApproval.tools: invalid tool name or pattern 'rm -rf'"),
+        ] {
+            let mut invalid = base.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            let error = serde_json::from_value::<Config>(invalid).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        // 代码构造的配置也会被 validate 拒绝，并带上 profile 名
+        let mut cfg = cfg;
+        cfg.profiles.get_mut("own").unwrap().tool_approval = Some(ToolApproval::Rules(agent_tools::approval::ApprovalRules { timeout_secs: 0, ..Default::default() }));
+        assert_eq!(cfg.validate().unwrap_err().to_string(), "profile 'own': toolApproval.timeoutSecs must be between 1 and 86400");
+    }
+
+    #[test]
+    fn readme_tool_approval_example_validates() {
+        let readme = include_str!("../../../README.md");
+        let section = &readme[readme.find("## 工具调用审批").expect("README section")..];
+        let start = section.find("```json\n").unwrap() + "```json\n".len();
+        let json = &section[start..start + section[start..].find("```").unwrap()];
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        for client in &mut cfg.clients {
+            client.token_sha256 = sha256_hex(&client.name);
+        }
+        cfg.validate().unwrap();
+        assert_eq!(cfg.tool_approval_of(&cfg.profiles["careful"]), agent_tools::ToolApproval::Always);
+        let coder = cfg.tool_approval_of(&cfg.profiles["coder"]);
+        let verdict = |tool: &str, args: serde_json::Value| coder.evaluate(tool, &args);
+        assert!(matches!(verdict("bash", serde_json::json!({"command": "git status && cargo test"})), agent_core::Verdict::Allow { .. }));
+        assert!(matches!(verdict("bash", serde_json::json!({"command": "git push --force origin"})), agent_core::Verdict::Deny { .. }));
+        assert!(matches!(verdict("bash", serde_json::json!({"command": "make"})), agent_core::Verdict::Ask { .. }));
+        assert!(matches!(verdict("mcp__github__delete_repo", serde_json::json!({})), agent_core::Verdict::Deny { .. }));
+        assert!(matches!(verdict("read", serde_json::json!({})), agent_core::Verdict::Allow { .. }));
+        // 示例配置里的策略同样有效
+        let example: Config = serde_json::from_str(include_str!("../../../sub-bot.example.json")).unwrap();
+        assert!(example.tool_approval_of(&example.profiles["coder"]).is_active());
     }
 }

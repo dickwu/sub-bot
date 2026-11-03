@@ -41,7 +41,7 @@ pub struct EnvPlan {
     pub set: Vec<(OsString, OsString)>,
 }
 
-fn glob(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob(pattern: &str, name: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();
     if parts.len() == 1 {
         return pattern == name;

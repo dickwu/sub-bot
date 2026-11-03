@@ -5,6 +5,7 @@
 - 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
 - OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
+- 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
 > 状态：v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
@@ -172,7 +173,7 @@ v0.5.0 将运行异常统一为 `IssueEvent`，写入日志目录下的 **`issue
 ```
 
 `ts` 为 Unix 毫秒；severity 为 `warn | error | fatal`。作用域字段和 `tool` 可省略。
-运行侧来源（I2 接入）包括：LLM 错误、工具失败/超时、run timeout / max_turns / token budget、abort、持久化 I/O、广播 lag、关闭时仍有在途工作、429 容量拒绝、调用方工具 callback 失败。核心还接入 webhook 最终投递失败、启动/配置失败、panic，以及本项目 crate 的 WARN/ERROR 日志（跳过 reporter/webhook 自身，防止循环）。
+运行侧来源（I2 接入）包括：LLM 错误、工具失败/超时、工具审批超时（`approval_timeout`）、run timeout / max_turns / token budget、abort、持久化 I/O、广播 lag、关闭时仍有在途工作、429 容量拒绝、调用方工具 callback 失败。核心还接入 webhook 最终投递失败、启动/配置失败、panic，以及本项目 crate 的 WARN/ERROR 日志（跳过 reporter/webhook 自身，防止循环）。
 
 ### 配置
 
@@ -257,6 +258,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "chatTimeoutSecs": 900,                     // /v1/chat 非流式默认等待上限
   "keychainTimeoutSecs": 30,                  // 每次 macOS Keychain 读取的等待上限（>= 1），见「Keychain 读取超时」
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
+  "toolApproval": "never",                    // 可选：未设置 toolApproval 的 profile 使用的工具审批策略，默认 never，见「工具调用审批」
   "profiles": {
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
@@ -273,6 +275,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
+      "toolApproval": "never",                 // 可选：never（默认）| always | {default, tools, bash, timeoutSecs, onTimeout}，见「工具调用审批」
       "maxTurns": 50,
       "deepModel": "claude-fable-5-1",         // 可选：depth=deep 用的模型；anthropic profile 默认固定为 claude-fable-5-1；"latest:claude-fable" 跟随最新版
       "autoRoute": false,                      // 可选：true 时默认 depth=auto（第一次 prompt 前用 routerModel 分类）
@@ -439,7 +442,7 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/health` | 健康检查（无需鉴权） |
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`） |
 | `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`（未知字段返回 400），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?, toolApproval?}`（未知字段返回 400；`toolApproval` 只能收紧 profile 策略），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, pendingApprovals, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
 | `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404 |
 | `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?}`：修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
 | `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
@@ -447,12 +450,14 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史 |
+| `GET /v1/sessions/{id}/approvals` | 等待中的工具调用审批，见「工具调用审批」 |
+| `POST /v1/sessions/{id}/approvals/{callId}` | `{decision: "approve"\|"deny", reason?}` 决定一次审批：200 / 未知 404 / 已决定 409 |
 | `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` 是 `session.profile` / `session.model` 的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
 
 `/v1/chat` 请求体校验（v0.9.2）：
 - 顶层 `profile` / `model` 等价于 `session.profile` / `session.model`（新会话使用；带 `sessionId` 时与 `session` 一样被忽略）。两处都给且值不同 ⇒ 400 `profile given both at top level and in session; put it in session.profile`（`model` 同理）；相同则接受。以前顶层 `profile` 会被静默忽略并落到默认 profile。
-- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
+- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`、`toolApproval`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
 - `session` 对象（以及 `POST /v1/sessions` 请求体）里的未知字段同样返回 400（serde 报 ``unknown field `profiel`, expected one of ...``），拼写错误不再被静默忽略。
 - 顶层 `reasoningEffort` / `depth` / `account` 的语义不变（`account` 顶层优先于 `session.account`）。
 
@@ -485,6 +490,7 @@ SSE 的 `event:` 名称与 pi 一致，依次有：
 - `turn_start`
 - `message_start` / `message_update`（`assistantMessageEvent`：`text_delta`、`toolcall_start/delta/end`、`done`、`error`）/ `message_end`
 - `tool_execution_start` / `tool_execution_end`
+- `approval_required` / `approval_resolved`：工具调用审批（仅在启用 `toolApproval` 时），见「工具调用审批」
 - `turn_end`
 - `agent_end`
 - `agent_settled{aborted}`：本次运行结束的标志
@@ -504,7 +510,7 @@ curl -s localhost:7878/v1/tasks/<id> -H "Authorization: Bearer $BOT_TOKEN"
 - 两个 URL 都未设置时仍能异步执行，只轮询、不投递。密钥文件不可读或 trim 后为空会阻止配置加载；密钥不进入 Debug、任务 JSON 或日志。webhook 日志不得含完整 URL、签名或正文。
 - 任务 JSON 包括 `taskId`, `owner`, `sessionId`, `status`, `createdAt`/`finishedAt`（Unix 毫秒）, `result`, `error`, `delivery`。状态为 `running | succeeded | failed | timeout | aborted`；运行中结果/完成时间为 null。`result` 与同步 chat 响应一致，含 `text`, `messages`，正常结束还含 `usage`, `stopReason`, `error`, `aborted`。超时按 `timeoutSecs` / `chatTimeoutSecs` 取消运行，保留部分文本，任务状态为 `timeout`（轮询本身仍返回 200）。
 - 任务与会话独立保留，完成后 `taskTtlSecs`（默认 3600 秒）由 sweeper 清理，运行中的任务不清理。任务和待投递队列仅在内存中，重启不恢复；关机中不接受新 chat，已有任务取消并收尾。投递不阻塞任务完成，进程退出不保证排空所有 webhook。
-- `webhookEvents` 为 `final`（默认）或 `all`。完成（包括失败/超时/取消）发送 `task.completed`，`data` 为含结果的任务快照。`all` 另发送 `task.progress`：工具结束时 `{taskId,toolName,toolCallId,isError}`，assistant 消息结束时 `{taskId,text}`。每个任务使用一个队列按序投递，最终事件最后发送。`delivery` 是最近一次投递状态：`deliveryId,event,state`（pending/delivered/failed）, `attempts,lastStatus,lastError`；最终事件正文是投递前快照，最新投递状态请轮询。
+- `webhookEvents` 为 `final`（默认）、`progress`、`approval_required`、`issues`、`all`（= final + progress + approval_required）或它们的数组。`approval_required` 投递 `task.approval_required`（见「工具调用审批」）。完成（包括失败/超时/取消）发送 `task.completed`，`data` 为含结果的任务快照。`all` 另发送 `task.progress`：工具结束时 `{taskId,toolName,toolCallId,isError}`，assistant 消息结束时 `{taskId,text}`。每个任务使用一个队列按序投递，最终事件最后发送。`delivery` 是最近一次投递状态：`deliveryId,event,state`（pending/delivered/failed）, `attempts,lastStatus,lastError`；最终事件正文是投递前快照，最新投递状态请轮询。
 
 Webhook 使用 `POST`、`Content-Type: application/json`，正文：
 
@@ -551,7 +557,7 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 
 模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。
 
-支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
+支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`approve`（`{"callId":"...","decision":"approve"|"deny","reason"?}`，见「工具调用审批」）、`get_messages`、`get_state`（含 `model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`、`pendingApprovals`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
 
 ## API key
 
@@ -855,6 +861,89 @@ CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各�
 - 被切走的账号冷却 `providers.<id>.failoverCooldownSecs` 秒（默认 60）：冷却期内新的调用把它排到链尾；所有账号都在冷却时仍按原顺序尝试。
 - 每次切换上报一条 warn issue `account_failover`（details `{from, to, reason: "rate_limit"|"quota", attempt}`，scope.account 更新为新账号），事件流里是一次 `message_retry`（reason `account failover: work -> default (quota)`），客户端应丢弃此前的部分输出。
 
+## 工具调用审批（toolApproval）
+
+每次执行工具之前按策略判定 **allow / ask / deny**：allow 直接执行；deny 不执行，模型收到错误工具结果 `tool call denied by policy: <reason>` 后继续；ask 暂停这次工具调用，发出 `approval_required` 事件，等调用方批准或拒绝（或超时 / abort）。默认 `"never"`，不配置时行为与以前完全相同。
+
+```json
+{
+  "toolApproval": "never",
+  "profiles": {
+    "coder": {
+      "workspaceRoots": ["/home/me/code"],
+      "toolApproval": {
+        "default": "allow",
+        "tools": {"bash": "ask", "write": "ask", "edit": "ask", "mcp__*": "ask", "mcp__github__delete_*": "deny"},
+        "bash": {
+          "allow": ["git status*", "git diff*", "git log*", "ls*", "cargo test*", "cargo build*"],
+          "ask": [],
+          "deny": ["rm -rf /*", "sudo *", "git push --force*"]
+        },
+        "timeoutSecs": 300,
+        "onTimeout": "deny"
+      }
+    },
+    "careful": {"workspaceRoots": ["/home/me/code"], "toolApproval": "always"}
+  },
+  "clients": [{"name": "dev-bot", "tokenSha256": "<sha256>", "profiles": ["coder", "careful"]}]
+}
+```
+
+- **形状**：`"never"`（默认，不审批）| `"always"`（每次工具调用都要审批，超时 300 秒、超时拒绝）| 对象 `{default, tools, bash, timeoutSecs, onTimeout}`。顶层 `toolApproval` 是全局默认，profile 自己的 `toolApproval` 优先（不合并）。
+  - `default`：`allow`（默认）| `ask` | `deny`，没有规则命中时使用。
+  - `tools`：工具名或 glob（`*` 匹配任意字符）→ `allow|ask|deny`。精确名优先，其次是字面字符最多（最具体）的 glob，同样具体时取最严格的动作。以后的 MCP 工具名为 `mcp__<server>__<tool>`，可以写 `mcp__*`、`mcp__github__*`。
+  - `bash`：`{allow, ask, deny}` 命令模式，对 bash 的 `command`（trim 并把连续空白折叠成一个空格后）做 glob 匹配，`*` 匹配任意字符（含空格和 `/`），没有 `*` 时要求完全相等。判定顺序 **deny > ask > allow**：任一片段（或整条命令）命中 deny ⇒ deny；否则命中 ask ⇒ ask；否则**每个片段**都命中 allow ⇒ allow；都不满足 ⇒ 回落到 `tools.bash` / `default`（所以 `"tools": {"bash": "deny"}` + `bash.allow` = “只允许这几条命令”）。
+  - 片段按 shell 控制符切分：`;` `&&` `||` `|` `&` 换行，以及 `` ` `` `$(` `(` `)`（`2>&1`、`>&2`、`&>` 是重定向，不切）。不解析引号，所以 `git commit -m "a; b"` 会被切开、不会命中 allow（宁可多问）。含命令替换（`` ` `` / `$(` / `<(` / `>(`）的命令**永远不会命中 allow**，但 deny/ask 会检查替换里的片段（`echo $(rm -rf ~)` 命中 `rm -rf *`）。重定向是片段的一部分：`echo *` 也会放行 `echo x > file`，请写更窄的模式。
+  - `timeoutSecs`：等待调用方决定的秒数，默认 300，范围 1..=86400；`onTimeout`：`deny`（默认）| `allow`。
+  - 这是防误操作的护栏，不是对抗恶意调用方/模型的沙箱（调用方本身是可信的）。
+- **校验**：配置加载时校验，错误示例：`toolApproval: unknown mode 'sometimes' (expected "never", "always" or an object)`、``toolApproval: unknown field `defualt`, expected one of `default`, `tools`, `bash`, `timeoutSecs`, `onTimeout` ``、`toolApproval.timeoutSecs must be between 1 and 86400`、``unknown variant `ask`, expected `allow` or `deny` ``（onTimeout）、`toolApproval.tools: invalid tool name or pattern 'rm -rf' (...)`、`toolApproval.bash.deny: patterns must not be empty`。
+- **会话级覆盖（只能收紧）**：`POST /v1/sessions` / `/v1/chat` 的 `session` 对象里的 `toolApproval`（同样形状；`rpc` / `run` 使用 profile 策略）与 profile 策略**同时生效、取最严格的判定**（deny > ask > allow），所以会话只能把 `never` 收紧成 `always` 之类，不能放宽 profile 的 ask/deny；超时取两者中较小值，任一层 `onTimeout: deny` 即超时拒绝。原因前缀 `session:` 表示由会话策略触发。非法值 ⇒ 400；放在 `/v1/chat` 顶层 ⇒ 400 提示放进 `"session"`。`GET /v1/profiles` 返回每个 profile 实际生效的 `toolApproval`。
+- **只审批存在的工具**：未知工具照常返回 `Tool <name> not found`；allow 不产生任何事件。
+
+### 事件
+
+```json
+{"type":"approval_required","callId":"call_1","tool":"bash","args":{"command":"git push"},"reason":"tool 'bash' requires approval (tools rule 'bash')","requestedAt":1740000000000,"expiresAt":1740000300000,"timeoutSecs":300}
+{"type":"approval_resolved","callId":"call_1","tool":"bash","decision":"approved","approved":true,"reason":"looks fine","by":"caller","waitMs":5321}
+```
+
+- `args` 是完整的工具参数；时间是 Unix 毫秒。
+- `approval_resolved.decision`：`approved | denied | timeout | cancelled`；`by`：`caller`（调用方决定）| `policy`（策略 deny，没有先发 `approval_required`，`waitMs: 0`）| `timeout` | `abort`；`approved` 表示工具是否会执行（`onTimeout: allow` 时 `decision: timeout, approved: true`）。
+- 给模型的结果：调用方拒绝 ⇒ `tool call denied by user: <reason>`（没给 reason 时为 `no reason given`）；超时拒绝 ⇒ `tool call denied: approval timed out after Ns`；策略拒绝 ⇒ `tool call denied by policy: <reason>`；等待期间 abort ⇒ `aborted while waiting for approval`。被拒绝的调用不执行，也没有 `tool_execution_*` 事件；模型继续下一轮。
+- **并行工具调用**：同一轮里的工具都可并行（如 read / ls / clock / http_fetch / 回调工具）时，每个调用各自独立等待审批，调用方可以按任意顺序决定，先批准的先执行；结果仍按模型给出的顺序返回。批次里只要有顺序执行的工具（内置 `write` / `edit` / `bash`），整批按顺序执行，审批也逐个出现（前一个决定并执行完才发下一个 `approval_required`）。
+- **abort / 删除会话 / runTimeoutSecs / 同步 chat 超时**：正在等待的审批立即以 `cancelled` 结束，运行正常 settle，不会挂起；之后再决定返回 409。
+- 事件出现在会话 SSE（`/v1/sessions/{id}/events`、`/v1/chat` 的 `stream:true`）、RPC stdout 与 `ask --json` 的 NDJSON 中。
+
+### 接口
+
+| 方法和路径 | 说明 |
+|---|---|
+| `GET /v1/sessions/{id}/approvals` | 等待中的审批 `{"approvals":[{callId, tool, args, reason, requestedAt, expiresAt, timeoutSecs}]}`；会话视图（`GET /v1/sessions/{id}`）也带 `pendingApprovals` |
+| `POST /v1/sessions/{id}/approvals/{callId}` | `{"decision":"approve"\|"deny", "reason"?}` ⇒ 200 `{"resolved":true, "callId", "tool", "decision":"approved"\|"denied"}`；未知 callId ⇒ 404 `approval not found`；已决定（含超时、abort）⇒ 409 `approval already resolved`；非 owner / 未知会话 ⇒ 404；请求体非法 ⇒ 400 |
+
+- **同步 `/v1/chat`（非流式）**：请求会一直等到运行结束，期间审批照常挂起。调用方需要另开一个请求批准：用已知 `sessionId` 发 chat 并轮询 `GET /v1/sessions/{id}/approvals`，或改用 `stream:true`（SSE 里有 `approval_required`，会话 ID 在 `X-Session-Id`）/ `async:true`（见下）。注意 chat 的 `timeoutSecs` 仍然计时，超时 abort 会把审批标记为 `cancelled`。
+- **异步任务 webhook**：`webhookEvents` 新增 `approval_required`（`all` 也包含），投递事件名 `task.approval_required`，`data` 为 `{taskId, sessionId, callId, tool, args, reason, requestedAt, expiresAt, timeoutSecs, approvalUrl}`，`approvalUrl` 是上面的 POST 路径。回调目标对象的 `events` 也可写 `task.approval_required`。
+
+### RPC
+
+```
+← {"type":"approval_required","callId":"call_1","tool":"bash","args":{"command":"git push"},...}
+→ {"id":"7","type":"approve","callId":"call_1","decision":"approve","reason":"ok"}
+← {"id":"7","type":"response","command":"approve","success":true,"data":{"resolved":true,"callId":"call_1","tool":"bash"}}
+```
+
+`decision` 为 `approve | deny`；未知或已决定的 callId ⇒ `success:false`，`error` 为 `approval not found` / `approval already resolved`。`get_state` 带 `pendingApprovals`。
+
+### CLI
+
+- `sub-bot ask`：stderr 是终端且能打开 `/dev/tty`、并且没有 `--json` 时，收到 `approval_required` 会在终端打印工具、原因和参数摘要（bash 显示命令原文，其它工具显示 JSON，最多 2000 字符），提示 `Approve? [y/N]`，答复从 `/dev/tty` 读取（`ask -` 从 stdin 读消息时也一样），只有 `y` / `yes` 算批准，然后 POST 决定。`--json` 只原样输出事件，由调用方处理。非交互且没有 `--json` 时在 stderr 提示如何批准，审批保持等待（按服务端 `onTimeout` 超时）。`--auto-approve` / `--auto-deny`（互斥）自动批准 / 拒绝所有 ask（deny 规则仍然生效），适合脚本；与 `--json` 可同时使用。`--async` 模式没有事件流，会在轮询任务时轮询 `GET /v1/sessions/{id}/approvals`，同样按上述方式处理。
+- `sub-bot run`（本地一次性）：交互终端（同上条件，且没有 `--json`）里逐个询问；否则把 ask 当作 deny，在 stderr 打印 `warning: tool <name> requires approval (...); denied because run is non-interactive (use --auto-approve)` 并记 WARN 日志，模型收到 `tool call denied by user: non-interactive run (use --auto-approve)`。`--auto-approve` 自动批准所有 ask。
+
+### 日志与问题上报
+
+- INFO：`approval required`（tool、tool_call_id、reason、timeout_secs）、`approval resolved`（decision、by、approved、wait_ms）、`tool call denied by policy`、HTTP/RPC 的 `approval decision accepted`；DEBUG：`tool call allowed by policy`（reason）与 `approval args`（参数 JSON，截断到 500 字符）。参数原文只在 DEBUG 级别出现。
+- WARN：`approval timed out`，并上报一条 warn issue `approval_timeout`（component `tool`、`tool` 字段、details `{toolCallId, approved}`），沿用 issue 的去重窗口，不会刷屏；不会再生成重复的 `log_warn`。拒绝不算工具失败，不产生 `tool_error`。
+
 ## 工具资源上限
 
 - `bash`：通过 `sh -c` 运行，独立进程组；取消、超时或清理时杀掉整个进程组（含子孙进程）。`timeoutSecs` 默认 120 秒，最多 1800 秒，等待输出管道 EOF 也计入超时。stdout/stderr 各捕获 256 KiB（合计 512 KiB），继续排空超出的输出并报告丢弃字节数；返回文本最多 50,000 字节（另加状态/截断提示）。
@@ -867,4 +956,4 @@ CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各�
 
 - 默认只监听 `127.0.0.1`。如果要跨机器访问，请放在带 TLS 的反向代理后面。
 - 受管 key 目录（Linux `~/.config/sub-bot/keys`）必须是当前用户所有、权限 0700 的真实目录，key 文件为 0600；`sub-bot keys set` 遇到不满足的已有目录会拒绝写入而不是修改权限。
-- `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。
+- `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。需要人工把关时用 `toolApproval`（如 `"tools": {"bash": "ask"}` 加 `bash.allow` 白名单）；它是防误操作的护栏，不是沙箱。

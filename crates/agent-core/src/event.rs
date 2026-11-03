@@ -1,3 +1,4 @@
+use crate::approval::{ApprovalDecision, ApprovedBy};
 use crate::tool::ToolResult;
 use agent_ai::{AssistantEvent, Message, ThinkingLevel, ToolResultMessage};
 use serde::Serialize;
@@ -63,5 +64,25 @@ pub enum AgentEvent {
         tool_name: String,
         result: ToolResult,
         is_error: bool,
+    },
+    /// 工具调用等待审批（toolApproval 判定为 ask）；用 callId 决定。时间为 Unix 毫秒。
+    ApprovalRequired {
+        call_id: String,
+        tool: String,
+        args: Value,
+        reason: String,
+        requested_at: u64,
+        expires_at: u64,
+        timeout_secs: u64,
+    },
+    /// 审批结束（调用方决定 / 策略拒绝 / 超时 / abort）；`approved` 表示工具是否会执行。
+    ApprovalResolved {
+        call_id: String,
+        tool: String,
+        decision: ApprovalDecision,
+        approved: bool,
+        reason: String,
+        by: ApprovedBy,
+        wait_ms: u64,
     },
 }

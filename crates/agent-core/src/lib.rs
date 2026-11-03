@@ -3,15 +3,20 @@
 //! - `event`：AgentEvent（对应 `types.ts` 的 `AgentEvent` 联合类型）
 //! - `agent_loop`：双层循环（对应 `agent-loop.ts::runLoop`）
 //! - `agent`：带状态的 Agent，含 steer/follow-up 队列与 abort（对应 `agent.ts`）
+//! - `approval`：工具调用审批闸门（执行前 allow / ask / deny，ask 时等待调用方决定）
 pub mod agent;
 pub mod agent_loop;
+pub mod approval;
 pub mod event;
 pub mod tool;
 
 pub use agent::{Agent, Disposition};
 pub use agent_loop::{run_loop, BeforeRun, Emit, LoopConfig, Shared};
+pub use approval::{ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovedBy, PendingApproval, ResolveError, Verdict};
 pub use event::AgentEvent;
 pub use tool::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 
+#[cfg(test)]
+mod approval_tests;
 #[cfg(test)]
 mod reliability_tests;

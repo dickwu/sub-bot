@@ -872,6 +872,13 @@ mod tests {
         let cli = Cli::try_parse_from(["sub-bot", "keys", "check", "--provider", "anthropic"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::Keys { command: keys::KeysCmd::Check }));
         assert_eq!(cli.provider.as_deref(), Some("anthropic"));
+        let cli = Cli::try_parse_from(["sub-bot", "--config", "c.json", "keys", "reauth", "--provider", "openai", "--account", "work", "--from-env", "--dry-run", "--json"]).unwrap();
+        let Cmd::Keys { command: keys::KeysCmd::Reauth { account, service, from_env, dry_run, json } } = cli.cmd else { panic!("keys reauth") };
+        assert_eq!((account.as_deref(), service, from_env, dry_run, json), (Some("work"), None, true, true, true));
+        assert_eq!(cli.provider.as_deref(), Some("openai"));
+        let cli = Cli::try_parse_from(["sub-bot", "keys", "reauth", "--service", "my-keys"]).unwrap();
+        let Cmd::Keys { command: keys::KeysCmd::Reauth { account, service, from_env, dry_run, json } } = cli.cmd else { panic!("keys reauth") };
+        assert_eq!((account, service.as_deref(), from_env, dry_run, json), (None, Some("my-keys"), false, false, false));
         assert!(Cli::try_parse_from(["sub-bot", "keys", "set", "--provider", "openai", "extra-positional-key"]).is_err());
     }
 

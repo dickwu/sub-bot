@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
+> 状态：v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
 
 ## Claude (Anthropic)
 
@@ -722,9 +722,11 @@ key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不�
 
 因此**推荐用 key 文件**（不出现在任何进程的环境里），文件放在 `workspaceRoots` 之外。要真正隔离，请让 sub-bot 以单独的系统用户运行，或者把 bash 放进容器/沙箱。
 
-## 密钥存储：macOS Keychain 与 `sub-bot keys`（v0.9.0）
+## 密钥存储：macOS Keychain 与 `sub-bot keys`（v0.9.0；v0.10.3 起经 `/usr/bin/security` 读写）
 
 除了手工维护 key 文件，sub-bot 可以自己保存 key：macOS 上存进登录钥匙串（Keychain，generic password），Linux 上写成权限 0600 的 key 文件。所有 `keys` 子命令都**绝不输出 key**：stdout、stderr、`--json` 和错误信息里只有路径、变量名或 Keychain 的 service/account 名。`keys` 不启动服务、不构造会话，也不创建日志目录（诊断只写 stderr）。
+
+> **从 <= 0.10.2 升级上来的用户**：旧版本创建的 Keychain 条目的 ACL 绑定旧二进制，升级后第一次读取会弹授权对话框（launchd 下无人点击则超时）。在 GUI 终端里执行一次 `sub-bot keys reauth`（或 `sub-bot keys reauth --from-env`，或重新 `sub-bot keys set`），之后再 `launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot`。只需做这一次，见下文「升级与后台运行」。
 
 `--provider` 与 `--config` 是全局参数，放在 `keys` 前后都可以。
 
@@ -739,7 +741,8 @@ sub-bot keys set --provider openai --file /etc/sub-bot/openai.key   # 写到指�
 
 - **TTY 输入**：stdin 是终端时，在 stderr 提示 `Enter OpenAI API key for account 'default' (input hidden): `，关闭回显读取一行（支持退格、Ctrl-U 清空；Ctrl-C 取消，终端设置在任何退出路径上都会恢复）。不依赖 rpassword，直接用 termios。
 - **管道 / 重定向输入**：读取全部 stdin。去掉首尾空白后必须恰好是一段不含空白的文本；多行或中间有空格报 `stdin must contain only the key`，为空报 `no key provided`。两种错误都不回显内容，读入的缓冲区用完即清零。不要把 key 写在命令行参数里（会进 shell 历史和 `ps`），`keys set` 也不接受位置参数。
-- **存储位置**：`--file PATH` > macOS Keychain（service `sub-bot`，account `<provider>/<account>`，已存在则更新）> Linux 受管文件 `~/.config/sub-bot/keys/<provider>-<account>.key`（遵循 `$XDG_CONFIG_HOME`）。
+- **存储位置**：`--file PATH` > macOS Keychain（service `sub-bot`，account `<provider>/<account>`；已存在则先删除再重建，让条目归属 `/usr/bin/security`）> Linux 受管文件 `~/.config/sub-bot/keys/<provider>-<account>.key`（遵循 `$XDG_CONFIG_HOME`）。
+- **macOS 写入方式（v0.10.3）**：通过 Apple 的 `/usr/bin/security` 写入：spawn `security -i`，把 `add-generic-password -U -s sub-bot -a openai/default -l sub-bot -X <key 的 hex>` 写到它的 stdin——key 不出现在任何命令行参数里（`ps` 只能看到 `security -i`），不经 shell。写完立即 `find-generic-password -w` 读回比对，不一致或找不到都报错（`keychain tool failed (...)`）。写入时 service / account 只允许 `[A-Za-z0-9._/@:-]`（受管条目名天然满足；读取不受此限制）。
 - **Linux 文件权限**：受管目录以 **0700** 创建；已存在的目录必须属于当前用户、不是符号链接、group/other 无任何权限，否则拒绝写入并提示 `chmod 700`（不会擅自改权限）。key 文件是 **0600**：先在同目录写一个 0600 临时文件并 `fsync`，再 `rename` 覆盖目标（**原子写**，不会留下写了一半的 key）；目标是符号链接时拒绝覆盖。`--file` 的父目录不存在时同样以 0700 创建。
 - `--service NAME` 只在 macOS 可用（Linux 上报 `--service is only supported on macOS`），且不能和 `--file` 同时使用；`--quiet` 只打印第一行、不打印配置片段；`--account NAME` 默认 `default`，命名账号的片段写成 `accounts.<name>`（见「同一 provider 多账号」）。`keys` 的 `--account` 不读 `SUB_BOT_ACCOUNT`。
 - 成功后打印可直接粘贴的配置片段。macOS：
@@ -777,7 +780,8 @@ Add to your config:
 
 - 命名约定：service 默认 `sub-bot`，account 默认 `<provider>/<account>`（当前即 `openai/default`、`anthropic/default`）。`security find-generic-password -s sub-bot`（不加 `-w`，只看属性）或在“钥匙串访问”里搜索 `sub-bot` 就能看到全部条目。`service` / `account` 给出时不能为空白；不认识的字段会被拒绝。
 - `apiKeyKeychain` 与 `apiKeyFile`（含顶层 `apiKeyFile`）只能设置一个：`providers.openai: set only one of apiKeyFile / apiKeyKeychain`。`faux` 不支持。
-- 读取通过 Security.framework（`security-framework` crate）直接进行，不调用 `security` 命令行：key 不经过子进程管道，ACL 归属也是 sub-bot 本身而不是 `/usr/bin/security`。条目内容同样做 trim 与“只含 key”校验（否则报 `keychain item is not valid UTF-8 or is empty (...)`）。
+- **读取方式（v0.10.3 起）**：spawn `/usr/bin/security find-generic-password -s <service> -a <account> -w`（绝对路径、不经 shell、stdin 为 /dev/null），stdout 即条目内容，读完即清零；退出码按 `OSStatus & 0xff` 映射（44 ⇒ 未找到、36 ⇒ 不允许交互、51 / 128 ⇒ 拒绝，见下表），stdout 绝不进入错误信息或日志。条目内容同样做 trim 与“只含 key”校验（否则报 `keychain item is not valid UTF-8 or is empty (...)`；`security` 对含不可打印字节的数据输出的 `0x…` hex 形式也视为非法）。v0.10.2 及以前直接用 Security.framework 读写，条目 ACL 因此绑定 sub-bot 二进制的 cdhash——这正是每次 brew upgrade 都要重新授权的原因，见下文。
+- **安全取舍（请知悉）**：`/usr/bin/security` 创建的条目 ACL 为 `identifier "com.apple.security" and anchor apple`、partition `apple-tool:`，也就是说**以同一用户身份运行的任何进程**都能用 `security find-generic-password -s sub-bot -a openai/default -w` 不弹窗地读出 key（与 `gh`、go-keyring 等工具相同）。这和一个 0600 的 `apiKeyFile` 的保护强度相当（同用户可读、其它用户不可读、钥匙串锁定时不可读），但**不再**享受“只有 sub-bot 这个二进制能读”的 per-app ACL。如果你需要后者，请改用 `apiKeyFile`（或 `keys set --file`）并配合更严格的控制（专用用户、文件系统权限、FileVault）；或者自己用“钥匙串访问”创建条目并只信任 sub-bot——代价是每次升级后都要重新授权。
 - 配置声明的条目不存在会直接报 `keychain item not found (service=..., account=...)` 并启动失败，**不会**悄悄回落到 `OPENAI_API_KEY` 或受管存储。
 - 非 macOS 构建里配置 `apiKeyKeychain`，加载配置时就会报错：``providers.openai: apiKeyKeychain is only supported on macOS (this build targets linux); use apiKeyFile or `sub-bot keys set` (writes a 0600 key file)``。
 - **Linux 不支持 libsecret / Secret Service**：它需要 glib/dbus 动态链接，与 musl 静态发布冲突，而且无头服务器通常没有 Secret Service 守护进程。Linux 上请用 `sub-bot keys set` 生成的 0600 key 文件。
@@ -789,6 +793,7 @@ sub-bot --config sub-bot.json keys list               # --json 输出 JSON；--p
 sub-bot keys delete --provider openai                 # macOS 删 Keychain 条目，Linux 删受管文件
 sub-bot keys delete --provider openai --file k.key    # 删指定文件
 sub-bot --config sub-bot.json keys check              # 按配置实际加载一次 key（触发 Keychain 授权）
+sub-bot --config sub-bot.json keys reauth             # macOS：一次性迁移 <= 0.10.2 创建的 Keychain 条目，见「升级与后台运行」
 ```
 
 **`list`** 汇总这些来源：`--openai-key-file` / `--anthropic-key-file`、`*_API_KEY_FILE`、配置里每个账号声明的 `apiKeyFile` / `apiKeyKeychain` / `apiKeyEnv`（含 `accounts.*`）、`*_API_KEY`，以及受管存储里发现的条目（Keychain service `sub-bot` 下形如 `<provider>/<account>` 的条目，或受管目录里的 `<provider>-<account>.key`）。判断状态时**不读取 key**：文件只看 metadata（`present (mode 0600)` / `missing` / `unreadable`），Keychain 只做属性搜索（`present` / `missing`；非 macOS 为 `unsupported`），环境变量只看是否设置（`set`）。`list` 只解析配置里与 key 有关的字段，不做完整的配置加载。
@@ -844,9 +849,29 @@ anthropic/default: skipped (not used by this configuration)
 ```
 
 ```text
-anthropic/default: FAILED: keychain access denied (service=sub-bot, account=anthropic/default): approve sub-bot in the Keychain prompt or re-run `sub-bot keys set` after upgrading the binary
+anthropic/default: FAILED: keychain access denied (service=sub-bot, account=anthropic/default): approve sub-bot in the Keychain prompt, or run `sub-bot keys reauth` once to migrate items saved by sub-bot <= 0.10.2 (after that, upgrades need nothing)
 Error: one or more API keys failed to load
 ```
+
+**`reauth`**（仅 macOS；v0.10.3）把旧版本 sub-bot 创建的 Keychain 条目（ACL 绑定旧二进制）重建为 `/usr/bin/security` 拥有的条目，之后 `brew upgrade` 不再需要任何操作。目标是 service `sub-bot`（或 `--service NAME`）下 `<provider>/<account>` 形式的受管条目，加上 `--config` 里每个账号声明的 `apiKeyKeychain` 条目（给了 `--service` 时只保留该 service 的），可用全局 `--provider` 和 `--account NAME` 筛选，去重。每个条目：读取一次（旧条目会弹**一次**授权对话框——输入登录密码并点“始终允许”；受 `keychainTimeoutSecs` 与等待提示保护，不会挂起）→ 删除 → 经 `/usr/bin/security` 重建 → 读回比对。逐条报告，任一失败退出码非零：
+
+```text
+$ sub-bot --config sub-bot.json keys reauth
+openai/default: migrated (keychain service=sub-bot account=openai/default)
+anthropic/default: migrated (keychain service=my-keys account=claude-prod)
+anthropic/ci: not found (keychain service=sub-bot account=anthropic/ci)
+```
+
+```text
+openai/work: FAILED: keychain access denied (service=sub-bot, account=openai/work): approve sub-bot in the Keychain prompt, or run `sub-bot keys reauth` once to migrate items saved by sub-bot <= 0.10.2 (after that, upgrades need nothing) (keychain service=sub-bot account=openai/work)
+Error: 1 keychain item(s) could not be migrated
+```
+
+- `--from-env`：不读旧条目，改从环境变量取 key——默认账号用 `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`，命名账号用配置里的 `apiKeyEnv`（没有则该条目 FAILED，提示用 `keys set --account`）。**零弹窗**，适合 ssh 场景：`OPENAI_API_KEY=... sub-bot keys reauth --from-env --provider openai`（注意 key 会进 shell 历史；或 `read -s OPENAI_API_KEY; export OPENAI_API_KEY`）。输出写成 `openai/default: migrated from env OPENAI_API_KEY (...)`。
+- `--dry-run`：只列出目标与将要做的事（`would migrate from keychain` / `would migrate from env X` / `would fail: env X is not set`），**不读也不改**任何条目。
+- `--json`：输出数组，每项 `{provider, account, service, item, status, source, error?}`，`status` 为 `migrated` / `not found` / `failed` / `would migrate` / `would fail`。
+- 没有目标时打印 `no keychain items to migrate (service=sub-bot)`；非 macOS 打印 `keychain is only supported on macOS; nothing to do here (...)` 并以 0 退出。
+- 日志（stderr，`--log-level debug` 可看细节）记录每个条目的每一步（读取、删除、重建、校验），只含 service/account 名。
 
 ### Keychain 错误码对照
 
@@ -856,18 +881,22 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
 |---|---|---|---|
 | `-25300` | `errSecItemNotFound` | `keychain item not found (service=…, account=…)` | 条目不存在。配置里 `apiKeyKeychain` 指向的条目不存在 ⇒ 启动失败；第 5 级受管存储探测时视为“未命中”，继续报 key not found；`keys delete` 报 `no key stored for …`。用 `sub-bot keys set` 创建，或修正 service/account。 |
 | `-25308` | `errSecInteractionNotAllowed` | `keychain interaction not allowed (…): the login keychain is locked and no UI is available; …` | 登录钥匙串已锁定且当前会话不能弹窗（ssh、无 GUI 的后台进程）。在同一会话先 `security unlock-keychain`，或从 GUI 登录会话 / LaunchAgent 启动。 |
-| `-25293` | `errSecAuthFailed` | ``keychain access denied (…): approve sub-bot in the Keychain prompt or re-run `sub-bot keys set` after upgrading the binary`` | ACL 不信任当前二进制（典型：brew upgrade 之后），或授权失败。见下文“升级后重新授权”。 |
+| `-25293` | `errSecAuthFailed` | ``keychain access denied (…): approve sub-bot in the Keychain prompt, or run `sub-bot keys reauth` once to migrate items saved by sub-bot <= 0.10.2 (after that, upgrades need nothing)`` | 条目由 <= 0.10.2 创建、ACL 不信任当前二进制（典型：brew upgrade 之后），或授权失败。执行一次 `sub-bot keys reauth`，见下文「升级与后台运行」。 |
 | `-128` | `errSecUserCanceled` | 同上（`keychain access denied (…)`） | 在授权弹窗里点了“拒绝”或取消。重新运行并选择“始终允许”。 |
-| 其它 | — | `keychain error <code> (service=…, account=…)` | 用 `security error <code>` 查看含义。 |
-| （超时） | — | `no answer from macOS Keychain within Ns (service=…, account=…): an authorization dialog is probably waiting …` | 读取在 `keychainTimeoutSecs` 内没有返回：多半是授权弹窗在等人点击（brew upgrade 换了二进制），或会话没有 GUI 显示弹窗。见下文「Keychain 读取超时」。 |
+| 其它 | — | `keychain error <code> (service=…, account=…)` | 读/写/删时 `<code>` 是 `/usr/bin/security` 的退出码（= OSStatus & 0xff，例如 1 为参数/用法错误）；属性搜索（`keys list`）时是 OSStatus，可用 `security error <code>` 查看含义。 |
+| — | — | `keychain tool failed (service=…, account=…): <reason>` | `/usr/bin/security` 无法运行（`cannot run /usr/bin/security: …`）、被信号终止、写入的 service/account 含不允许的字符，或写入后读不回（`reported success but the item cannot be found` / `does not read back as the value given`）。reason 只含退出码 / IO 错误 / 名称规则。 |
+| （超时） | — | `no answer from macOS Keychain within Ns (service=…, account=…): an authorization dialog is probably waiting …` | 读取在 `keychainTimeoutSecs` 内没有返回：多半是授权弹窗在等人点击（<= 0.10.2 创建的条目 + brew upgrade 换了二进制），或会话没有 GUI 显示弹窗。见下文「Keychain 读取超时」。 |
 
 ### 首次访问弹窗、升级与后台运行
 
-- **首次 Keychain 访问弹窗**：由 sub-bot 自己 `keys set` 创建的条目，ACL 的“始终允许”列表里就是创建它的这个 sub-bot 二进制，之后同一个二进制读取**不会弹窗**。用“钥匙串访问”或 `security add-generic-password` 创建的条目，sub-bot 第一次读取时会弹出“sub-bot 想要使用钥匙串中的机密信息”：输入登录密码并点 **“始终允许”**，以后不再弹；点“拒绝”得到 `-128`。只做属性搜索的 `keys list` 不读条目内容，不会触发 ACL 弹窗；`keys check` 和服务启动会读取内容。两者都受下文「Keychain 读取超时」保护，不会无限挂起。
-- **brew 升级后 ACL 失效，需要重新授权**：**每次** `brew upgrade` 都会替换 sub-bot 二进制。Homebrew 把每个版本装在不同的 Cellar 路径下，新二进制的路径和签名/hash 都和旧的不同，Keychain 视之为另一个应用，旧二进制创建或授权过的条目，原来的“始终允许”对新二进制不再生效（手动替换二进制同理），因此升级后授权弹窗会再次出现。GUI 会话里会再弹一次授权，而在有人点击之前读取一直阻塞（v0.9.2 起有超时，见下一节）；没有 GUI（ssh、后台进程）时读取失败，报 `keychain access denied (...)`（`-25293`）、`keychain interaction not allowed (...)`（`-25308`），或者等不到回应而超时。升级后、重启服务之前，在**图形界面登录会话的终端**里执行一次：
-  - `sub-bot --config sub-bot.json keys check`，在弹窗里点 **“始终允许 / Always Allow”**（每次升级后点一次即可）；或
-  - `sub-bot keys delete --provider openai && sub-bot keys set --provider openai`，让新二进制重新创建条目（ACL 随之归属新二进制）。
-- **关于 `security add-generic-password -T`**：也可以用 `security add-generic-password -U -s sub-bot -a openai/<account> -T "$(brew --prefix)/bin/sub-bot" -w` 更新条目并把指定路径的程序加入信任列表（`-w` 后面不带值时会交互提示输入密码，**不要**把 key 直接写在命令行上，否则会进 shell 历史和 `ps`）。`-T` 信任的是指定路径上的程序，但 macOS 同时记录该程序当时的代码签名；Homebrew 升级会把它换成签名不同的新二进制，macOS 仍可能再次弹窗，所以这**不是**可靠的修复办法；升级后照样按上一条点一次“始终允许”。
+- **v0.10.3 起 Keychain 访问不再弹窗，升级也无需任何操作**：`keys set` / `keys reauth` 经 `/usr/bin/security` 创建的条目，ACL 信任的是 Apple 的 `security` 工具而不是某个 sub-bot 二进制；之后无论哪个版本的 sub-bot 读取（都是 spawn `/usr/bin/security find-generic-password -w`）都不会弹窗，`brew upgrade` 后只需 `launchctl kickstart -k` 重启服务。安全取舍见上文「配置 `apiKeyKeychain`」一节。
+- **为什么以前每次 brew upgrade 都要重新授权**（<= 0.10.2）：旧版本用 Security.framework（SecItemAdd）在 sub-bot 进程里创建条目，macOS 把创建者记为“可信应用”——但 Homebrew 的二进制只有 ad-hoc / linker 签名，没有稳定的 Team ID，所以 ACL 里存的是该二进制的 **cdhash**（`cdhash H"…"`），partition list 也是 `cdhash:<hash>`。每次升级都是一个新 cdhash，新二进制对 Keychain 来说就是另一个应用：GUI 会话里再弹一次授权（有人点击之前读取一直阻塞，v0.9.2 起有超时），没有 GUI（ssh、launchd 后台进程）时读取失败（`-25293` / `-25308`）或超时。用 `security add-generic-password -T /opt/homebrew/bin/sub-bot` 信任一个稳定路径也**没用**：ACL 存的仍是 cdhash 要求，partition 检查也基于 cdhash。
+- **从 <= 0.10.2 升级后的一次性迁移**：旧条目的 ACL 还绑着旧二进制，0.10.3 第一次读它仍会弹一次窗（或在 launchd 下超时）。在**这台 Mac 的图形界面终端**里（不是 ssh）执行一次，三选一：
+  - `sub-bot --config sub-bot.json keys reauth`：逐条读取旧条目（每条弹一次窗，输入登录密码并点 **“始终允许 / Always Allow”**）、删除并重建。带上服务用的 `--config`，这样配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）也会被迁移；`keys reauth --dry-run` 先看会动哪些条目。
+  - `sub-bot keys reauth --from-env --provider openai`（`OPENAI_API_KEY` 已 export）：不读旧条目，零弹窗，ssh 下也能做。
+  - `sub-bot keys set --provider openai`：重新输入 key，效果相同（新条目同样归属 `/usr/bin/security`）。
+  然后重启后台服务：`launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot`。之后的升级不再需要这一步。
+- **用“钥匙串访问”或旧版 `security add-generic-password -T …` 自己创建的条目**：如果 ACL 信任列表里没有 `/usr/bin/security`（`security` 工具自己创建的条目默认信任它），0.10.3 读取时会弹一次“security 想要使用钥匙串中的机密信息”，点“始终允许”即可，以后不再弹；或直接 `keys reauth` 重建。只做属性搜索的 `keys list` 不读条目内容，从不弹窗；`keys check`、`keys reauth` 和服务启动会读取内容，都受下文「Keychain 读取超时」保护，不会无限挂起。
 - **ssh 会话下钥匙串锁定**：ssh 登录不会解锁登录钥匙串，也无法弹窗，读取返回 `-25308`。在同一个 ssh 会话里先解锁再运行：
 
   ```bash
@@ -875,7 +904,7 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
   sub-bot --config sub-bot.json keys check
   ```
 
-  解锁不会给新二进制授权：如果条目 ACL 不信任当前二进制（例如刚升级），ssh 下仍会失败，需要按上一条在 GUI 会话里授权一次。
+  解锁不会给旧条目授权：如果条目是 <= 0.10.2 创建的（ACL 不信任 `/usr/bin/security`），ssh 下仍会失败——用 `keys reauth --from-env`（零弹窗）或在 GUI 会话里做一次 `keys reauth`。
 - **LaunchAgent（可用）vs LaunchDaemon（不可用）**：要让后台常驻的 `sub-bot serve` 使用 Keychain，请用 **LaunchAgent**：plist 放在 `~/Library/LaunchAgents/`，以登录用户身份在其会话中运行，能访问该用户（已解锁的）登录钥匙串，示例 plist 与加载方式见下文「LaunchAgent 示例与 brew upgrade 之后」。**LaunchDaemon**（`/Library/LaunchDaemons/`，系统级、通常以 root 运行、不属于任何用户登录会话）没有登录钥匙串可用，Keychain 来源会失败——这种部署请改用 `apiKeyFile` 或 `keys set --file` 写出的 0600 key 文件。Homebrew tap 的 formula 没有提供服务定义，launchd plist 需要自己编写（可参考下文示例）。
 - **无头部署（ssh、LaunchDaemon、没有人看屏幕的机器）**：推荐直接用 `apiKeyFile`（或 `keys set --file` 写出的 0600 key 文件），完全绕开 Keychain 授权弹窗。
 - **启动失败即退出**：Keychain 读取只发生在启动阶段（不做运行期懒加载，避免服务运行中突然弹窗或挂起）。失败时 sub-bot 直接退出并上报 `startup_failed` issue，消息为上表中的 Keychain 错误文本（只含 service/account 名，不含 key）。同样，`provider ... is not configured`、`... API key not found for account ...`、`account '...' is not configured for provider ...` 这类 key 配置错误（只含 provider / 账号 / 环境变量名 / 配置路径）会原样显示，issue details 为 `{"reason": "key_config"}`；key 文件读取失败等其它错误只显示通用的 `service initialization failed (check provider and key configuration)`。部署 LaunchAgent 前先在 GUI 终端里跑一次 `sub-bot keys check`。
@@ -943,33 +972,38 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
   launchctl bootout gui/$(id -u)/com.dickwu.sub-bot  # 卸载（修改 plist 后先 bootout 再 bootstrap）
   ```
 
-**brew upgrade 之后**（每次升级都要做）：
+**brew upgrade 之后**（v0.10.3 起）：
+
+```bash
+launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot
+```
+
+`brew upgrade` 只替换磁盘上的二进制，**不会重启服务**：在 `kickstart` 之前老进程继续用旧二进制运行（新版本的修复都还没生效）；`-k` 先结束正在运行的实例再重新启动。Keychain 条目由 `/usr/bin/security` 拥有，新二进制读取不弹窗、不需要重新授权。
+
+**只在从 <= 0.10.2 升级到 0.10.3+ 时做一次**（旧条目的 ACL 还绑着旧二进制）：
 
 1. 在**这台 Mac 的图形界面终端**里（不是 ssh）执行：
 
    ```bash
-   sub-bot keys check --provider anthropic
-   sub-bot keys check --provider openai
+   sub-bot --config /Users/you/.config/sub-bot/sub-bot.json keys reauth
    ```
 
-   出现 Keychain 授权对话框时点 **「始终允许」（Always Allow）**。每个 Keychain 条目单独授权（每个 provider / 账号一条），逐个点完。服务用了 `--config` 时（上面的 plist 就是），建议加上同样的参数——`sub-bot --config /Users/you/.config/sub-bot/sub-bot.json keys check --provider anthropic`——这样检查的正是服务启动时会读取的条目（命名账号、自定义 `apiKeyKeychain` service）；不带 `--config` 时按默认配置判断，服务实际使用的条目可能显示为 `skipped (not used by this configuration)` 而没有被读取、授权。每个条目输出一行，`<provider>/<account>: ok (…)` 表示新二进制已能读取；`FAILED: …` 见上文错误码对照。
-2. 然后重启后台服务，让它换到新二进制：
+   每个旧条目弹一次授权对话框，输入登录密码并点 **「始终允许」（Always Allow）**；输出 `<provider>/<account>: migrated (…)` 表示该条目已重建。带上服务用的 `--config`，配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）才会一起迁移。不想点窗（或只有 ssh）就用 `sub-bot keys reauth --from-env --provider anthropic`（先 export `ANTHROPIC_API_KEY`），或重新 `sub-bot keys set --provider anthropic`。`FAILED: …` 见上文错误码对照。
+2. 重启后台服务：
 
    ```bash
    launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot
    ```
 
-为什么：
-- `brew upgrade` 只替换磁盘上的二进制，**不会重启服务**。在 `kickstart` 之前，老进程继续用旧二进制运行（新版本的修复都还没生效）；`-k` 先结束正在运行的实例再重新启动。
-- 新二进制对 Keychain 来说是另一个应用（见上文“brew 升级后 ACL 失效”），第一次读取 key 会弹授权对话框。如果跳过第 1 步就让服务重启（`kickstart`、重新登录、重启机器或进程崩溃），后台服务会等待这个没人点击的对话框，`keychainTimeoutSecs`（默认 30 秒）后以 `no answer from macOS Keychain …` 启动失败退出（上报 `startup_failed` issue）；`KeepAlive` 让 launchd 立即再拉起它（两次启动至少间隔 `ThrottleInterval` 10 秒），每次都同样等待、超时、退出——服务陷入重启循环，一直起不来。此时补做第 1 步即可：授权之后下一次自动重启就会成功（也可以再执行一次第 2 步立即重启）。
+如果跳过第 1 步就让服务重启（`kickstart`、重新登录、重启机器或进程崩溃），后台服务会等待一个没人点击的对话框，`keychainTimeoutSecs`（默认 30 秒）后以 `no answer from macOS Keychain …` 启动失败退出（上报 `startup_failed` issue）；`KeepAlive` 让 launchd 立即再拉起它（两次启动至少间隔 `ThrottleInterval` 10 秒），每次都同样等待、超时、退出——服务陷入重启循环。此时补做第 1 步即可：迁移之后下一次自动重启就会成功（也可以再执行一次第 2 步立即重启）。
 
 ### Keychain 读取超时（v0.9.2）
 
-授权弹窗出现时，Security.framework 的读取会一直阻塞到有人点击。v0.9.1 及以前，`serve` 和 `sub-bot keys check` 会因此无限挂起且没有任何日志。v0.9.2 起每次 Keychain 读取都放在独立线程上并限时等待：
+授权弹窗出现时，Keychain 读取（v0.10.3 起是 `/usr/bin/security` 子进程；之前是 Security.framework 调用）会一直阻塞到有人点击。v0.9.1 及以前，`serve` 和 `sub-bot keys check` 会因此无限挂起且没有任何日志。v0.9.2 起每次 Keychain 读取都放在独立线程上并限时等待（v0.10.3 起正常情况下不会再出现弹窗，只有 <= 0.10.2 创建、尚未 `keys reauth` 的条目才会）：
 
-- **超过 1 秒仍未返回**（正常读取远快于此，不会产生噪音）：记一条 WARN 日志 `waiting for macOS Keychain authorization for sub-bot/openai/default — check for a dialog on the Mac's screen; after brew upgrade choose "Always Allow"`（service/account 为实际条目名）；`serve` / `run` / `rpc` 还会上报一个 `keychain_waiting` issue（severity `warn`，details `{service, account}`）。`keys check` / `keys list` 把同一行提示打到 stderr（stdout 只放结果）。
-- **超过 `keychainTimeoutSecs`（全局配置，默认 30，必须 >= 1；`--keychain-timeout-secs` / `SUB_BOT_KEYCHAIN_TIMEOUT_SECS` 覆盖）**：该次读取失败，报 `no answer from macOS Keychain within 30s (service=sub-bot, account=openai/default): an authorization dialog is probably waiting (the sub-bot binary changed, e.g. after `brew upgrade`) or this session has no GUI to show it; click "Always Allow" in the dialog or re-run `sub-bot keys set`, or use apiKeyFile for headless use (ssh / LaunchDaemon)`。处理方式与其它 Keychain 错误相同：启动必需的账号 ⇒ `serve` 退出并在 `startup_failed` issue 里显示这条消息（details `{"reason": "keychain"}`）；可选账号 ⇒ 只有该账号标记为不可用（`account_unavailable` issue），服务照常启动。`keys check` 把该账号报告为 `FAILED: no answer from macOS Keychain ...` 并以非零状态退出；`keys list` 的状态列显示 `unknown (no answer from macOS Keychain ...)`。
-- 超时后被放弃的读取线程可能一直阻塞在 Security.framework 里，直到有人响应弹窗；sub-bot 不等待它，进程退出也不受影响。之后再点“始终允许”不会让本次已失败的启动恢复，重新启动即可。
+- **超过 1 秒仍未返回**（正常读取远快于此，不会产生噪音）：记一条 WARN 日志 ``waiting for macOS Keychain authorization for sub-bot/openai/default — check for a dialog on the Mac's screen and choose "Always Allow"; then run `sub-bot keys reauth` once so later upgrades need no re-authorization``（service/account 为实际条目名）；`serve` / `run` / `rpc` 还会上报一个 `keychain_waiting` issue（severity `warn`，details `{service, account}`）。`keys check` / `keys list` 把同一行提示打到 stderr（stdout 只放结果）。
+- **超过 `keychainTimeoutSecs`（全局配置，默认 30，必须 >= 1；`--keychain-timeout-secs` / `SUB_BOT_KEYCHAIN_TIMEOUT_SECS` 覆盖）**：该次读取失败，报 ``no answer from macOS Keychain within 30s (service=sub-bot, account=openai/default): an authorization dialog is probably waiting (the item was saved by sub-bot <= 0.10.2 and the binary changed, e.g. after `brew upgrade`) or this session has no GUI to show it; click "Always Allow" in the dialog, then run `sub-bot keys reauth` once (or `sub-bot keys reauth --from-env` / `sub-bot keys set`) so later upgrades need nothing, or use apiKeyFile for headless use (ssh / LaunchDaemon)``。处理方式与其它 Keychain 错误相同：启动必需的账号 ⇒ `serve` 退出并在 `startup_failed` issue 里显示这条消息（details `{"reason": "keychain"}`）；可选账号 ⇒ 只有该账号标记为不可用（`account_unavailable` issue），服务照常启动。`keys check` 把该账号报告为 `FAILED: no answer from macOS Keychain ...` 并以非零状态退出；`keys list` 的状态列显示 `unknown (no answer from macOS Keychain ...)`。
+- 超时后被放弃的读取线程（及其 `security` 子进程）可能一直阻塞到有人响应弹窗；sub-bot 不等待它，进程退出也不受影响。之后再点“始终允许”不会让本次已失败的启动恢复，重新启动即可。
 
 ## 同一 provider 多账号（v0.9.0）
 

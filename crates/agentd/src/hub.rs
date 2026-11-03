@@ -1763,7 +1763,7 @@ pub(crate) mod tests {
         assert_eq!(message, timeout.to_string());
         assert!(message.contains("no answer from macOS Keychain within 1s"), "{message}");
         assert_eq!(event.details, serde_json::json!({"reason": "keychain"}));
-        let hint = "waiting for macOS Keychain authorization for sub-bot/anthropic/default — check for a dialog on the Mac's screen; after brew upgrade choose \"Always Allow\"";
+        let hint = "waiting for macOS Keychain authorization for sub-bot/anthropic/default — check for a dialog on the Mac's screen and choose \"Always Allow\"; then run `sub-bot keys reauth` once so later upgrades need no re-authorization";
         let logs = logs.0.lock().unwrap().clone();
         assert_eq!(logs.iter().filter(|l| l.contains(hint)).count(), 1, "{logs:?}");
         reporter.flush(Duration::from_secs(1)).await;

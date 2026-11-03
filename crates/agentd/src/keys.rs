@@ -1,6 +1,7 @@
-//! `sub-bot keys set|list|delete|check`：管理 provider API key 的受管存储。
+//! `sub-bot keys set|list|delete|check|reauth`：管理 provider API key 的受管存储。
 //!
-//! - macOS：Keychain generic password，service `sub-bot`、account `<provider>/<account>`；
+//! - macOS：Keychain generic password，service `sub-bot`、account `<provider>/<account>`（v0.10.3 起经 `/usr/bin/security` 读写，
+//!   brew upgrade 后无需重新授权；`reauth` 一次性迁移旧版本创建的条目）；
 //! - 其它平台（或 `--file`）：0600 key 文件（受管目录 `~/.config/sub-bot/keys`，0700）。
 //!
 //! 约定：任何输出（stdout/stderr/JSON/错误）都只包含来源描述（路径、变量名、service/account 名），绝不包含 key。
@@ -59,6 +60,27 @@ pub enum KeysCmd {
     },
     /// 按当前配置尝试加载每个将被使用的 key（触发 Keychain 授权），只报告成功/失败与来源
     Check,
+    /// 一次性迁移：把旧版本 sub-bot（<= 0.10.2，ACL 绑定旧二进制）创建的 Keychain 条目重建为 /usr/bin/security 拥有的条目，之后 brew upgrade 无需任何操作（仅 macOS）
+    ///
+    /// 目标：service sub-bot（或 --service）下的受管条目 + 配置里的 apiKeyKeychain 条目（--config），可用全局 --provider / --account 筛选。
+    /// 每个条目读取一次（旧条目会弹一次授权对话框，点“始终允许”），删除后重建并读回校验。任一失败 ⇒ 非零退出码。
+    Reauth {
+        /// 只迁移该账号（需配合 --provider 更精确）
+        #[arg(long)]
+        account: Option<String>,
+        /// Keychain service（默认 sub-bot）
+        #[arg(long)]
+        service: Option<String>,
+        /// 不读旧条目，改从环境变量取 key（OPENAI_API_KEY / ANTHROPIC_API_KEY；命名账号用其 apiKeyEnv）：零弹窗
+        #[arg(long)]
+        from_env: bool,
+        /// 只列出目标和将要做的事，不读也不改任何条目
+        #[arg(long)]
+        dry_run: bool,
+        /// 输出 JSON 数组（每项 provider / account / service / item / status / source / error）
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Keychain 读写（生产：系统 Keychain；测试：mock）。
@@ -583,6 +605,217 @@ pub fn check(stores: &Stores<'_>, cfg: &Config, default_provider: &str, filter: 
     Ok(())
 }
 
+/// `keys reauth` 的参数。
+#[derive(Debug, Clone, Default)]
+pub struct ReauthOpts<'a> {
+    /// Keychain service（默认 `sub-bot`）
+    pub service: Option<&'a str>,
+    /// 全局 `--provider` 筛选
+    pub provider: Option<&'a str>,
+    /// `--account` 筛选
+    pub account: Option<&'a str>,
+    pub from_env: bool,
+    pub dry_run: bool,
+    pub json: bool,
+}
+
+/// `keys reauth` 每个条目的结果。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReauthRow {
+    pub provider: String,
+    pub account: String,
+    pub service: String,
+    pub item: String,
+    /// `would migrate` | `migrated` | `not found` | `failed`
+    pub status: String,
+    /// key 从哪里来：`keychain` 或 `env <VAR>`
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 一个待迁移条目。
+#[derive(Debug, Clone)]
+struct ReauthTarget {
+    provider: &'static ProviderKey,
+    account: String,
+    service: String,
+    item: String,
+    /// `--from-env` 时取 key 的变量名（命名账号没有 `apiKeyEnv` 时为 None）
+    env: Option<String>,
+}
+
+/// 收集迁移目标：配置声明的 `apiKeyKeychain` 条目（按 `--service` 筛选）+ 受管 service 下 `<provider>/<account>` 形式的条目；去重。
+fn reauth_targets(stores: &Stores<'_>, cfg: &KeyConfig, opts: &ReauthOpts<'_>) -> anyhow::Result<Vec<ReauthTarget>> {
+    let service = opts.service.unwrap_or(keychain::DEFAULT_SERVICE);
+    let managed = stores.keychain.list(service).map_err(|e| anyhow::anyhow!("cannot list keychain items (service={service}): {e}"))?;
+    tracing::debug!(service, count = managed.len(), "reauth: keychain items found by attribute search");
+    let mut targets: Vec<ReauthTarget> = vec![];
+    let mut push = |t: ReauthTarget| {
+        if !targets.iter().any(|x| x.service == t.service && x.item == t.item) {
+            targets.push(t);
+        }
+    };
+    for pk in PROVIDER_KEYS.iter().filter(|pk| opts.provider.is_none_or(|f| f == pk.provider)) {
+        let wanted = |name: &str| opts.account.is_none_or(|a| a == name);
+        for name in cfg.account_names(pk.provider) {
+            let declared = cfg.declared(pk.provider, &name);
+            let Some((svc, item)) = declared.keychain else { continue };
+            if !wanted(&name) || (opts.service.is_some() && svc != service) {
+                continue;
+            }
+            let env = if name == DEFAULT_ACCOUNT { Some(declared.env.unwrap_or_else(|| pk.env.to_string())) } else { declared.env };
+            push(ReauthTarget { provider: pk, account: name.clone(), service: svc, item, env });
+        }
+        let prefix = format!("{}/", pk.provider);
+        for item in &managed {
+            let Some(name) = item.strip_prefix(&prefix).filter(|n| valid_account_name(n)) else { continue };
+            if !wanted(name) {
+                continue;
+            }
+            let env = if name == DEFAULT_ACCOUNT { Some(pk.env.to_string()) } else { cfg.declared(pk.provider, name).env };
+            push(ReauthTarget { provider: pk, account: name.into(), service: service.into(), item: item.clone(), env });
+        }
+    }
+    Ok(targets)
+}
+
+fn reauth_row(t: &ReauthTarget, from_env: bool, status: &str, error: Option<String>) -> ReauthRow {
+    let source = match (from_env, &t.env) {
+        (false, _) => "keychain".into(),
+        (true, Some(var)) => format!("env {var}"),
+        (true, None) => "env (none)".into(),
+    };
+    ReauthRow { provider: t.provider.provider.into(), account: t.account.clone(), service: t.service.clone(), item: t.item.clone(), status: status.into(), source, error }
+}
+
+/// 迁移一个条目：取 key（旧条目或环境变量）→ 删除 → 重建 → 读回比对。返回 (status, error)。
+fn reauth_one(stores: &Stores<'_>, t: &ReauthTarget, from_env: bool, getenv: &dyn Fn(&str) -> Option<String>) -> (&'static str, Option<String>) {
+    let (service, item) = (t.service.as_str(), t.item.as_str());
+    let label = format!("{}/{}", t.provider.provider, t.account);
+    let key = if from_env {
+        let Some(var) = t.env.as_deref() else {
+            return (
+                "failed",
+                Some(format!(
+                    "no environment variable for account '{}' (named accounts do not use {}); use `sub-bot keys set --provider {} --account {}`",
+                    t.account, t.provider.env, t.provider.provider, t.account
+                )),
+            );
+        };
+        tracing::info!(account = %label, service, item, var, "reauth: taking key from environment");
+        match getenv(var) {
+            Some(text) => {
+                let result = validate_key_text(&text).map_err(|e| match e {
+                    KeyTextError::Empty => format!("env {var} is empty"),
+                    KeyTextError::Whitespace => format!("env {var} must contain only the key"),
+                });
+                wipe_bytes(text.into_bytes());
+                match result {
+                    Ok(key) => key,
+                    Err(e) => return ("failed", Some(e)),
+                }
+            }
+            None => return ("failed", Some(format!("env {var} is not set"))),
+        }
+    } else {
+        tracing::info!(account = %label, service, item, "reauth: reading existing keychain item (a legacy item shows one authorization dialog)");
+        match stores.keychain.get(service, item) {
+            Ok(key) => key,
+            Err(e) if e.is_not_found() => {
+                tracing::info!(account = %label, service, item, "reauth: item not found");
+                return ("not found", None);
+            }
+            Err(e) => {
+                tracing::warn!(account = %label, service, item, error = %e, "reauth: cannot read existing item");
+                return ("failed", Some(e.to_string()));
+            }
+        }
+    };
+    tracing::info!(account = %label, service, item, "reauth: deleting old item");
+    match stores.keychain.delete(service, item) {
+        Ok(()) => {}
+        Err(e) if e.is_not_found() => tracing::debug!(account = %label, service, item, "reauth: nothing to delete"),
+        Err(e) => {
+            tracing::warn!(account = %label, service, item, error = %e, "reauth: delete failed");
+            return ("failed", Some(format!("delete failed: {e}")));
+        }
+    }
+    tracing::info!(account = %label, service, item, "reauth: re-adding item via /usr/bin/security");
+    if let Err(e) = stores.keychain.set(service, item, &key) {
+        tracing::warn!(account = %label, service, item, error = %e, "reauth: re-add failed");
+        return ("failed", Some(format!("re-add failed: {e}")));
+    }
+    tracing::debug!(account = %label, service, item, "reauth: verifying read-back");
+    match stores.keychain.get(service, item) {
+        Ok(back) if back.expose() == key.expose() => {
+            tracing::info!(account = %label, service, item, "reauth: migrated");
+            ("migrated", None)
+        }
+        Ok(_) => ("failed", Some("verification failed: the re-added item does not read back as the value written".into())),
+        Err(e) => ("failed", Some(format!("verification read failed: {e}"))),
+    }
+}
+
+/// `keys reauth`：见 [`KeysCmd::Reauth`]。非 macOS 只打印说明并成功返回。任一条目失败 ⇒ Err。
+pub fn reauth(stores: &Stores<'_>, cfg: &KeyConfig, opts: &ReauthOpts<'_>, getenv: &dyn Fn(&str) -> Option<String>, out: &mut dyn Write) -> anyhow::Result<()> {
+    if let Some(f) = opts.provider {
+        anyhow::ensure!(provider_key(f).is_some(), "unknown provider '{f}' (expected one of: {})", PROVIDER_KEYS.iter().map(|k| k.provider).collect::<Vec<_>>().join(", "));
+    }
+    if let Some(a) = opts.account {
+        anyhow::ensure!(valid_account_name(a), "invalid account name '{a}' (allowed: [A-Za-z0-9_.-]{{1,64}})");
+    }
+    anyhow::ensure!(opts.service.is_none_or(|s| !s.trim().is_empty()), "--service must not be blank");
+    if !stores.macos {
+        let msg = "keychain is only supported on macOS; nothing to do here (keys are stored as 0600 files on this platform and need no re-authorization)";
+        tracing::info!("reauth: {msg}");
+        writeln!(out, "{}", if opts.json { "[]" } else { msg })?;
+        return Ok(());
+    }
+    let targets = reauth_targets(stores, cfg, opts)?;
+    tracing::info!(count = targets.len(), dry_run = opts.dry_run, from_env = opts.from_env, "reauth: targets collected");
+    let mut rows: Vec<ReauthRow> = vec![];
+    for t in &targets {
+        let (status, error) = if opts.dry_run {
+            match (opts.from_env, &t.env) {
+                (true, None) => ("would fail", Some(format!("no environment variable for account '{}'", t.account))),
+                (true, Some(var)) if getenv(var).is_none_or(|v| v.trim().is_empty()) => ("would fail", Some(format!("env {var} is not set"))),
+                _ => ("would migrate", None),
+            }
+        } else {
+            reauth_one(stores, t, opts.from_env, getenv)
+        };
+        rows.push(reauth_row(t, opts.from_env, status, error));
+    }
+    if opts.json {
+        writeln!(out, "{}", serde_json::to_string_pretty(&rows)?)?;
+    } else if rows.is_empty() {
+        writeln!(
+            out,
+            "no keychain items to migrate (service={}{})",
+            opts.service.unwrap_or(keychain::DEFAULT_SERVICE),
+            if cfg.providers.is_empty() { "; pass --config to include apiKeyKeychain entries" } else { "" }
+        )?;
+    } else {
+        for r in &rows {
+            let source = if opts.from_env || opts.dry_run { format!(" from {}", r.source) } else { String::new() };
+            let where_ = format!("keychain service={} account={}", r.service, r.item);
+            match r.status.as_str() {
+                "failed" => writeln!(out, "{}/{}: FAILED: {} ({where_})", r.provider, r.account, r.error.as_deref().unwrap_or("unknown error"))?,
+                "would fail" => writeln!(out, "{}/{}: would fail: {} ({where_})", r.provider, r.account, r.error.as_deref().unwrap_or("unknown error"))?,
+                status => writeln!(out, "{}/{}: {status}{source} ({where_})", r.provider, r.account)?,
+            }
+        }
+        if opts.dry_run {
+            writeln!(out, "(dry run: nothing was read or changed)")?;
+        }
+    }
+    let failed = rows.iter().filter(|r| r.status == "failed").count();
+    anyhow::ensure!(failed == 0, "{failed} keychain item(s) could not be migrated");
+    Ok(())
+}
+
 fn require_provider(cli: &crate::Cli) -> anyhow::Result<&'static ProviderKey> {
     let id = cli.provider.as_deref().ok_or_else(|| anyhow::anyhow!("--provider is required (one of: {})", PROVIDER_KEYS.iter().map(|k| k.provider).collect::<Vec<_>>().join(", ")))?;
     provider_key(id).ok_or_else(|| anyhow::anyhow!("unknown provider '{id}' (expected one of: {})", PROVIDER_KEYS.iter().map(|k| k.provider).collect::<Vec<_>>().join(", ")))
@@ -625,6 +858,13 @@ pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
             let timed = timed_system_store(keychain_timeout(cli, cfg.keychain_timeout_secs)?);
             let stores = Stores { keychain: &timed, ..stores };
             print_rows(&list_rows(&stores, &cfg, cli.provider.as_deref(), files, &getenv), *json, &mut out)
+        }
+        KeysCmd::Reauth { account, service, from_env, dry_run, json } => {
+            let cfg = cli.config.as_deref().map(KeyConfig::read).transpose()?.unwrap_or_default();
+            let timed = timed_system_store(keychain_timeout(cli, cfg.keychain_timeout_secs)?);
+            let stores = Stores { keychain: &timed, ..stores };
+            let opts = ReauthOpts { service: service.as_deref(), provider: cli.provider.as_deref(), account: account.as_deref(), from_env: *from_env, dry_run: *dry_run, json: *json };
+            reauth(&stores, &cfg, &opts, &getenv, &mut out)
         }
         KeysCmd::Check => {
             let mut cfg = match &cli.config {
@@ -1007,5 +1247,245 @@ mod tests {
         let rows = list_rows(&stores, &cfg, Some("openai"), KeyFiles::default(), &|_| None);
         assert_eq!(rows.iter().find(|r| r.account == "default").unwrap().status, "present");
         assert!(hints.lock().unwrap().is_empty());
+    }
+
+    /// `--from-env` 不读旧条目；默认账号用 provider 环境变量，命名账号用 apiKeyEnv。
+    fn reauth_env(vars: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| vars.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+    }
+
+    fn reauth_out(stores: &Stores<'_>, cfg: &KeyConfig, opts: &ReauthOpts<'_>, getenv: &dyn Fn(&str) -> Option<String>) -> (anyhow::Result<()>, String) {
+        output(|o| reauth(stores, cfg, opts, getenv, o))
+    }
+
+    #[test]
+    fn reauth_is_a_no_op_off_macos() {
+        let kc = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-linux-secret"))]);
+        let stores = Stores { macos: false, managed_dir: Some(PathBuf::from("/tmp/x")), keychain: &kc };
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts::default(), &|_| None);
+        r.unwrap();
+        assert_eq!(out, "keychain is only supported on macOS; nothing to do here (keys are stored as 0600 files on this platform and need no re-authorization)\n");
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts { json: true, ..Default::default() }, &|_| None);
+        r.unwrap();
+        assert_eq!(out, "[]\n");
+        // 没有读也没有改
+        assert_eq!(kc.get("sub-bot", "openai/default").unwrap().expose(), "sk-linux-secret");
+    }
+
+    #[test]
+    fn reauth_dry_run_lists_targets_without_reading_or_changing() {
+        let kc = MockKeychain::with([
+            (("sub-bot", "openai/default"), Ok("sk-dry-openai")),
+            (("sub-bot", "openai/work"), Ok("sk-dry-work")),
+            (("sub-bot", "anthropic/default"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "anthropic/default".into() })),
+            (("sub-bot", "junk"), Ok("sk-dry-junk")),
+            (("my-keys", "claude-prod"), Ok("sk-dry-prod")),
+        ]);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &kc };
+        let cfg: KeyConfig = serde_json::from_value(serde_json::json!({"providers": {
+            "anthropic": {"apiKeyKeychain": {"service": "my-keys", "account": "claude-prod"}, "accounts": {"ci": {"apiKeyKeychain": {}}}},
+            "openai": {"apiKeyKeychain": {}}
+        }}))
+        .unwrap();
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { dry_run: true, ..Default::default() }, &|_| None);
+        r.unwrap();
+        assert_eq!(
+            out,
+            "openai/default: would migrate from keychain (keychain service=sub-bot account=openai/default)\n\
+             openai/work: would migrate from keychain (keychain service=sub-bot account=openai/work)\n\
+             anthropic/default: would migrate from keychain (keychain service=my-keys account=claude-prod)\n\
+             anthropic/ci: would migrate from keychain (keychain service=sub-bot account=anthropic/ci)\n\
+             anthropic/default: would migrate from keychain (keychain service=sub-bot account=anthropic/default)\n\
+             (dry run: nothing was read or changed)\n"
+        );
+        assert!(!out.contains("sk-dry"), "{out}");
+        // 条目原样（Denied 的仍是 Denied，没有被读取/重建）
+        let items = kc.items.lock().unwrap().clone();
+        assert_eq!(items.len(), 5);
+        assert!(matches!(items[&("sub-bot".to_string(), "anthropic/default".to_string())], Err(KeychainError::Denied { .. })));
+        // --from-env 的 dry-run 只看变量是否设置
+        let env = reauth_env(&[("OPENAI_API_KEY", "sk-dry-env")]);
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { dry_run: true, from_env: true, json: true, ..Default::default() }, &env);
+        r.unwrap();
+        let rows: Vec<ReauthRow> = serde_json::from_str(&out).unwrap();
+        let summary: Vec<_> = rows.iter().map(|r| (r.account.as_str(), r.status.as_str(), r.source.as_str(), r.error.as_deref())).collect();
+        assert_eq!(
+            summary,
+            [
+                ("default", "would migrate", "env OPENAI_API_KEY", None),
+                ("work", "would fail", "env (none)", Some("no environment variable for account 'work'")),
+                ("default", "would fail", "env ANTHROPIC_API_KEY", Some("env ANTHROPIC_API_KEY is not set")),
+                ("ci", "would fail", "env (none)", Some("no environment variable for account 'ci'")),
+                ("default", "would fail", "env ANTHROPIC_API_KEY", Some("env ANTHROPIC_API_KEY is not set")),
+            ]
+        );
+        assert!(!out.contains("sk-dry"), "{out}");
+        assert_eq!(rows[2].item, "claude-prod");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap()[0]["inConfig"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn reauth_migrates_items_and_reports_not_found_and_failures() {
+        let kc = MockKeychain::with([
+            (("sub-bot", "openai/default"), Ok("sk-mig-openai")),
+            (("sub-bot", "openai/work"), Ok("sk-mig-work\n")),
+            (("sub-bot", "anthropic/default"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "anthropic/default".into() })),
+        ]);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &kc };
+        let cfg: KeyConfig = serde_json::from_value(serde_json::json!({"providers": {"anthropic": {"accounts": {"ci": {"apiKeyKeychain": {}}}}}})).unwrap();
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts::default(), &|_| None);
+        assert_eq!(r.unwrap_err().to_string(), "1 keychain item(s) could not be migrated");
+        assert_eq!(
+            out,
+            "openai/default: migrated (keychain service=sub-bot account=openai/default)\n\
+             openai/work: migrated (keychain service=sub-bot account=openai/work)\n\
+             anthropic/ci: not found (keychain service=sub-bot account=anthropic/ci)\n\
+             anthropic/default: FAILED: keychain access denied (service=sub-bot, account=anthropic/default): approve sub-bot in the Keychain prompt, or run `sub-bot keys reauth` once to migrate items saved by sub-bot <= 0.10.2 (after that, upgrades need nothing) (keychain service=sub-bot account=anthropic/default)\n"
+        );
+        assert!(!out.contains("sk-mig"), "{out}");
+        // 重建后的内容与原来一致（trim 后）；失败的条目未被动过
+        assert_eq!(kc.get("sub-bot", "openai/default").unwrap().expose(), "sk-mig-openai");
+        assert_eq!(kc.items.lock().unwrap()[&("sub-bot".to_string(), "openai/work".to_string())], Ok("sk-mig-work".to_string()));
+        assert!(matches!(kc.get("sub-bot", "anthropic/default"), Err(KeychainError::Denied { .. })));
+        assert!(kc.get("sub-bot", "anthropic/ci").unwrap_err().is_not_found());
+        // 全部成功 ⇒ Ok；--json
+        kc.items.lock().unwrap().remove(&("sub-bot".into(), "anthropic/default".into()));
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts { json: true, ..Default::default() }, &|_| None);
+        r.unwrap();
+        let rows: Vec<ReauthRow> = serde_json::from_str(&out).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.status == "migrated" && r.source == "keychain" && r.error.is_none()), "{rows:?}");
+        assert!(!out.contains("sk-mig"), "{out}");
+        // 其它 Keychain 错误（例如 /usr/bin/security 异常）同样是 FAILED，消息只含 service/account
+        let kc = MockKeychain::with([(
+            ("sub-bot", "openai/default"),
+            Err(KeychainError::Tool { message: "cannot run /usr/bin/security: boom".into(), service: "sub-bot".into(), account: "openai/default".into() }),
+        )]);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &kc };
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts::default(), &|_| None);
+        assert!(r.is_err());
+        assert_eq!(
+            out,
+            "openai/default: FAILED: keychain tool failed (service=sub-bot, account=openai/default): cannot run /usr/bin/security: boom (keychain service=sub-bot account=openai/default)\n"
+        );
+    }
+
+    #[test]
+    fn reauth_from_env_never_reads_old_items() {
+        let kc = MockKeychain::with([
+            (("sub-bot", "openai/default"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "openai/default".into() })),
+            (("sub-bot", "openai/work"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "openai/work".into() })),
+            (("sub-bot", "openai/proxy"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "openai/proxy".into() })),
+            (("sub-bot", "anthropic/default"), Err(KeychainError::Denied { service: "sub-bot".into(), account: "anthropic/default".into() })),
+        ]);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &kc };
+        let cfg: KeyConfig = serde_json::from_value(serde_json::json!({"providers": {"openai": {"accounts": {"proxy": {"apiKeyEnv": "TEST_REAUTH_PROXY"}}}}})).unwrap();
+        let env = reauth_env(&[("OPENAI_API_KEY", " sk-env-openai\n"), ("TEST_REAUTH_PROXY", "sk-env-proxy"), ("ANTHROPIC_API_KEY", "sk-env a b")]);
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { from_env: true, ..Default::default() }, &env);
+        assert_eq!(r.unwrap_err().to_string(), "2 keychain item(s) could not be migrated");
+        assert_eq!(
+            out,
+            "openai/default: migrated from env OPENAI_API_KEY (keychain service=sub-bot account=openai/default)\n\
+             openai/proxy: migrated from env TEST_REAUTH_PROXY (keychain service=sub-bot account=openai/proxy)\n\
+             openai/work: FAILED: no environment variable for account 'work' (named accounts do not use OPENAI_API_KEY); use `sub-bot keys set --provider openai --account work` (keychain service=sub-bot account=openai/work)\n\
+             anthropic/default: FAILED: env ANTHROPIC_API_KEY must contain only the key (keychain service=sub-bot account=anthropic/default)\n"
+        );
+        assert!(!out.contains("sk-env"), "{out}");
+        assert_eq!(kc.get("sub-bot", "openai/default").unwrap().expose(), "sk-env-openai");
+        assert_eq!(kc.get("sub-bot", "openai/proxy").unwrap().expose(), "sk-env-proxy");
+        assert!(matches!(kc.get("sub-bot", "openai/work"), Err(KeychainError::Denied { .. })));
+        assert!(matches!(kc.get("sub-bot", "anthropic/default"), Err(KeychainError::Denied { .. })));
+        // 变量未设置 ⇒ FAILED
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { from_env: true, provider: Some("anthropic"), ..Default::default() }, &|_| None);
+        assert!(r.is_err());
+        assert_eq!(out, "anthropic/default: FAILED: env ANTHROPIC_API_KEY is not set (keychain service=sub-bot account=anthropic/default)\n");
+    }
+
+    #[test]
+    fn reauth_filters_by_provider_account_and_service() {
+        let kc = MockKeychain::with([
+            (("sub-bot", "openai/default"), Ok("sk-f-openai")),
+            (("sub-bot", "openai/work"), Ok("sk-f-work")),
+            (("sub-bot", "anthropic/default"), Ok("sk-f-anthropic")),
+            (("my-keys", "openai/default"), Ok("sk-f-custom")),
+            (("my-keys", "claude-prod"), Ok("sk-f-prod")),
+        ]);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &kc };
+        let cfg: KeyConfig = serde_json::from_value(serde_json::json!({"providers": {"anthropic": {"apiKeyKeychain": {"service": "my-keys", "account": "claude-prod"}}}})).unwrap();
+        let names = |opts: ReauthOpts<'_>| -> Vec<String> {
+            let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { dry_run: true, ..opts }, &|_| None);
+            r.unwrap();
+            out.lines().filter(|l| l.contains("would migrate")).map(|l| l.split(" (").nth(1).unwrap().trim_end_matches(')').to_string()).collect()
+        };
+        assert_eq!(names(ReauthOpts { provider: Some("openai"), ..Default::default() }), ["keychain service=sub-bot account=openai/default", "keychain service=sub-bot account=openai/work"]);
+        assert_eq!(names(ReauthOpts { account: Some("work"), ..Default::default() }), ["keychain service=sub-bot account=openai/work"]);
+        assert_eq!(
+            names(ReauthOpts { provider: Some("anthropic"), account: Some("default"), ..Default::default() }),
+            ["keychain service=my-keys account=claude-prod", "keychain service=sub-bot account=anthropic/default"]
+        );
+        // --service：只看该 service（配置里指向其它 service 的条目不包括）
+        assert_eq!(names(ReauthOpts { service: Some("my-keys"), ..Default::default() }), ["keychain service=my-keys account=openai/default", "keychain service=my-keys account=claude-prod"]);
+        assert_eq!(names(ReauthOpts { service: Some("my-keys"), provider: Some("anthropic"), ..Default::default() }), ["keychain service=my-keys account=claude-prod"]);
+        // 没有目标
+        let (r, out) = reauth_out(&stores, &cfg, &ReauthOpts { provider: Some("openai"), account: Some("nope"), ..Default::default() }, &|_| None);
+        r.unwrap();
+        assert_eq!(out, "no keychain items to migrate (service=sub-bot)\n");
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts { service: Some("empty"), ..Default::default() }, &|_| None);
+        r.unwrap();
+        assert_eq!(out, "no keychain items to migrate (service=empty; pass --config to include apiKeyKeychain entries)\n");
+        // 参数校验
+        assert!(reauth(&stores, &cfg, &ReauthOpts { provider: Some("faux"), ..Default::default() }, &|_| None, &mut Vec::new()).unwrap_err().to_string().contains("unknown provider 'faux'"));
+        assert!(reauth(&stores, &cfg, &ReauthOpts { account: Some("a/b"), ..Default::default() }, &|_| None, &mut Vec::new()).unwrap_err().to_string().contains("invalid account name 'a/b'"));
+        assert_eq!(reauth(&stores, &cfg, &ReauthOpts { service: Some(" "), ..Default::default() }, &|_| None, &mut Vec::new()).unwrap_err().to_string(), "--service must not be blank");
+        // 实际迁移只动筛选到的条目
+        let (r, _) = reauth_out(&stores, &cfg, &ReauthOpts { provider: Some("openai"), account: Some("work"), ..Default::default() }, &|_| None);
+        r.unwrap();
+        assert_eq!(kc.items.lock().unwrap().len(), 5);
+    }
+
+    /// 只有读取（`get`）阻塞的 mock：属性搜索照常返回（真实 Keychain 的 list 不触发 ACL 对话框）。
+    struct SlowGet(MockKeychain, Duration);
+
+    impl KeychainReader for SlowGet {
+        fn get(&self, service: &str, account: &str) -> Result<Secret, KeychainError> {
+            std::thread::sleep(self.1);
+            self.0.get(service, account)
+        }
+    }
+
+    impl KeychainStore for SlowGet {
+        fn set(&self, service: &str, account: &str, secret: &Secret) -> Result<(), KeychainError> {
+            self.0.set(service, account, secret)
+        }
+        fn delete(&self, service: &str, account: &str) -> Result<(), KeychainError> {
+            self.0.delete(service, account)
+        }
+        fn list(&self, service: &str) -> Result<Vec<String>, KeychainError> {
+            self.0.list(service)
+        }
+    }
+
+    /// 旧条目的授权对话框无人响应：读取限时失败（打印等待提示），该条目 FAILED 而不是挂起。
+    #[test]
+    fn reauth_times_out_on_blocked_item_and_prints_hint() {
+        let slow = SlowGet(MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-blocked"))]), Duration::from_secs(30));
+        let (hints, hook) = hint_recorder();
+        let timed = TimedStore::new(Arc::new(slow), Duration::from_secs(1), Duration::from_millis(100), hook);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &timed };
+        let started = std::time::Instant::now();
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts::default(), &|_| None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(r.unwrap_err().to_string(), "1 keychain item(s) could not be migrated");
+        assert!(out.starts_with("openai/default: FAILED: no answer from macOS Keychain within 1s (service=sub-bot, account=openai/default)"), "{out}");
+        assert!(out.contains("sub-bot keys reauth") && !out.contains("sk-blocked"), "{out}");
+        assert_eq!(*hints.lock().unwrap(), [keychain::wait_hint("sub-bot", "openai/default")]);
+        // 列举阶段超时 ⇒ 整体报错（没有逐条输出）
+        let slow = MockKeychain::with([(("sub-bot", "openai/default"), Ok("sk-blocked"))]).delayed(Duration::from_secs(30));
+        let (_, hook) = hint_recorder();
+        let timed = TimedStore::new(Arc::new(slow), Duration::from_secs(1), Duration::from_millis(100), hook);
+        let stores = Stores { macos: true, managed_dir: None, keychain: &timed };
+        let (r, out) = reauth_out(&stores, &KeyConfig::default(), &ReauthOpts::default(), &|_| None);
+        assert!(r.unwrap_err().to_string().starts_with("cannot list keychain items (service=sub-bot): no answer from macOS Keychain within 1s"));
+        assert!(out.is_empty());
     }
 }

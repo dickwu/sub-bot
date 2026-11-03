@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.3] - 2026-11-03
+
+### Fixed
+- **macOS Keychain items asked for authorization after every `brew upgrade`**: `sub-bot keys set` created items through Security.framework (`SecItemAdd`) from the sub-bot binary itself. The Homebrew binary is ad-hoc/linker-signed, so the item ACL trusted only that binary's `cdhash` (and the partition list was `cdhash:<hash>`); every upgrade changed the cdhash, so the new binary triggered an authorization dialog on first read — or, under launchd with nobody to click it, timed out (`no answer from macOS Keychain within 30s …`) and the service sat in a restart loop. Trusting a stable path (`/opt/homebrew/bin/sub-bot`) does not help because both checks are cdhash-based. Keychain items are now read, written and deleted through Apple's `/usr/bin/security` (same approach as `gh` / go-keyring): items created by `security add-generic-password` carry the ACL `identifier "com.apple.security" and anchor apple` with partition `apple-tool:`, and `security find-generic-password -w` reads them without any prompt regardless of which sub-bot build spawns it. `keys set` deletes an existing item first (an in-place update would keep the legacy ACL), then re-adds and verifies by reading back. The secret never appears in a command line: the add goes through `security -i` on stdin as `-X <hex>` (visible in `ps` only as `security -i`); service/account names used for writing are restricted to `[A-Za-z0-9._/@:-]`. Exit codes of the tool are mapped to the same errors as before (`44` → not found, `36` → interaction not allowed, `51` / `128` → denied); the tool's stdout never enters errors or logs. `keys list` still uses a Security.framework attribute search (no data read, no prompt). **One-time migration needed** for items saved by sub-bot <= 0.10.2 — see `keys reauth`.
+
+### Added
+- **`sub-bot keys reauth`** (macOS): migrates Keychain items created by older sub-bot versions (ACL tied to an old binary) to the `/usr/bin/security`-owned form, so later upgrades need nothing. Targets: managed items under service `sub-bot` (or `--service`) plus `apiKeyKeychain` entries of `--config`, filtered by `--provider` / `--account`, deduplicated. Each item is read once (a legacy item shows one dialog — click "Always Allow" / enter the login password; the usual `keychainTimeoutSecs` timeout and waiting hint apply), deleted, re-added and read back. Reports `migrated` / `not found` / `FAILED: <reason>` per item; non-zero exit if any failed. `--from-env` takes the key from `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` (named accounts: their `apiKeyEnv`) instead of reading the old item — zero dialogs. `--dry-run` lists the targets without reading or changing anything; `--json` outputs an array like `keys list`. On Linux it prints that Keychain is macOS-only and exits 0. Output and logs never contain the key.
+- New `KeychainError::Tool` (`keychain tool failed (service=…, account=…): <reason>`) for `/usr/bin/security` not being runnable, a name that cannot be written safely, or an add that reported success but does not read back.
+
+### Changed
+- Keychain error and hint texts now point to `sub-bot keys reauth` (one-time migration) instead of re-running `keys set` after every upgrade; the `keychain error <code>` text may now carry the exit status of `/usr/bin/security` (= OSStatus & 0xff) for read/write/delete, and the OSStatus for attribute searches.
+
+### Tests
+- `strip_thinking_keeps_text_and_tool_calls_and_drops_emptied_messages` no longer fails intermittently (expected messages are cloned from the inputs instead of being rebuilt with a fresh timestamp).
+
+### Docs
+- README: Keychain section rewritten — since 0.10.3 upgrades need no action; one-time `keys reauth` (or `keys reauth --from-env` / `keys set`) after upgrading from <= 0.10.2, then `launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot`; the trade-off (any process running as the same user can read the item with `security find-generic-password -w` without a prompt, comparable to a 0600 `apiKeyFile`) and how to opt out of it.
+
 ## [0.10.2] - 2026-11-03
 
 ### Fixed

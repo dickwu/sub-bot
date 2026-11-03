@@ -434,8 +434,12 @@ mod tests {
         // 文本回合：只剩文本
         let mut text = AssistantMessage::empty("m");
         text.content = vec![thinking(), redacted(), Content::Text { text: "answer".into() }];
+        // 期望值从同一条消息克隆（timestamp 一致；分别构造在毫秒边界上会偶发不等）
+        let mut text_expected = text.clone();
+        text_expected.content = vec![Content::Text { text: "answer".into() }];
         // 工具循环中途：只剩 tool_use，配对的工具结果不受影响
         let Message::Assistant(mut call) = assistant("", &["c1"]) else { unreachable!() };
+        let call_expected = call.clone();
         call.content.insert(0, thinking());
         // 只有 thinking（例如在 thinking 阶段中止）⇒ 变空 ⇒ 丢弃（没有工具调用，不影响配对）
         let mut only = AssistantMessage::failed("m", StopReason::Aborted, "aborted");
@@ -444,9 +448,7 @@ mod tests {
         let failed = AssistantMessage::failed("m", StopReason::Error, "boom");
         let kept = vec![user("q"), Message::Assistant(text), Message::Assistant(call), result("c1", "ok"), Message::Assistant(only), Message::Assistant(failed.clone())];
         let stripped = strip_kept_thinking(&kept);
-        let mut text_expected = AssistantMessage::empty("m");
-        text_expected.content = vec![Content::Text { text: "answer".into() }];
-        assert_eq!(stripped, vec![user("q"), Message::Assistant(text_expected), assistant("", &["c1"]), result("c1", "ok"), Message::Assistant(failed)]);
+        assert_eq!(stripped, vec![user("q"), Message::Assistant(text_expected), Message::Assistant(call_expected), result("c1", "ok"), Message::Assistant(failed)]);
         for m in &stripped {
             if let Message::Assistant(a) = m {
                 assert!(!a.content.iter().any(|c| matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. })));

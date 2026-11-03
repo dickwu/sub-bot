@@ -161,8 +161,8 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `file-mutation-queue.ts`、`truncate.ts` | `mutation_queue.rs` | M1 |
 | `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, grep, find, edit, write, bash`；预设有 `default`、`readonly`（read/ls/grep/find）、`no-shell`（再加 edit/write） | ✅ |
 | `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 cwd 向上查找到 workspaceRoot 为止）、cwd | ✅ |
-| `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_messages`） | ✅ 读写；恢复会话在 M2 |
-| `core/compaction/*` | `agent-compaction` crate | M2 |
+| `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_context` 含压缩）、header `meta` 与 `session_info` 元数据、按 id 查找、崩溃修复；`agentd/src/sessions.rs`：`ContextHooks` 逐条写入、按需恢复、列表/purge | ✅ 读写与恢复；fork/分支切换在 M2 |
+| `core/compaction/*` | `agent-session/src/compaction.rs`（估计、切点、序列化与提示词，纯函数）+ `agentd/src/compaction.rs`（配置、摘要调用）；模型调用前经 `ContextHooks::before_call` 自动压缩，`POST /v1/sessions/{id}/compact` / RPC `compact` 手动压缩 | ✅ |
 | `core/skills.ts`、`extensions/`、`prompt-templates.ts` | `agent-resources` crate（只做 skills 和 prompt templates；扩展改成 MCP 或回调） | M4 |
 | `mcp/`（pi-mcp）、`core/mcp-servers.ts` | `agent-mcp` crate（可以基于 `rmcp`），MCP 工具注册进 `ToolRegistry` | M4 |
 | `modes/rpc/*` | `agentd/src/rpc.rs`：stdio JSONL，命令和响应格式与 `rpc-types.ts` 一致 | ✅ 部分命令 |
@@ -219,7 +219,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 - 顶层配置 `sessionIdleTtlSecs` 默认 3600；无 `sessionId` 的 `/chat` 自动创建临时会话，使用独立的 `chatSessionTtlSecs`（默认 600）。两个字段各自的 0 表示禁用该类过期。
 - 创建、submit、运行完成后更新单调时钟时间；GET/SSE 不刷新。`serve` 启动 sweeper，周期为最短非零 TTL 与 60 秒的较小值，仅清理未运行且超过其 TTL 的会话。`Hub::evict_idle(now)` 可注入时间测试，每次清理记 info 日志。
 - `maxSessionsPerClient` 默认 64，0 不限制，包括普通和临时会话。创建时在同一 map 锁内检查/插入；满额先回收该 client 已过期的空闲会话，仍满返回专用错误（HTTP 429），其它参数错误返回 400。
-- HTTP 提交、删除、清理使用同一个 map 锁，避免删除后旧 handle 再启动运行。DELETE 会取消正在运行的 Agent；清理与删除都保留已有 JSONL，当前不自动恢复旧 ID。
+- HTTP 提交、删除、清理使用同一个 map 锁，避免删除后旧 handle 再启动运行。DELETE 会取消正在运行的 Agent；清理与删除都保留已有 JSONL（`?purge=true` 才删除），之后按旧 ID 访问时从同一 client 的会话目录恢复（README「会话持久化与恢复」）。
 - 临时会话可通过返回的 ID 继续（流式响应使用 `X-Session-Id` 头），续聊刷新计时但不改变 TTL。
 - RPC 只有一个进程生命周期内的会话，无需 delete 命令或 sweeper；关闭 stdin 会 abort 并退出。
 
@@ -343,7 +343,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 | **M0（已完成，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；会话 cwd 与 workspaceRoots 校验；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件，越权 cwd 和工具被拒，401/404 隔离） |
 | **M1：编码能力补齐** | ✅ OpenAI Responses API（v0.3）；✅ `grep`、`find`（内嵌 ripgrep，遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
 | **M1.5：Claude** | `agent-ai/src/anthropic.rs` 接入 Anthropic Messages API；profile 增加 `provider` 字段；Hub 持有多个 provider，按 profile 分派 | 先用离线单测覆盖 SSE 解析和请求体，有 key 后再做端到端测试 |
-| **M2：会话** | 恢复会话（`sessionId` 重开后加载 JSONL）；fork 和分支切换；`compaction`（自动压缩和 `compact` 命令）；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
+| **M2：会话** | ✅ 恢复会话（`sessionId` 重开后加载 JSONL，`run`/`rpc --resume`）；✅ `compaction`（自动压缩和 `compact` 命令）；fork 和分支切换；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
 | **M3：安全与治理** | `beforeToolCall` 审批钩子（profile 可设 bash 需要调用方确认，确认通过 SSE/RPC 往返）；bash 命令允许和拒绝规则；每个 bot 的限流和并发上限；审计日志；内建 TLS；keyring | 只读 profile 无法写文件，也无法执行命令；审批流程可用 |
 | **M4：扩展** | MCP 客户端（stdio/HTTP）；skills 和 prompt templates；项目信任（对应 `project-trust.ts`）；调用方工具支持通过 RPC 回填 | 接入一个 MCP server 后能调用其工具 |
 | **M5：分发** | cargo-dist 三平台六个目标；`service install`；按操作系统决定配置目录；安装文档 | 在 Win、mac、Linux 上一键安装并作为服务运行 |

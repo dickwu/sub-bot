@@ -10,8 +10,8 @@ pub mod approval;
 pub mod event;
 pub mod tool;
 
-pub use agent::{Agent, Disposition};
-pub use agent_loop::{run_loop, BeforeRun, Emit, LoopConfig, Shared};
+pub use agent::{Agent, Disposition, ExclusiveGuard};
+pub use agent_loop::{run_loop, BeforeRun, ContextHooks, Emit, LoopConfig, Shared};
 pub use approval::{ApprovalDecision, ApprovalGate, ApprovalPolicy, ApprovedBy, PendingApproval, ResolveError, Verdict};
 pub use event::AgentEvent;
 pub use tool::{AgentTool, ExecutionMode, ToolResult, UpdateSink};

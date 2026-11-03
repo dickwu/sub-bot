@@ -41,10 +41,15 @@ enum Command {
     GetMessages,
     GetState,
     GetAvailableModels,
+    /// 立即压缩上下文（运行中失败）；可选给摘要模型的附加说明
+    Compact {
+        #[serde(default)]
+        instructions: Option<String>,
+    },
 }
 
 fn state(hub: &Hub, session: &SessionHandle) -> Value {
-    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "account": session.account, "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile, "pendingApprovals": session.pending_approvals()});
+    let mut data = json!({"sessionId": session.id, "persisted": session.hooks.path().is_some(), "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "account": session.account, "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile, "pendingApprovals": session.pending_approvals()});
     data.as_object_mut().unwrap().extend(session.effort_fields());
     data
 }
@@ -59,14 +64,25 @@ fn send_response(out: &mpsc::UnboundedSender<Value>, id: Option<Value>, command:
 }
 
 /// stdio 的调用方就是父进程本身，视为可用全部 profile 的本地 client。
-pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
-    run_io(hub, req, tokio::io::stdin(), tokio::io::stdout()).await
+/// `resume`：恢复 `<sessionDir>/stdio/` 下已持久化的会话（会话参数来自记录，`req` 里只有推理强度作为粘性修改生效）。
+pub async fn run(hub: Arc<Hub>, req: SessionRequest, resume: Option<String>) -> anyhow::Result<()> {
+    run_io(hub, req, resume, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-pub(crate) async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
+fn open_session(hub: &Hub, client: &Client, req: SessionRequest, resume: Option<&str>) -> anyhow::Result<Arc<SessionHandle>> {
+    let Some(id) = resume else { return hub.create_session(client, req) };
+    anyhow::ensure!(hub.client_session_dir(&client.name).is_some(), "session persistence is disabled (--no-persist-sessions / persistSessions: false); cannot resume");
+    let session = hub.load_persisted(client, id)?.ok_or_else(|| anyhow::anyhow!("session {id} not found"))?;
+    if let Some(level) = req.reasoning_effort {
+        session.set_reasoning_effort(Some(level));
+    }
+    Ok(session)
+}
+
+pub(crate) async fn run_io(hub: Arc<Hub>, req: SessionRequest, resume: Option<String>, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect(), ..Default::default() };
     let mut output = output;
-    let session = match hub.create_session(&client, req) {
+    let session = match open_session(&hub, &client, req, resume.as_deref()) {
         Ok(session) => session,
         Err(e) => {
             // 会话创建失败（如 AccountNotAllowed）：先给 JSONL 调用方一条 success:false，再以错误退出
@@ -166,6 +182,18 @@ pub(crate) async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl Async
                 continue;
             }
             Ok(Command::GetState) => json!({"success": true, "data": state(&hub, &session)}),
+            Ok(Command::Compact { instructions }) => {
+                let session = session.clone();
+                let out = out_tx.clone();
+                requests.spawn(async move {
+                    let resp = match session.compact(instructions).await {
+                        Ok(report) => json!({"success": true, "data": report}),
+                        Err(e) => json!({"success": false, "error": e.to_string()}),
+                    };
+                    send_response(&out, id, cmd_name, resp);
+                });
+                continue;
+            }
             Ok(Command::GetAvailableModels) => {
                 let hub = hub.clone();
                 let out = out_tx.clone();
@@ -206,7 +234,7 @@ mod tests {
         let (mut input, input_rx) = tokio::io::duplex(64 * 1024);
         let (output_tx, output) = tokio::io::duplex(1024 * 1024);
         let req = SessionRequest { provider: Some("anthropic".into()), model: Some("claude-sonnet-4-6".into()), depth: Some(Depth::Deep), ..Default::default() };
-        let server = tokio::spawn(run_io(hub, req, input_rx, output_tx));
+        let server = tokio::spawn(run_io(hub, req, None, input_rx, output_tx));
         let mut lines = tokio::io::BufReader::new(output).lines();
         let mut call = async |command: Value| -> Value {
             input.write_all(format!("{command}\n").as_bytes()).await.unwrap();
@@ -251,19 +279,80 @@ mod tests {
         let (_input, input_rx) = tokio::io::duplex(1024);
         let (output_tx, output) = tokio::io::duplex(64 * 1024);
         let req = SessionRequest { account: Some("work".into()), ..Default::default() };
-        let err = run_io(hub.clone(), req, input_rx, output_tx).await.unwrap_err();
+        let err = run_io(hub.clone(), req, None, input_rx, output_tx).await.unwrap_err();
         assert!(err.is::<crate::hub::AccountNotAllowed>());
         let mut lines = tokio::io::BufReader::new(output).lines();
         let line: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(line, json!({"type": "response", "command": "start", "success": false, "error": "account 'work' is not allowed in profile 'default' (allowedAccounts)"}));
         let (mut input, input_rx) = tokio::io::duplex(1024);
         let (output_tx, output) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(run_io(hub, SessionRequest::default(), input_rx, output_tx));
+        let server = tokio::spawn(run_io(hub, SessionRequest::default(), None, input_rx, output_tx));
         input.write_all(b"{\"id\":\"1\",\"type\":\"get_state\"}\n").await.unwrap();
         let mut lines = tokio::io::BufReader::new(output).lines();
         let state: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(state["data"]["account"], "default");
         drop(input);
         tokio::time::timeout(std::time::Duration::from_secs(3), server).await.unwrap().unwrap().unwrap();
+    }
+
+    /// 一次 RPC 会话：发送命令，读到对应 response；`wait_settled` 时额外等 agent_settled。
+    async fn rpc_session(hub: Arc<Hub>, resume: Option<String>, commands: Vec<(Value, bool)>) -> Vec<Value> {
+        let (mut input, input_rx) = tokio::io::duplex(64 * 1024);
+        let (output_tx, output) = tokio::io::duplex(1024 * 1024);
+        let server = tokio::spawn(run_io(hub, SessionRequest::default(), resume, input_rx, output_tx));
+        let mut lines = tokio::io::BufReader::new(output).lines();
+        let mut responses = vec![];
+        for (command, wait_settled) in commands {
+            input.write_all(format!("{command}\n").as_bytes()).await.unwrap();
+            let (mut response, mut settled) = (None, !wait_settled);
+            while response.is_none() || !settled {
+                let line: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                if line["type"] == "response" && line["id"] == command["id"] {
+                    response = Some(line);
+                } else if line["type"] == "agent_settled" {
+                    settled = true;
+                }
+            }
+            responses.push(response.unwrap());
+        }
+        drop(input);
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap().unwrap();
+        responses
+    }
+
+    #[tokio::test]
+    async fn compact_command_and_resume_flag() {
+        let dir = crate::sessions_tests::TempDir::new();
+        let (hub, _) = crate::sessions_tests::hub(&dir, |cfg| {
+            cfg.profiles.get_mut("default").unwrap().compaction = Some(crate::compaction::CompactionConfig { enabled: Some(false), keep_recent_tokens: Some(0), ..Default::default() });
+        });
+        let long = "lorem ipsum ".repeat(80);
+        let r = rpc_session(
+            hub.clone(),
+            None,
+            vec![
+                (json!({"id": "1", "type": "prompt", "message": long}), true),
+                (json!({"id": "2", "type": "prompt", "message": long}), true),
+                (json!({"id": "3", "type": "compact", "instructions": "be brief"}), false),
+                (json!({"id": "4", "type": "get_state"}), false),
+            ],
+        )
+        .await;
+        assert_eq!(r[2]["success"], true, "{}", r[2]);
+        assert_eq!(r[2]["data"]["compacted"], true);
+        assert!(r[2]["data"]["firstKeptEntryId"].is_string());
+        assert_eq!(r[3]["data"]["persisted"], true);
+        let id = r[3]["data"]["sessionId"].as_str().unwrap().to_string();
+        // 重启 RPC 进程：--resume 恢复压缩后的上下文
+        let (hub2, _) = crate::sessions_tests::hub(&dir, |_| {});
+        let r = rpc_session(hub2.clone(), Some(id.clone()), vec![(json!({"id": "1", "type": "get_state"}), false), (json!({"id": "2", "type": "get_messages"}), false)]).await;
+        assert_eq!(r[0]["data"]["sessionId"], id.as_str());
+        let messages = r[1]["data"]["messages"].as_array().unwrap();
+        assert_eq!(messages[0], serde_json::to_value(agent_session::compaction::summary_message("SUMMARY-1")).unwrap());
+        // 未知 id ⇒ start 失败
+        let (_input, input_rx) = tokio::io::duplex(1024);
+        let (output_tx, _output) = tokio::io::duplex(64 * 1024);
+        let err = run_io(hub2, SessionRequest::default(), Some(uuid::Uuid::new_v4().to_string()), input_rx, output_tx).await.unwrap_err();
+        assert!(err.to_string().contains("not found"));
     }
 }

@@ -301,7 +301,7 @@ async fn rpc_approve_command_and_state() {
     let hub = Hub::new(config(Some(json!({"tools": {"bash": "ask"}}))), "faux", None, None).unwrap();
     let (mut input, input_rx) = tokio::io::duplex(64 * 1024);
     let (output_tx, output) = tokio::io::duplex(1024 * 1024);
-    let server = tokio::spawn(crate::rpc::run_io(hub, SessionRequest::default(), input_rx, output_tx));
+    let server = tokio::spawn(crate::rpc::run_io(hub, SessionRequest::default(), None, input_rx, output_tx));
     let mut lines = tokio::io::BufReader::new(output).lines();
     let mut send = async |command: Value| input.write_all(format!("{command}\n").as_bytes()).await.unwrap();
     let mut next = async |pred: &dyn Fn(&Value) -> bool| -> Value {

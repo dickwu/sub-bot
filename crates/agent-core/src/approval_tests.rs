@@ -87,6 +87,7 @@ fn agent(calls: Vec<(&'static str, &'static str)>, timeout: Duration, approve_on
         run_timeout: None,
         before_run: None,
         approval: Some(gate.clone()),
+        hooks: None,
     };
     (Agent::new(cfg, vec![]), gate, ran)
 }

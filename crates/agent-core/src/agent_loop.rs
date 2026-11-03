@@ -12,6 +12,17 @@ pub type Queue = Arc<Mutex<VecDeque<Message>>>;
 /// 每次 run 开始前（第一次模型调用之前）调用，参数是本次 run 的初始消息；可用于异步路由模型等。
 pub type BeforeRun = Arc<dyn Fn(Vec<Message>, Emit) -> futures::future::BoxFuture<'static, ()> + Send + Sync>;
 
+/// 会话层对上下文的钩子：逐条持久化与模型调用前的压缩（对应 pi AgentSession 的 session 写入与自动压缩）。
+pub trait ContextHooks: Send + Sync {
+    /// 每条消息加入上下文后同步调用（用户消息、助手消息、工具结果），用于增量持久化。
+    fn on_message(&self, _message: &Message) {}
+    /// 每次模型调用之前调用，参数是当前上下文快照；返回 Some 时用它替换上下文（压缩）。
+    /// 取消时应尽快返回 None；返回 None 表示不修改。
+    fn before_call(&self, _context: Vec<Message>, _emit: Emit, _cancel: CancellationToken) -> futures::future::BoxFuture<'_, Option<Vec<Message>>> {
+        Box::pin(async { None })
+    }
+}
+
 /// 运行期可修改的共享值：每次模型调用时读取快照，修改从下一次调用生效（包括正在进行的 run）。
 pub struct Shared<T>(Arc<Mutex<T>>);
 
@@ -88,6 +99,16 @@ pub struct LoopConfig {
     pub before_run: Option<BeforeRun>,
     /// 工具调用审批；None 表示不审批（全部直接执行）。
     pub approval: Option<Arc<crate::approval::ApprovalGate>>,
+    /// 见 [`ContextHooks`]；None 时不持久化、不压缩。
+    pub hooks: Option<Arc<dyn ContextHooks>>,
+}
+
+/// 把消息加入上下文并通知钩子（持久化）。
+fn push(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, m: &Message) {
+    context.lock().unwrap().push(m.clone());
+    if let Some(hooks) = &cfg.hooks {
+        hooks.on_message(m);
+    }
 }
 
 fn drain(q: &Queue) -> Vec<Message> {
@@ -117,7 +138,7 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             for m in pending.drain(..) {
                 emit(AgentEvent::MessageStart { message: m.clone() });
                 emit(AgentEvent::MessageEnd { message: m.clone() });
-                context.lock().unwrap().push(m.clone());
+                push(context, cfg, &m);
                 new_messages.push(m);
             }
 
@@ -135,7 +156,7 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
                 let m = Message::user_text("[sub-bot] Token budget reached. Do not call any more tools; give your final answer now based on what you have.");
                 emit(AgentEvent::MessageStart { message: m.clone() });
                 emit(AgentEvent::MessageEnd { message: m.clone() });
-                context.lock().unwrap().push(m.clone());
+                push(context, cfg, &m);
                 new_messages.push(m);
                 stream_assistant(context, cfg, cancel.clone(), &emit, false).await
             } else {
@@ -143,7 +164,7 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             };
             used_tokens += assistant.usage.total_tokens;
             let am = Message::Assistant(assistant.clone());
-            context.lock().unwrap().push(am.clone());
+            push(context, cfg, &am);
             new_messages.push(am.clone());
 
             if matches!(assistant.stop_reason, StopReason::Error | StopReason::Aborted) && assistant.tool_calls().is_empty() {
@@ -168,7 +189,7 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
                     let m = Message::ToolResult(r.clone());
                     emit(AgentEvent::MessageStart { message: m.clone() });
                     emit(AgentEvent::MessageEnd { message: m.clone() });
-                    context.lock().unwrap().push(m.clone());
+                    push(context, cfg, &m);
                     new_messages.push(m);
                 }
                 results = msgs;
@@ -193,6 +214,17 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
 }
 
 async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
+    if let Some(hooks) = &cfg.hooks {
+        let snapshot = context.lock().unwrap().clone();
+        let replaced = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            r = hooks.before_call(snapshot, emit.clone(), cancel.clone()) => r,
+        };
+        if let Some(compacted) = replaced {
+            *context.lock().unwrap() = compacted;
+        }
+    }
     let model = cfg.model.get();
     let req = Request {
         model: model.clone(),
@@ -375,6 +407,7 @@ mod tests {
             run_timeout: None,
             before_run: None,
             approval: None,
+            hooks: None,
         };
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
@@ -425,6 +458,7 @@ mod tests {
             run_timeout: None,
             before_run: None,
             approval: None,
+            hooks: None,
         };
         let emit: Emit = Arc::new(|_| {});
         let ctx = Mutex::new(vec![]);
@@ -434,5 +468,64 @@ mod tests {
         assert_eq!(assistants.len(), 4);
         assert_eq!(assistants.last().unwrap().text(), "final");
         assert_eq!(assistants.last().unwrap().stop_reason, StopReason::Stop);
+    }
+
+    /// 记录每次请求的消息条数；第一次调用前把上下文替换为一条摘要消息。
+    struct Hooks {
+        persisted: Mutex<Vec<Message>>,
+        calls: AtomicUsize,
+    }
+    impl ContextHooks for Hooks {
+        fn on_message(&self, m: &Message) {
+            self.persisted.lock().unwrap().push(m.clone());
+        }
+        fn before_call(&self, context: Vec<Message>, _emit: Emit, _cancel: CancellationToken) -> futures::future::BoxFuture<'_, Option<Vec<Message>>> {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            Box::pin(async move { first.then(|| vec![Message::user_text("SUMMARY"), context.last().unwrap().clone()]) })
+        }
+    }
+
+    struct Recording(Mutex<Vec<usize>>);
+    impl Provider for Recording {
+        fn id(&self) -> &str {
+            "recording"
+        }
+        fn stream(&self, req: Request, _c: CancellationToken) -> EventStream {
+            self.0.lock().unwrap().push(req.messages.len());
+            let mut m = AssistantMessage::empty(&req.model);
+            m.content.push(Content::Text { text: "ok".into() });
+            Box::pin(futures::stream::iter(vec![AssistantEvent::Done { message: m }]))
+        }
+    }
+
+    #[tokio::test]
+    async fn hooks_persist_each_message_and_can_replace_context() {
+        let provider = Arc::new(Recording(Mutex::new(vec![])));
+        let hooks = Arc::new(Hooks { persisted: Mutex::new(vec![]), calls: AtomicUsize::new(0) });
+        let cfg = LoopConfig {
+            provider: provider.clone(),
+            model: "m".into(),
+            system_prompt: None,
+            tools: vec![],
+            reasoning: Default::default(),
+            api: Default::default(),
+            steering: Default::default(),
+            follow_up: Default::default(),
+            max_turns: 5,
+            max_tokens: None,
+            llm_max_retries: None,
+            token_budget: None,
+            run_timeout: None,
+            before_run: None,
+            approval: None,
+            hooks: Some(hooks.clone()),
+        };
+        let ctx = Mutex::new(vec![Message::user_text("old 1"), Message::user_text("old 2"), Message::user_text("old 3")]);
+        let new = run_loop(&ctx, vec![Message::user_text("hi")], &cfg, CancellationToken::new(), Arc::new(|_| {})).await;
+        assert_eq!(new.len(), 2);
+        // 压缩后模型只看到 [摘要, hi]
+        assert_eq!(*provider.0.lock().unwrap(), [2]);
+        assert_eq!(ctx.lock().unwrap().len(), 3);
+        assert_eq!(*hooks.persisted.lock().unwrap(), new);
     }
 }

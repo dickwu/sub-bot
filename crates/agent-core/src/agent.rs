@@ -190,4 +190,55 @@ impl Agent {
     pub async fn messages(&self) -> Vec<Message> {
         self.messages.lock().unwrap().clone()
     }
+
+    /// 替换整个上下文（例如手动压缩）。只应在持有 [`ExclusiveGuard`] 时调用，不能与 run 并发。
+    pub fn replace_messages(&self, messages: Vec<Message>) {
+        *self.messages.lock().unwrap() = messages;
+    }
+
+    /// 在没有 run 时独占 Agent（例如手动压缩）：期间 `is_running()` 为 true、提交会排队、`abort()` 取消 guard 的 token。
+    /// 正在运行时返回 None。
+    pub fn try_exclusive(self: &Arc<Self>) -> Option<ExclusiveGuard> {
+        let mut state = self.state.lock().unwrap();
+        if state.cancel.is_some() {
+            return None;
+        }
+        let token = CancellationToken::new();
+        state.cancel = Some(token.clone());
+        Some(ExclusiveGuard { agent: self.clone(), token, released: false })
+    }
+
+    fn release_exclusive(&self) -> Vec<(Message, &'static str)> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.cancel = None;
+        let mut queued: Vec<(Message, &'static str)> = self.config.steering.lock().unwrap_or_else(|e| e.into_inner()).drain(..).map(|m| (m, "steer")).collect();
+        queued.extend(self.config.follow_up.lock().unwrap_or_else(|e| e.into_inner()).drain(..).map(|m| (m, "follow_up")));
+        queued
+    }
+}
+
+/// 见 [`Agent::try_exclusive`]。
+pub struct ExclusiveGuard {
+    agent: Arc<Agent>,
+    pub token: CancellationToken,
+    released: bool,
+}
+
+impl ExclusiveGuard {
+    /// 结束独占；返回期间排队的消息（steer 在前、按提交顺序）及其模式，由调用方重新提交。
+    pub fn release(mut self) -> Vec<(Message, &'static str)> {
+        self.released = true;
+        self.agent.release_exclusive()
+    }
+}
+
+impl Drop for ExclusiveGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            let discarded = self.agent.release_exclusive().len();
+            if discarded > 0 {
+                tracing::warn!(issue = "typed", discarded, "discarded queued messages after an interrupted exclusive operation");
+            }
+        }
+    }
 }

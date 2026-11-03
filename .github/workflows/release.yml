@@ -63,13 +63,13 @@ jobs:
           set -euo pipefail
           for target in ${{ matrix.targets }}; do
             if [[ "${{ matrix.cross }}" == "true" ]]; then
-              cross build --release --locked --target "$target" -p agentd
+              cross build --release --locked --target "$target" -p agentd --bin sub-bot
             else
-              cargo build --release --locked --target "$target" -p agentd
+              cargo build --release --locked --target "$target" -p agentd --bin sub-bot
             fi
             name=sub-bot-${GITHUB_REF_NAME}-$target
             mkdir -p "dist/$name"
-            cp "target/$target/release/sub-bot" sub-bot.example.json README.md DESIGN.md "dist/$name/"
+            cp "target/$target/release/sub-bot" sub-bot.example.json README.md DESIGN.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "dist/$name/"
             (cd dist && tar czf "$name.tar.gz" "$name" && { command -v sha256sum >/dev/null && sha256sum "$name.tar.gz" || shasum -a 256 "$name.tar.gz"; } > "$name.tar.gz.sha256")
           done
       - uses: actions/upload-artifact@v4
@@ -86,6 +86,13 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: release notes
+        shell: bash
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          awk -v v="$v" 'index($0, "## [" v "]") == 1 {f=1; next} f && /^## / {exit} f' CHANGELOG.md > release-notes.md
+          [[ -s release-notes.md ]] || echo "sub-bot ${GITHUB_REF_NAME}" > release-notes.md
       - uses: actions/download-artifact@v4
         with:
           pattern: sub-bot-*
@@ -94,6 +101,7 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           fail_on_unmatched_files: true
+          body_path: release-notes.md
           files: |
             artifacts/*.tar.gz
             artifacts/*.tar.gz.sha256

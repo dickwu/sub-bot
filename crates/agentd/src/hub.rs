@@ -479,6 +479,14 @@ impl SessionHandle {
                     self.dynamic.issue_scope.lock().unwrap().account = Some(account.clone());
                 }
             }
+            AgentEvent::ApprovalResolved { decision: agent_core::ApprovalDecision::Timeout, tool, call_id, approved, .. } => {
+                self.issues.report(
+                    IssueEvent::new(Severity::Warn, "approval_timeout", "tool", "Tool approval timed out")
+                        .scope(self.scope())
+                        .tool(tool)
+                        .details(serde_json::json!({"toolCallId": call_id, "approved": approved})),
+                );
+            }
             AgentEvent::RunOutcome { kind } => self.report_issue(if kind == "task_panic" { Severity::Fatal } else { Severity::Warn }, kind, "runtime", kind, serde_json::json!({})),
             AgentEvent::AgentSettled { aborted: true } => self.report_issue(Severity::Warn, "run_aborted", "runtime", "Run aborted", serde_json::json!({})),
             _ => {}
@@ -514,6 +522,8 @@ pub struct SessionRequest {
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub caller_tools: Vec<CallerToolSpec>,
+    /// 会话级工具审批策略（形状同 profile.toolApproval）；与 profile 策略取最严格的判定，因此只能收紧
+    pub tool_approval: Option<agent_tools::ToolApproval>,
 }
 
 /// 第一次 prompt 之后不能再修改 depth（路由不会重新进行）。
@@ -1180,6 +1190,7 @@ impl Hub {
         dynamic.plan();
         dynamic.apply_effort(requested_effort);
         let hook = dynamic.clone();
+        let approval = crate::approvals::gate(self.config.tool_approval_of(p), req.tool_approval);
         let config = LoopConfig {
             provider,
             model: dynamic.model.clone(),
@@ -1202,8 +1213,9 @@ impl Hub {
             llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
             before_run: Some(Arc::new(move |messages, emit| Box::pin(hook.clone().route_first_run(messages, emit)))),
+            approval,
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -1486,6 +1498,7 @@ impl Hub {
             "api": h.effective_api().map(|a| a.as_str()).unwrap_or_else(|| self.effective_api(&h.agent.config)),
             "isStreaming": h.agent.is_running(),
             "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+            "pendingApprovals": h.pending_approvals(),
         });
         view.as_object_mut().unwrap().extend(h.effort_fields());
         view

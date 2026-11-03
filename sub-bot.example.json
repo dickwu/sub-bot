@@ -81,6 +81,20 @@
           "GITHUB_TOKEN"
         ],
         "allow": []
+      },
+      "toolApproval": {
+        "default": "allow",
+        "tools": {
+          "bash": "ask",
+          "write": "ask",
+          "mcp__*": "ask"
+        },
+        "bash": {
+          "allow": ["git status*", "git diff*", "git log*", "ls*", "cargo test*", "cargo build*"],
+          "deny": ["rm -rf /*", "sudo *"]
+        },
+        "timeoutSecs": 300,
+        "onTimeout": "deny"
       }
     },
     "reviewer": {

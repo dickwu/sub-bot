@@ -11,6 +11,13 @@
 
 ---
 
+## 工具调用审批（toolApproval）
+
+- **运行时**（`agent_core::approval`）：`LoopConfig.approval: Option<Arc<ApprovalGate>>`。`run_one` 在工具 span 内、执行之前调用 `ApprovalGate::check`（只对存在的工具）：`ApprovalPolicy::evaluate(tool, args) -> Verdict{Allow|Ask|Deny}`；Deny 直接返回错误工具结果并发 `approval_resolved{by:policy}`；Ask 把 `(callId → oneshot)` 放进挂起表、发 `approval_required`，`select!` 等待调用方 / `cancel`（abort、runTimeout、删除会话）/ 超时。超时或取消与调用方决定竞争时以“谁从挂起表里取走条目”为准；最近 1024 个已决定 callId 用于区分 409 与 404。并行批次（`join_all`）里每个调用独立等待；顺序批次逐个等待。
+- **策略**（`agent_tools::approval`）：`ToolApproval = Never | Always | Rules{default, tools, bash, timeoutSecs, onTimeout}`，自定义 Deserialize（解析即校验）。工具规则：精确名 > 最具体 glob > default；bash 规则先于工具规则：deny/ask 检查整条命令与每个片段，allow 要求每个片段命中且无命令替换。`ApprovalStack(profile, session)` 取最严格判定，因此会话级策略只能收紧；策略全为 allow 时不创建闸门。
+- **服务侧**（`agentd::approvals`）：profile/全局策略 + `SessionRequest.toolApproval` ⇒ 闸门；`GET/POST /v1/sessions/{id}/approvals[/{callId}]`（handler 通过 `FromRef<AppState> for Arc<Hub>` 取 hub）、RPC `approve`、会话视图/get_state 的 `pendingApprovals`；异步任务另开一个订阅把 `approval_required` 投递为 `task.approval_required` webhook。超时在 `report_event` 里上报 warn issue `approval_timeout`（WARN 日志带 `issue="typed"`，不重复成 `log_warn`）。
+- **CLI**：`ask` 在交互终端（stderr TTY + `/dev/tty`，非 `--json`）里用 `/dev/tty` 询问并 POST 决定，`--auto-approve/--auto-deny`；`--async` 轮询 approvals 列表。`run` 交互时询问，否则 ask ⇒ deny + 警告，`--auto-approve` 例外。
+
 ## v0.8.1 OpenAI 默认模型
 
 - `config::DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"`（全局 `defaultModel` 默认值与 CLI 回退），`DEFAULT_OPENAI_ALLOWED_MODELS = ["gpt-6.1-sol", "gpt-6-astra"]`。

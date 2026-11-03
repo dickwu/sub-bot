@@ -25,6 +25,12 @@ struct AppState {
     hub: Arc<Hub>,
 }
 
+impl axum::extract::FromRef<AppState> for Arc<Hub> {
+    fn from_ref(st: &AppState) -> Self {
+        st.hub.clone()
+    }
+}
+
 pub fn random_token() -> String {
     use rand::Rng;
     let bytes: [u8; 24] = rand::thread_rng().gen();
@@ -98,6 +104,8 @@ fn router(st: AppState) -> Router {
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
         .route("/v1/sessions/{id}/messages", get(messages))
+        .route("/v1/sessions/{id}/approvals", get(crate::approvals::list))
+        .route("/v1/sessions/{id}/approvals/{call_id}", post(crate::approvals::decide))
         .route("/v1/issues", get(issues))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
@@ -209,7 +217,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
                     "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
                         "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
-                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools, "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
             })
         })
         .collect();
@@ -370,7 +378,8 @@ impl WebhookEvents {
             match v.as_str() {
                 "final" => events.push("task.completed".into()),
                 "progress" => events.push("task.progress".into()),
-                "all" => events.extend(["task.completed".into(), "task.progress".into()]),
+                "approval_required" => events.push(crate::approvals::WEBHOOK_EVENT.into()),
+                "all" => events.extend(["task.completed".into(), "task.progress".into(), crate::approvals::WEBHOOK_EVENT.into()]),
                 "issues" => events.push("issues".into()),
                 _ => return Err(bad_request("invalid webhookEvents")),
             }
@@ -420,7 +429,7 @@ struct ChatBody {
 /// `/v1/chat` 文档化的顶层字段（未知字段错误里列出）。
 const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model"];
 /// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"；profile/model/reasoningEffort/depth/account 顶层可用）。
-const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools"];
+const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools", "toolApproval"];
 
 /// 错误信息里展示的字段名：去掉控制字符并截断（只回显键名，不回显任何值）。
 fn field_label(key: &str) -> String {
@@ -484,7 +493,7 @@ fn webhook_targets(c: &Client, callback: Option<&serde_json::Value>, events: &We
                 TargetSpec::Url(url) => (url, None, None),
                 TargetSpec::Full { url, events, min_severity, .. } => (url, events, min_severity),
             };
-            if events.as_ref().is_some_and(|es| es.iter().any(|e| !matches!(e.as_str(), "task.completed" | "task.progress" | "issues"))) {
+            if events.as_ref().is_some_and(|es| es.iter().any(|e| !matches!(e.as_str(), "task.completed" | "task.progress" | "issues" | crate::approvals::WEBHOOK_EVENT))) {
                 return Err(bad_request("invalid target events"));
             }
             let url = crate::config::webhook_url(&value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
@@ -541,6 +550,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
         h.set_request_id(id.0);
     }
     let rx = h.subscribe(); // 先订阅再提交，避免漏事件
+    let approval_rx = b.asynchronous.then(|| h.subscribe());
     let submit_error = || {
         if st.hub.is_shutting_down() {
             (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"})))
@@ -558,6 +568,10 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
                 (target, queue)
             })
             .collect();
+        let approval_queues: Vec<_> = queues.iter().filter(|(t, _)| t.wants(crate::approvals::WEBHOOK_EVENT)).map(|(_, q)| q.clone()).collect();
+        if let (Some(approval_rx), false) = (approval_rx, approval_queues.is_empty()) {
+            crate::approvals::forward_to_webhooks(task.task_id.clone(), h.clone(), approval_rx, approval_queues);
+        }
         let response = (
             StatusCode::ACCEPTED,
             [("location", status_url.clone())],

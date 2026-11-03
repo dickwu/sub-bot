@@ -86,6 +86,8 @@ pub struct LoopConfig {
     pub run_timeout: Option<std::time::Duration>,
     /// 见 [`BeforeRun`]；None 时不调用。
     pub before_run: Option<BeforeRun>,
+    /// 工具调用审批；None 表示不审批（全部直接执行）。
+    pub approval: Option<Arc<crate::approval::ApprovalGate>>,
 }
 
 fn drain(q: &Queue) -> Vec<Message> {
@@ -247,7 +249,20 @@ async fn run_one(call: ToolCall, cfg: &LoopConfig, cancel: CancellationToken, em
     }
     use tracing::Instrument;
     let span = tracing::info_span!("tool", tool = %call.name, tool_call_id = %call.id);
-    run_one_inner(call, cfg, cancel, emit).instrument(span).await
+    async move {
+        // 只审批存在的工具；未知工具照常返回 not found。
+        if let Some(gate) = cfg.approval.as_ref().filter(|_| cfg.tools.iter().any(|t| t.name() == call.name)) {
+            if let Err(text) = gate.check(&call, &cancel, &emit).await {
+                return ToolResult::error(text);
+            }
+            if cancel.is_cancelled() {
+                return ToolResult::error("aborted before execution");
+            }
+        }
+        run_one_inner(call, cfg, cancel, emit).await
+    }
+    .instrument(span)
+    .await
 }
 
 async fn run_one_inner(call: ToolCall, cfg: &LoopConfig, cancel: CancellationToken, emit: Emit) -> ToolResult {
@@ -359,6 +374,7 @@ mod tests {
             token_budget: None,
             run_timeout: None,
             before_run: None,
+            approval: None,
         };
         let events = Arc::new(Mutex::new(vec![]));
         let ev = events.clone();
@@ -408,6 +424,7 @@ mod tests {
             token_budget: Some(250),
             run_timeout: None,
             before_run: None,
+            approval: None,
         };
         let emit: Emit = Arc::new(|_| {});
         let ctx = Mutex::new(vec![]);

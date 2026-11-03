@@ -32,13 +32,19 @@ enum Command {
         message: String,
     },
     Abort,
+    /// 决定一次工具调用审批（事件 `approval_required` 的 callId）
+    Approve {
+        call_id: String,
+        decision: crate::approvals::Decision,
+        reason: Option<String>,
+    },
     GetMessages,
     GetState,
     GetAvailableModels,
 }
 
 fn state(hub: &Hub, session: &SessionHandle) -> Value {
-    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "account": session.account, "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile});
+    let mut data = json!({"sessionId": session.id, "isStreaming": session.agent.is_running(), "provider": session.provider_id(), "account": session.account, "model": session.model(), "api": session.effective_api().map(|a| a.as_str().to_string()).unwrap_or_else(|| hub.effective_api(&session.agent.config).to_string()), "profile": session.profile, "pendingApprovals": session.pending_approvals()});
     data.as_object_mut().unwrap().extend(session.effort_fields());
     data
 }
@@ -57,7 +63,7 @@ pub async fn run(hub: Arc<Hub>, req: SessionRequest) -> anyhow::Result<()> {
     run_io(hub, req, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
-async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
+pub(crate) async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpin, output: impl AsyncWrite + Unpin + Send + 'static) -> anyhow::Result<()> {
     let client = Client { name: "stdio".into(), token_sha256: String::new(), profiles: hub.config.profiles.keys().cloned().collect(), ..Default::default() };
     let mut output = output;
     let session = match hub.create_session(&client, req) {
@@ -146,6 +152,10 @@ async fn run_io(hub: Arc<Hub>, req: SessionRequest, input: impl AsyncRead + Unpi
                 session.agent.abort();
                 json!({"success": true})
             }
+            Ok(Command::Approve { call_id, decision, reason }) => match session.resolve_approval(&call_id, decision, reason) {
+                Ok(p) => json!({"success": true, "data": {"resolved": true, "callId": p.call_id, "tool": p.tool}}),
+                Err(e) => json!({"success": false, "error": e.to_string()}),
+            },
             Ok(Command::GetMessages) => {
                 let session = session.clone();
                 let out = out_tx.clone();

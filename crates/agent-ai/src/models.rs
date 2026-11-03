@@ -161,6 +161,30 @@ fn resolve_effort_inner(provider_id: &str, model: &str, requested: Option<Thinki
     result
 }
 
+/// 未知模型的保守默认上下文窗口（token）。
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+/// 模型的上下文窗口（输入 + 输出，token），用于自动压缩阈值。取保守值；profile 的 `contextWindow` 可覆盖。
+/// - Claude：已列出的 4.x / 5.x 都按 200k（1M 上下文需要 beta 头，这里不假定）；
+/// - gpt-5.x / gpt-6.x：400k；gpt-4.1：1M（按 1,000,000 计）；gpt-4o / o 系列：128k / 200k；
+/// - 其它（含 faux）：128k。
+pub fn context_window(provider_id: &str, model: &str) -> u64 {
+    let m = base(model);
+    if provider_id == "anthropic" || m.starts_with("claude-") {
+        return 200_000;
+    }
+    if m.starts_with("gpt-6") || m.starts_with("gpt-5") {
+        return 400_000;
+    }
+    if m.starts_with("gpt-4.1") {
+        return 1_000_000;
+    }
+    if m.len() > 1 && m.starts_with('o') && m.as_bytes()[1].is_ascii_digit() {
+        return 200_000;
+    }
+    DEFAULT_CONTEXT_WINDOW
+}
+
 /// 去掉日期快照后缀（`-2025-08-07`）。
 fn base(id: &str) -> &str {
     let b = id.as_bytes();
@@ -272,6 +296,17 @@ pub fn model_matches(pattern: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn context_windows_are_conservative() {
+        assert_eq!(context_window("anthropic", "claude-opus-5-5"), 200_000);
+        assert_eq!(context_window("anthropic", "claude-fable-5-1-20260101"), 200_000);
+        assert_eq!(context_window("openai", "gpt-6.1-sol"), 400_000);
+        assert_eq!(context_window("openai", "gpt-5-2025-08-07"), 400_000);
+        assert_eq!(context_window("openai", "gpt-4.1"), 1_000_000);
+        assert_eq!(context_window("openai", "o3"), 200_000);
+        assert_eq!(context_window("faux", "faux"), DEFAULT_CONTEXT_WINDOW);
+    }
+
     #[test]
     fn claude_models_are_chat_models() {
         for id in ["claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219", "claude-opus-4-6"] {

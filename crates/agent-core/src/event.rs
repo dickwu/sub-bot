@@ -1,5 +1,5 @@
 use crate::tool::ToolResult;
-use agent_ai::{AssistantEvent, Message, ThinkingLevel, ToolResultMessage};
+use agent_ai::{AssistantEvent, Message, ThinkingLevel, ToolResultMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -28,6 +28,25 @@ pub enum AgentEvent {
     /// 会话模型路由已确定（创建时或第一次 prompt 时，只发生一次）。
     ModelRouted {
         routing: Value,
+    },
+    /// 上下文压缩：`phase` 为 start / end；`reason` 为 auto（模型调用前超过阈值）/ manual（compact 命令）。
+    /// end 时带压缩后估计、耗时、摘要调用用量；失败时带 `error`（上下文保持不变）。
+    Compaction {
+        reason: String,
+        phase: String,
+        tokens_before: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tokens_after: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        summary_chars: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_kept_entry_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     TurnStart,
     TurnEnd {

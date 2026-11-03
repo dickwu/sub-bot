@@ -12,6 +12,7 @@ compile_error!("sub-bot only supports macOS and Linux");
 
 mod accounts;
 mod ask;
+mod compaction;
 mod config;
 mod http;
 mod hub;
@@ -26,6 +27,9 @@ mod prompt;
 mod routing;
 mod rpc;
 mod server;
+mod sessions;
+#[cfg(test)]
+mod sessions_tests;
 mod store;
 pub mod webhook;
 
@@ -69,9 +73,12 @@ struct Cli {
     /// 数据目录；默认系统数据目录/sub-bot
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
-    /// 会话 JSONL 存放目录（按 client 分子目录）；不填则不持久化
+    /// 会话 JSONL 存放目录（按 client 分子目录）；默认配置 sessionDir 或 <dataDir>/sessions（serve / run / rpc）
     #[arg(long, global = true, env = "SUB_BOT_SESSION_DIR")]
     session_dir: Option<PathBuf>,
+    /// 不持久化会话（同配置 persistSessions: false，优先于 --session-dir）；此时无法 --resume / 重启后恢复
+    #[arg(long, global = true)]
+    no_persist_sessions: bool,
     /// 从文件读取 OpenAI API key（推荐：key 不进入进程环境）。优先级：本参数 > OPENAI_API_KEY_FILE > 配置 apiKeyFile / providers.openai.apiKeyKeychain（macOS Keychain）> OPENAI_API_KEY > 受管存储（`sub-bot keys set` 写入：macOS Keychain sub-bot/openai/default，Linux ~/.config/sub-bot/keys/openai-default.key）
     #[arg(long, global = true)]
     openai_key_file: Option<PathBuf>,
@@ -112,6 +119,9 @@ enum Cmd {
         depth: Option<routing::Depth>,
         #[command(flatten)]
         account: AccountArg,
+        /// 恢复已持久化的会话（<sessionDir>/stdio/ 下的 id），继续写入同一 JSONL
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// 一次性执行一个 prompt，打印最终回复后退出
     Run {
@@ -125,6 +135,10 @@ enum Cmd {
         json: bool,
         #[command(flatten)]
         account: AccountArg,
+        /// 继续已持久化的会话（<sessionDir>/local/ 下的 id）：加载历史，追加写入同一 JSONL。
+        /// 会话的 profile / model / provider / account / depth 来自记录，--reasoning-effort 作为粘性修改生效
+        #[arg(long)]
+        resume: Option<String>,
         prompt: String,
     },
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
@@ -325,6 +339,11 @@ async fn main() -> anyhow::Result<()> {
         return probe::run(&cli, &loaded, args).await;
     }
     install_reporter(&loaded, &cli);
+    // 会话持久化（serve / run / rpc）：--no-persist-sessions > --session-dir > 配置 persistSessions/sessionDir > <dataDir>/sessions
+    let session_dir = match cli.cmd {
+        Cmd::Serve { .. } | Cmd::Run { .. } | Cmd::Rpc { .. } if !cli.no_persist_sessions => cli.session_dir.clone().or_else(|| loaded.sessions_dir()),
+        _ => None,
+    };
     let new_hub = |cfg: config::Config| {
         let provider = cli.provider.clone().or_else(|| cfg.default_provider.clone()).unwrap_or_else(|| "openai".into());
         let mode = if matches!(cli.cmd, Cmd::Serve { .. }) { hub::StoreMode::Persistent } else { hub::StoreMode::Memory };
@@ -332,15 +351,15 @@ async fn main() -> anyhow::Result<()> {
             hub::Hub::with_provider_keys(
                 cfg,
                 &provider,
-                cli.session_dir.clone(),
+                session_dir.clone(),
                 hub::KeyFiles { openai: cli.openai_key_file.as_deref(), anthropic: cli.anthropic_key_file.as_deref() },
                 issues::global().expect("installed reporter"),
                 mode,
             )
         } else if matches!(cli.cmd, Cmd::Serve { .. }) {
-            hub::Hub::with_reporter(cfg, &provider, cli.session_dir.clone(), cli.openai_key_file.as_deref(), issues::global().expect("installed reporter"), mode)
+            hub::Hub::with_reporter(cfg, &provider, session_dir.clone(), cli.openai_key_file.as_deref(), issues::global().expect("installed reporter"), mode)
         } else {
-            hub::Hub::new(cfg, &provider, cli.session_dir.clone(), cli.openai_key_file.as_deref())
+            hub::Hub::new(cfg, &provider, session_dir.clone(), cli.openai_key_file.as_deref())
         }
     };
     // Construct before dispatch so initialization failures get the short synchronous alert path.
@@ -409,13 +428,28 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile, depth, ref account } => {
+        Cmd::Rpc { ref profile, depth, ref account, ref resume } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            rpc::run(hub, session_req(profile.clone(), depth, account)).await?;
+            rpc::run(hub, session_req(profile.clone(), depth, account), resume.clone()).await?;
         }
-        Cmd::Run { ref profile, depth, json, ref account, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref account, ref resume, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let session = hub.create_session(&local_client(&hub.config), session_req(profile.clone(), depth, account))?;
+            let client = local_client(&hub.config);
+            let session = match resume {
+                Some(id) => {
+                    let session = resume_session(&hub, &client, id)?;
+                    if let Some(level) = cli.reasoning_effort {
+                        session.set_reasoning_effort(Some(level));
+                    }
+                    session
+                }
+                None => hub.create_session(&client, session_req(profile.clone(), depth, account))?,
+            };
+            let persisted = session.hooks.path().is_some();
+            if !json {
+                // 让用户可以继续：sub-bot run --resume <id> "..."
+                eprintln!("[session] {}{}", session.id, if persisted { "" } else { " (not persisted)" });
+            }
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
             let mut last = None;
@@ -435,6 +469,10 @@ async fn main() -> anyhow::Result<()> {
                     Ok(AgentEvent::ToolExecutionStart { tool_name, .. }) if !json => {
                         eprintln!("[tool] {tool_name}")
                     }
+                    Ok(AgentEvent::Compaction { reason, phase, tokens_before, tokens_after, error, .. }) if !json && phase == "end" => match (tokens_after, error) {
+                        (_, Some(e)) => eprintln!("[compaction] {reason} failed: {e}"),
+                        (after, None) => eprintln!("[compaction] {reason}: ~{tokens_before} -> ~{} tokens", after.unwrap_or_default()),
+                    },
                     Ok(AgentEvent::AgentSettled { .. }) | Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     _ => {}
                 }
@@ -449,9 +487,11 @@ async fn main() -> anyhow::Result<()> {
                 if let Some(u) = &session.routing().usage {
                     add_usage(&mut total, u);
                 }
+                // 压缩摘要调用的用量也计入 totalUsage
+                add_usage(&mut total, &session.hooks.compaction_usage());
                 // account：最后一次调用实际使用的账号（failover 后可能不同于会话账号）
                 let account = last.account.clone().unwrap_or_else(|| session.account.clone());
-                let mut out = serde_json::json!({"sessionId": session.id, "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
+                let mut out = serde_json::json!({"sessionId": session.id, "persisted": persisted, "resumed": resume.is_some(), "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
                 out.as_object_mut().unwrap().extend(session.effort_fields());
                 out["reasoningEffort"] = serde_json::json!(effort);
                 println!("{out}");
@@ -502,6 +542,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// `run --resume`：从本地会话目录恢复（client `local`）。
+fn resume_session(hub: &std::sync::Arc<hub::Hub>, client: &config::Client, id: &str) -> anyhow::Result<std::sync::Arc<hub::SessionHandle>> {
+    let dir = hub.client_session_dir(&client.name).ok_or_else(|| anyhow::anyhow!("session persistence is disabled (--no-persist-sessions / persistSessions: false); cannot resume"))?;
+    anyhow::ensure!(agent_session::valid_id(id), "invalid session id '{id}' (expected a UUID)");
+    hub.load_persisted(client, id)?.ok_or_else(|| anyhow::anyhow!("session {id} not found in {}", dir.display()))
 }
 
 fn add_usage(total: &mut agent_ai::Usage, u: &agent_ai::Usage) {
@@ -626,6 +673,20 @@ mod tests {
         assert_eq!(account, "ci");
         use clap::CommandFactory;
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn resume_and_persistence_flags() {
+        let Cmd::Run { resume, .. } = Cli::try_parse_from(["sub-bot", "run", "--resume", "abc", "hi"]).unwrap().cmd else { panic!("run") };
+        assert_eq!(resume.as_deref(), Some("abc"));
+        let Cmd::Rpc { resume, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--resume", "abc"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!(resume.as_deref(), Some("abc"));
+        for flag in ["--resume", "--session"] {
+            let Cmd::Ask(ask) = Cli::try_parse_from(["sub-bot", "ask", flag, "abc", "hi"]).unwrap().cmd else { panic!("ask") };
+            assert_eq!(ask.session.as_deref(), Some("abc"));
+        }
+        let cli = Cli::try_parse_from(["sub-bot", "--no-persist-sessions", "--session-dir", "/tmp/x", "serve"]).unwrap();
+        assert!(cli.no_persist_sessions && cli.session_dir.is_some());
     }
 
     #[test]

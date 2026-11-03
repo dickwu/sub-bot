@@ -3,6 +3,7 @@ use crate::{
     hub::{AccountNotAllowed, DepthLocked, Hub, SessionHandle, SessionRequest, TaskStatus, TooManySessions, WebhookQueue},
     issues::Severity,
     routing::Depth,
+    sessions::{CompactError, ResumeFailed},
     webhook::WebhookTarget,
 };
 use agent_ai::{Message, ThinkingLevel};
@@ -92,12 +93,13 @@ pub(crate) fn test_router(hub: Arc<Hub>) -> Router {
 
 fn router(st: AppState) -> Router {
     let api = Router::new()
-        .route("/v1/sessions", post(create_session))
+        .route("/v1/sessions", post(create_session).get(list_sessions))
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
         .route("/v1/sessions/{id}/prompt", post(prompt))
         .route("/v1/sessions/{id}/events", get(events))
         .route("/v1/sessions/{id}/abort", post(abort))
         .route("/v1/sessions/{id}/messages", get(messages))
+        .route("/v1/sessions/{id}/compact", post(compact_session))
         .route("/v1/issues", get(issues))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
@@ -166,8 +168,57 @@ fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
     }
 }
 
+/// 调用方自己的会话：内存里没有时从磁盘恢复（同一 client 的会话目录）。未知 / 非 owner / 非法 id ⇒ 404。
+async fn session(st: &AppState, c: &Client, id: &str) -> Result<Arc<SessionHandle>, (StatusCode, Json<serde_json::Value>)> {
+    match st.hub.get_or_load(c, id).await {
+        Ok(Some(h)) => Ok(h),
+        Ok(None) => Err(not_found()),
+        Err(e) if e.is::<TooManySessions>() => Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))),
+        Err(e) if e.is::<ResumeFailed>() => {
+            tracing::warn!(session_id = %id, error = %e, "session rehydration failed");
+            Err((StatusCode::CONFLICT, Json(json!({"error": e.to_string()}))))
+        }
+        Err(e) => {
+            tracing::error!(session_id = %id, error = %e, "session rehydration failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "session could not be loaded"}))))
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ListQuery {
+    limit: Option<usize>,
+}
+
+/// 调用方的会话（内存 + 已持久化，按 updatedAt 倒序）。
+async fn list_sessions(State(st): State<AppState>, Extension(c): Caller, Query(q): Query<ListQuery>) -> ApiResult {
+    let limit = q.limit.unwrap_or(crate::sessions::DEFAULT_LIST_LIMIT);
+    if limit == 0 || limit > 1000 {
+        return Err(bad_request("limit must be between 1 and 1000"));
+    }
+    Ok(Json(json!({"sessions": st.hub.list_sessions(&c, limit).await})).into_response())
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompactBody {
+    /// 给摘要模型的附加说明（例如“重点保留测试失败信息”）
+    instructions: Option<String>,
+}
+
+/// 立即压缩上下文；运行中 409，摘要调用失败 502。
+async fn compact_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, body: axum::body::Bytes) -> ApiResult {
+    let b: CompactBody = if body.iter().all(u8::is_ascii_whitespace) { CompactBody::default() } else { serde_json::from_slice(&body).map_err(bad_request)? };
+    let h = session(&st, &c, &id).await?;
+    match h.compact(b.instructions).await {
+        Ok(report) => Ok(Json(report).into_response()),
+        Err(e @ CompactError::Busy) => Err((StatusCode::CONFLICT, Json(json!({"error": e.to_string()})))),
+        Err(e @ CompactError::Failed(_)) => Err((StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()})))),
+    }
+}
+
 async fn get_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    let h = session(&st, &c, &id).await?;
     Ok(Json(st.hub.session_view(&h)).into_response())
 }
 
@@ -180,16 +231,28 @@ struct PatchBody {
 }
 
 async fn patch_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, ApiJson(b): ApiJson<PatchBody>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    let h = session(&st, &c, &id).await?;
     apply_overrides(&h, b.reasoning_effort, b.depth)?;
     Ok(Json(st.hub.session_view(&h)).into_response())
 }
 
-async fn delete_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
-    if !st.hub.remove(&c, &id) {
-        return Err(not_found());
+#[derive(Deserialize, Default)]
+struct DeleteQuery {
+    /// 同时删除磁盘上的 JSONL（之后不能再恢复）
+    #[serde(default)]
+    purge: bool,
+}
+
+/// 默认只从内存删除（JSONL 保留，之后仍可按 id 恢复）；`?purge=true` 同时删除 JSONL。
+async fn delete_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, Query(q): Query<DeleteQuery>) -> ApiResult {
+    match st.hub.delete_session(&c, &id, q.purge) {
+        Ok(Some(outcome)) => Ok(Json(json!({"deleted": true, "inMemory": outcome.in_memory, "purged": outcome.purged})).into_response()),
+        Ok(None) => Err(not_found()),
+        Err(e) => {
+            tracing::error!(session_id = %id, error = %e, "session purge failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "session file could not be deleted"}))))
+        }
     }
-    Ok(Json(json!({"deleted": true})).into_response())
 }
 
 /// 列出当前 bot 可用的 profile 及其工具（不含任何密钥）。
@@ -277,7 +340,7 @@ struct PromptBody {
 }
 
 async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, request_id: Option<Extension<RequestId>>, ApiJson(b): ApiJson<PromptBody>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    let h = session(&st, &c, &id).await?;
     if let Some(Extension(id_value)) = request_id {
         h.set_request_id(id_value.0);
     }
@@ -315,17 +378,17 @@ fn sse_stream(rx: tokio::sync::broadcast::Receiver<AgentEvent>, stop_on_settled:
 }
 
 async fn events(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    let h = session(&st, &c, &id).await?;
     Ok(Sse::new(sse_stream(h.subscribe(), false, h)).keep_alive(Default::default()).into_response())
 }
 
 async fn abort(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
-    st.hub.get(&c, &id).ok_or_else(not_found)?.agent.abort();
+    session(&st, &c, &id).await?.agent.abort();
     Ok(Json(json!({"ok": true})).into_response())
 }
 
 async fn messages(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>) -> ApiResult {
-    let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+    let h = session(&st, &c, &id).await?;
     Ok(Json(json!({"messages": h.agent.messages().await})).into_response())
 }
 
@@ -526,7 +589,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
     let timeout_secs = b.timeout_secs.unwrap_or(st.hub.config.chat_timeout_secs);
     let h = match b.session_id {
         Some(id) => {
-            let h = st.hub.get(&c, &id).ok_or_else(not_found)?;
+            let h = session(&st, &c, &id).await?;
             apply_overrides(&h, b.reasoning_effort, b.depth)?;
             h
         }
@@ -1299,7 +1362,7 @@ mod tests {
         }
         let (status, body) = request(&app, "DELETE", &path, Some("test-token"), json!({})).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"deleted": true}));
+        assert_eq!(body, json!({"deleted": true, "inMemory": true, "purged": false}));
         for method in ["GET", "DELETE"] {
             assert_eq!(request(&app, method, &path, Some("test-token"), json!({})).await.0, StatusCode::NOT_FOUND);
         }

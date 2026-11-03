@@ -142,6 +142,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         token_budget: None,
         run_timeout: None,
         before_run: None,
+        hooks: None,
     }
 }
 

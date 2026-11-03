@@ -38,8 +38,8 @@ impl std::str::FromStr for Depth {
     }
 }
 
-/// 对外报告的路由结果（会话视图、chat 响应、task 结果、ask --json、RPC get_state）。
-#[derive(Debug, Clone, Serialize)]
+/// 对外报告的路由结果（会话视图、chat 响应、task 结果、ask --json、RPC get_state）；也持久化到会话 JSONL 元数据。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Routing {
     pub depth: Depth,

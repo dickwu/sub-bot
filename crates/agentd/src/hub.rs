@@ -14,7 +14,7 @@ use agent_ai::{
     EffortResolution, Message, ModelInfo, Provider, ThinkingLevel,
 };
 use agent_core::{Agent, AgentEvent, AgentTool, Emit, LoopConfig, Shared};
-use agent_session::Session;
+use agent_session::{Session, SessionMeta};
 use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistry};
 use anyhow::{bail, Result};
 use std::{
@@ -42,11 +42,12 @@ pub struct SessionHandle {
     caller_tools: Vec<String>,
     observing: AtomicBool,
     /// 运行期可变状态（推理强度、路由、issue scope），与 Agent 的 before_run hook 共享
-    dynamic: Arc<SessionDynamic>,
-    store: Mutex<Option<Session>>,
-    last_activity: Mutex<Instant>,
+    pub(crate) dynamic: Arc<SessionDynamic>,
+    /// JSONL 持久化 + 压缩（与 Agent 的 ContextHooks 共享），见 sessions.rs
+    pub(crate) hooks: Arc<crate::sessions::SessionHooks>,
+    pub(crate) last_activity: Mutex<Instant>,
     idle_ttl: Duration,
-    ephemeral: bool,
+    pub(crate) ephemeral: bool,
 }
 
 pub use agent_core::Disposition;
@@ -81,26 +82,26 @@ impl EffortChange {
 
 /// 会话里运行期可变的部分。不引用 Agent / Hub，因此可以放进 Agent 的 before_run hook 而不形成循环引用。
 pub(crate) struct SessionDynamic {
-    session_id: String,
-    provider_id: String,
+    pub(crate) session_id: String,
+    pub(crate) provider_id: String,
     /// 会话主账号（模型目录缓存键）
     account_key: AccountKey,
-    provider: Arc<dyn Provider>,
-    model: Shared<String>,
-    reasoning: Shared<Option<ThinkingLevel>>,
+    pub(crate) provider: Arc<dyn Provider>,
+    pub(crate) model: Shared<String>,
+    pub(crate) reasoning: Shared<Option<ThinkingLevel>>,
     /// (调用方请求的推理强度, 调整原因)
-    effort: Mutex<(Option<ThinkingLevel>, Option<String>)>,
-    routing: Mutex<Routing>,
+    pub(crate) effort: Mutex<(Option<ThinkingLevel>, Option<String>)>,
+    pub(crate) routing: Mutex<Routing>,
     /// 配置的深度模型（可能是 `latest:<prefix>` 别名）
     deep_spec: Option<String>,
     router_model: String,
     catalog: Arc<ModelsCache>,
-    issues: Arc<Reporter>,
-    issue_scope: Mutex<IssueScope>,
+    pub(crate) issues: Arc<Reporter>,
+    pub(crate) issue_scope: Mutex<IssueScope>,
     /// 最近一次成功调用实际使用的 (API, 推理强度)；推理强度变化后清空
     last_call: Mutex<Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)>>,
     /// 已收到过 prompt：此后 depth 不能再修改，路由不再改变
-    prompted: AtomicBool,
+    pub(crate) prompted: AtomicBool,
     /// 最近一次 warn 过的推理强度调整 (模型, 请求值)，避免同一调整重复 warn
     effort_warned: Mutex<Option<(String, Option<ThinkingLevel>)>>,
 }
@@ -111,7 +112,7 @@ impl SessionDynamic {
     }
 
     /// 按当前模型解析推理强度并写入会话；返回解析结果和实际值是否变化。
-    fn apply_effort(&self, requested: Option<ThinkingLevel>) -> (EffortResolution, bool) {
+    pub(crate) fn apply_effort(&self, requested: Option<ThinkingLevel>) -> (EffortResolution, bool) {
         let model = self.model.get();
         let resolution = agent_ai::resolve_effort_quiet(&self.provider_id, &model, requested);
         // 调整只在会话层 warn，且同一 (模型, 请求值) 只报一次（创建与路由都会解析；provider 内部的二次解析只记 debug）。
@@ -135,7 +136,7 @@ impl SessionDynamic {
         AgentEvent::EffortChanged { requested: r.requested, effective: r.effective, adjusted: r.adjusted.clone() }
     }
 
-    fn set_model(&self, model: String) {
+    pub(crate) fn set_model(&self, model: String) {
         self.issue_scope.lock().unwrap().model = Some(model.clone());
         self.model.set(model);
     }
@@ -261,6 +262,11 @@ impl SessionDynamic {
 impl SessionHandle {
     /// 运行中则排队（默认 follow_up），否则后台启动一次 run。
     pub fn submit(self: &Arc<Self>, text: String, mode: Option<&str>) -> Disposition {
+        self.submit_message(Message::user_text(text), mode)
+    }
+
+    /// 同 [`Self::submit`]，提交一条现成的消息（例如手动压缩期间排队、之后重新提交的消息）。
+    pub fn submit_message(self: &Arc<Self>, msg: Message, mode: Option<&str>) -> Disposition {
         self.dynamic.prompted.store(true, Ordering::Relaxed);
         self.run_generation.fetch_add(1, Ordering::Relaxed);
         if self.scope().task_id.is_none() {
@@ -297,8 +303,10 @@ impl SessionHandle {
         }
         let mut activity = self.last_activity.lock().unwrap();
         *activity = Instant::now();
-        let msg_len = text.chars().count();
-        let msg = Message::user_text(text);
+        let msg_len = match &msg {
+            Message::User { content, .. } => content.iter().map(|c| if let agent_ai::Content::Text { text } = c { text.chars().count() } else { 0 }).sum(),
+            _ => 0,
+        };
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
         let effort = self.agent.config.reasoning.get().map(|l| l.as_str()).unwrap_or("-");
@@ -327,14 +335,8 @@ impl SessionHandle {
                 }
             }
             tracing::info!(latency_ms = started.elapsed().as_millis() as u64, messages = new.len(), tool_calls = tools, input_tokens = input, output_tokens = output, reasoning_tokens, stop_reason = ?stop, "run finished");
-            if let Some(store) = this.store.lock().unwrap().as_mut() {
-                for m in new {
-                    if let Err(e) = store.append_message(m) {
-                        tracing::error!(issue = "typed", error = %e, "persist failed");
-                        this.report_issue(Severity::Error, "session_persist_failed", "session", "Session persistence failed", serde_json::json!({}));
-                    }
-                }
-            }
+            // 消息已由 ContextHooks::on_message 逐条写入 JSONL；这里只同步可变元数据（模型/推理强度/路由）
+            this.hooks.sync_meta();
             // 持久化完成后更新：长时间运行不会消耗下一次空闲窗口。
             *this.last_activity.lock().unwrap() = Instant::now();
         });
@@ -374,6 +376,7 @@ impl SessionHandle {
     pub fn set_reasoning_effort(&self, requested: Option<ThinkingLevel>) -> EffortChange {
         let (resolution, _) = self.dynamic.apply_effort(requested);
         self.agent.emit(self.dynamic.effort_event(&resolution));
+        self.hooks.sync_meta();
         EffortChange { requested: resolution.requested, effective: resolution.effective, adjusted: resolution.adjusted, allowed: self.dynamic.allowed_efforts() }
     }
 
@@ -389,6 +392,7 @@ impl SessionHandle {
         if changed {
             self.agent.emit(self.dynamic.effort_event(&resolution));
         }
+        self.hooks.sync_meta();
         Ok(())
     }
 
@@ -548,6 +552,21 @@ impl std::fmt::Display for TooManySessions {
 
 impl std::error::Error for TooManySessions {}
 
+/// 从 JSONL 重建会话所需的状态（见 sessions.rs `Hub::load_persisted`）。
+pub(crate) struct Restore {
+    pub store: Session,
+    /// 活动上下文（已考虑压缩、已修复中断的工具调用）
+    pub history: Vec<Message>,
+    /// 原会话已确定的路由
+    pub routing: Option<Routing>,
+    /// 原会话收到过 prompt（depth 不能再改）
+    pub prompted: bool,
+    /// 活动上下文来自压缩（其中的用量统计已失效）
+    pub compacted: bool,
+    /// 创建时间（Unix 毫秒）
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
@@ -580,7 +599,7 @@ pub fn classify_llm_error(message: &str) -> (&'static str, Option<u16>) {
 }
 
 // Prefer the provider's message over its full JSON body (request IDs, metadata, etc.).
-fn llm_error_summary(message: &str, reporter: &Reporter) -> String {
+pub(crate) fn llm_error_summary(message: &str, reporter: &Reporter) -> String {
     let body = message.find('{').and_then(|start| serde_json::from_str::<serde_json::Value>(&message[start..]).ok());
     let summary = body
         .as_ref()
@@ -669,8 +688,9 @@ pub struct Hub {
     cooldowns: Arc<Cooldowns>,
     default_provider: String,
     registry: ToolRegistry,
-    session_dir: Option<PathBuf>,
-    sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// 会话 JSONL 根目录（每个 client 一个子目录）；None = 不持久化
+    pub(crate) session_dir: Option<PathBuf>,
+    pub(crate) sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     store: Arc<crate::store::Store>,
     shutting_down: AtomicBool,
     http: reqwest::Client,
@@ -898,6 +918,11 @@ impl Hub {
 
     pub fn with_provider_keys(config: Config, provider_name: &str, session_dir: Option<PathBuf>, files: KeyFiles<'_>, issues: Arc<Reporter>, store_mode: StoreMode) -> Result<Arc<Self>> {
         config.validate()?;
+        if let Some(dir) = &session_dir {
+            // 临时回退 dataDir 下的会话目录同样要求属主/权限安全
+            crate::config::prepare_temp_data_dir(dir, true)?;
+            tracing::info!(dir = %dir.display(), "session persistence enabled");
+        }
         let keychain = timed_keychain(Arc::new(SystemKeychain), config.keychain_timeout_secs, agent_ai::keychain::WAIT_HINT_GRACE, issues.clone());
         let LoadedProviders { providers, unavailable } = load_providers(&config, provider_name, files, &issues, |k| std::env::var(k).ok(), &keychain, &ManagedStore::system())?;
         let registry = ToolRegistry::with_builtins();
@@ -1057,9 +1082,19 @@ impl Hub {
     }
 
     fn create_session_with_ttl(&self, client: &Client, req: SessionRequest, ephemeral: bool) -> Result<Arc<SessionHandle>> {
+        self.create_inner(client, req, ephemeral, None)
+    }
+
+    /// 新建会话，或（`restore`）用持久化的 JSONL 重建会话：沿用原 id、历史和已确定的路由，追加写入同一文件。
+    pub(crate) fn create_inner(&self, client: &Client, req: SessionRequest, ephemeral: bool, restore: Option<Restore>) -> Result<Arc<SessionHandle>> {
         // 上限检查与插入共用 map 锁，避免并发创建突破上限。
         let mut sessions = self.sessions.lock().unwrap();
         anyhow::ensure!(!self.shutting_down.load(Ordering::Relaxed), "server is shutting down");
+        if let Some(existing) = restore.as_ref().and_then(|r| sessions.get(&r.store.id)) {
+            // 并发恢复同一个会话：使用已经在内存里的那个
+            anyhow::ensure!(existing.owner == client.name, "session id collision");
+            return Ok(existing.clone());
+        }
         let cap = self.config.max_sessions_per_client;
         if cap != 0 && sessions.values().filter(|h| h.owner == client.name).count() >= cap {
             Self::evict_idle_from(&mut sessions, Instant::now(), Some(&client.name));
@@ -1092,16 +1127,12 @@ impl Hub {
             bail!("profile '{profile_name}' does not allow caller tools");
         }
 
-        let store = match &self.session_dir {
-            Some(dir) => Some(Session::create(&dir.join(&client.name), &profile_name)?),
-            None => None,
-        };
-        let id = store.as_ref().map(|s| s.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let id = restore.as_ref().map(|r| r.store.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
         let (cwd, root) = resolve_cwd(p, req.cwd.as_deref())?;
         let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone(), shell_env: p.shell_env.clone() };
         let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&selected, &ctx)?;
-        let caller_tools = req.caller_tools.iter().map(|t| t.name.clone()).collect();
+        let caller_tools: Vec<String> = req.caller_tools.iter().map(|t| t.name.clone()).collect();
         for spec in req.caller_tools {
             if tools.iter().any(|t| t.name() == spec.name) {
                 bail!("caller tool '{}' collides with a built-in tool", spec.name);
@@ -1171,23 +1202,86 @@ impl Hub {
             prompted: AtomicBool::new(false),
             effort_warned: Mutex::new(None),
         });
-        dynamic.plan();
+        match restore.as_ref().and_then(|r| r.routing.clone()) {
+            // 恢复：路由已在原会话里确定，不再重新路由
+            Some(mut routing) if routing.decided => {
+                routing.explicit = explicit;
+                dynamic.set_model(routing.model.clone());
+                *dynamic.routing.lock().unwrap() = routing;
+            }
+            _ => dynamic.plan(),
+        }
+        if restore.as_ref().is_some_and(|r| r.prompted) {
+            dynamic.prompted.store(true, Ordering::Relaxed);
+        }
         dynamic.apply_effort(requested_effort);
+        let api = if provider_id == "openai" { req.api.or(p.api).unwrap_or(self.config.default_api) } else { agent_ai::Api::Auto };
+        let system_prompt = crate::prompt::build(crate::prompt::PromptInput {
+            custom: req.system_prompt.as_deref().or(p.system_prompt.as_deref()),
+            append: &[p.append_system_prompt.as_deref().unwrap_or(""), req.append_system_prompt.as_deref().unwrap_or("")],
+            tools: &tools,
+            cwd: &cwd,
+            root: &root,
+            load_context_files: p.load_context_files,
+        });
+        let prompt_sha256 = crate::config::sha256_hex(&system_prompt);
+        let (store, history, created_at, compacted) = match restore {
+            Some(r) => {
+                if r.store.meta().system_prompt_sha256.as_ref().is_some_and(|h| *h != prompt_sha256) {
+                    tracing::info!(session_id = %id, "system prompt changed since the session was created (profile or context files changed); using the current prompt");
+                }
+                (Some(r.store), r.history, r.created_at, r.compacted)
+            }
+            None => {
+                let store = match &self.session_dir {
+                    Some(dir) => {
+                        let meta = SessionMeta {
+                            client: Some(client.name.clone()),
+                            provider: Some(provider_id.into()),
+                            account: Some(account.clone()),
+                            model: Some(dynamic.model.get()),
+                            explicit_model: Some(explicit),
+                            api: req.api.map(|a| a.as_str().to_string()),
+                            cwd: Some(cwd.clone()),
+                            requested_reasoning_effort: requested_effort,
+                            reasoning_effort: dynamic.reasoning.get(),
+                            routing: serde_json::to_value(&*dynamic.routing.lock().unwrap()).ok(),
+                            tools: Some(selected.clone()),
+                            system_prompt: req.system_prompt.clone(),
+                            append_system_prompt: req.append_system_prompt.clone(),
+                            system_prompt_sha256: Some(prompt_sha256),
+                            caller_tools: (!caller_tools.is_empty()).then(|| caller_tools.clone()),
+                            ephemeral: ephemeral.then_some(true),
+                            title: None,
+                        };
+                        Some(Session::create_with_id(&dir.join(&client.name), &id, &profile_name, meta)?)
+                    }
+                    None => None,
+                };
+                (store, vec![], unix_ms(), false)
+            }
+        };
+        let persisted_path = store.as_ref().map(|s| s.path.clone());
+        let hooks = Arc::new(crate::sessions::SessionHooks::new(crate::sessions::HooksInit {
+            store,
+            dynamic: dynamic.clone(),
+            settings: crate::compaction::CompactionSettings::resolve(&self.config.compaction, p.compaction.as_ref()),
+            context_window: p.context_window,
+            overhead_tokens: crate::sessions::overhead_tokens(&system_prompt, &tools),
+            api,
+            llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
+            created_at,
+            usage_floor: if compacted { history.len() } else { 0 },
+            title: history.iter().find_map(crate::sessions::title_of),
+        }));
         let hook = dynamic.clone();
         let config = LoopConfig {
             provider,
             model: dynamic.model.clone(),
-            system_prompt: Some(crate::prompt::build(crate::prompt::PromptInput {
-                custom: req.system_prompt.as_deref().or(p.system_prompt.as_deref()),
-                append: &[p.append_system_prompt.as_deref().unwrap_or(""), req.append_system_prompt.as_deref().unwrap_or("")],
-                tools: &tools,
-                cwd: &cwd,
-                root: &root,
-                load_context_files: p.load_context_files,
-            })),
+            system_prompt: Some(system_prompt),
             tools,
             reasoning: dynamic.reasoning.clone(),
-            api: if provider_id == "openai" { req.api.or(p.api).unwrap_or(self.config.default_api) } else { agent_ai::Api::Auto },
+            api,
             steering: Default::default(),
             follow_up: Default::default(),
             max_turns: p.max_turns,
@@ -1196,8 +1290,9 @@ impl Hub {
             llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
             before_run: Some(Arc::new(move |messages, emit| Box::pin(hook.clone().route_first_run(messages, emit)))),
+            hooks: Some(hooks.clone()),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), persisted = ?persisted_path, restored = !history.is_empty(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -1209,9 +1304,9 @@ impl Hub {
             profile: profile_name,
             account,
             cwd,
-            agent: Agent::new(config, vec![]),
+            agent: Agent::new(config, history),
             dynamic,
-            store: Mutex::new(store),
+            hooks,
             last_activity: Mutex::new(Instant::now()),
             idle_ttl: Duration::from_secs(if ephemeral { self.config.chat_session_ttl_secs } else { self.config.session_idle_ttl_secs }),
             ephemeral,
@@ -1235,15 +1330,21 @@ impl Hub {
         Some(h.submit(text, mode))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn remove(&self, client: &Client, id: &str) -> bool {
+        self.remove_handle(client, id).is_some()
+    }
+
+    /// 从内存删除自己的会话并中止运行；返回被删除的 handle。
+    pub(crate) fn remove_handle(&self, client: &Client, id: &str) -> Option<Arc<SessionHandle>> {
         let mut sessions = self.sessions.lock().unwrap();
         if !sessions.get(id).is_some_and(|h| h.owner == client.name) {
-            return false;
+            return None;
         }
         let h = sessions.remove(id).unwrap();
         h.agent.abort();
-        tracing::info!(session_id = %h.id, bot = %h.owner, "session deleted; persisted JSONL files retained");
-        true
+        tracing::info!(session_id = %h.id, bot = %h.owner, "session deleted from memory");
+        Some(h)
     }
 
     /// 关机时禁止新会话/提交，取消全部运行并等待持久化完成；释放 handle 后 SSE 也会结束。
@@ -1480,6 +1581,7 @@ impl Hub {
             "api": h.effective_api().map(|a| a.as_str()).unwrap_or_else(|| self.effective_api(&h.agent.config)),
             "isStreaming": h.agent.is_running(),
             "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+            "persisted": h.hooks.path().is_some(),
         });
         view.as_object_mut().unwrap().extend(h.effort_fields());
         view
@@ -2563,7 +2665,7 @@ pub(crate) mod tests {
         for (h, mut rx) in handles {
             assert!(settled(&mut rx).await);
             assert!(!h.agent.is_running());
-            let path = h.store.lock().unwrap().as_ref().unwrap().path.clone();
+            let path = h.hooks.path().unwrap();
             let persisted = Session::open(&path).unwrap().active_messages();
             assert!(!persisted.is_empty());
             assert_eq!(persisted, h.agent.messages().await);

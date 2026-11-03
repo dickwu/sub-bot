@@ -13,7 +13,8 @@ pub struct Ask {
     pub token_file: Option<PathBuf>,
     #[arg(long)]
     pub profile: Option<String>,
-    #[arg(long)]
+    /// Continue a server session (also after a server restart: the server reloads it from its session directory).
+    #[arg(long, visible_alias = "resume")]
     pub session: Option<String>,
     /// Submit an asynchronous task and poll until its final result.
     #[arg(long = "async")]

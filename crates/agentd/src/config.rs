@@ -82,6 +82,12 @@ pub struct Profile {
     /// 主账号 429 / 额度耗尽时依次切换的账号（覆盖账号级 fallbackAccounts）
     #[serde(default)]
     pub fallback_accounts: Option<Vec<String>>,
+    /// 覆盖模型的上下文窗口（token，>= 1000），用于自动压缩阈值；默认按模型表（agent_ai::context_window）
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    /// 覆盖全局 `compaction`（逐字段）
+    #[serde(default)]
+    pub compaction: Option<crate::compaction::CompactionConfig>,
 }
 
 fn default_tools() -> Vec<String> {
@@ -297,6 +303,15 @@ pub struct Config {
     /// 每个 client 的内存会话上限，0 不限制。
     #[serde(default = "default_max_sessions")]
     pub max_sessions_per_client: usize,
+    /// 会话 JSONL 目录（按 client 分子目录）；默认 `<dataDir>/sessions`。`--session-dir` 优先
+    #[serde(default)]
+    pub session_dir: Option<PathBuf>,
+    /// false 关闭会话持久化（serve / run / rpc）；默认 true。`--no-persist-sessions` 同效
+    #[serde(default)]
+    pub persist_sessions: Option<bool>,
+    /// 上下文压缩默认设置（profile 的 `compaction` 逐字段覆盖）
+    #[serde(default)]
+    pub compaction: crate::compaction::CompactionConfig,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -554,6 +569,14 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
+    /// 会话持久化目录：`persistSessions: false` ⇒ None；否则 `sessionDir` 或 `<dataDir>/sessions`。
+    pub fn sessions_dir(&self) -> Option<PathBuf> {
+        if self.persist_sessions == Some(false) {
+            return None;
+        }
+        Some(self.session_dir.clone().unwrap_or_else(|| self.data_dir().join("sessions")))
+    }
+
     pub fn socket_mode(&self) -> anyhow::Result<u32> {
         let value = self.unix_socket_mode.as_deref().unwrap_or("0600");
         anyhow::ensure!(!value.is_empty() && value.bytes().all(|b| matches!(b, b'0'..=b'7')), "unixSocketMode must be an octal permission string");
@@ -631,9 +654,16 @@ impl Config {
         if let Some(trust) = &self.trust_loopback {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
+        self.compaction.validate("compaction")?;
         let registry = agent_tools::ToolRegistry::with_builtins();
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            if let Some(c) = &profile.compaction {
+                c.validate(&format!("profile '{name}': compaction"))?;
+            }
+            if let Some(w) = profile.context_window {
+                anyhow::ensure!(w >= crate::compaction::MIN_CONTEXT_WINDOW, "profile '{name}': contextWindow must be >= {}", crate::compaction::MIN_CONTEXT_WINDOW);
+            }
             self.validate_profile_accounts(name, profile)?;
             if let Some(deep) = &profile.deep_model {
                 anyhow::ensure!(!deep.trim().is_empty() && deep.strip_prefix("latest:").is_none_or(|p| !p.trim().is_empty()), "profile '{name}': deepModel must be a model id or latest:<prefix>");
@@ -803,6 +833,8 @@ impl Config {
                 account: None,
                 allowed_accounts: None,
                 fallback_accounts: None,
+                context_window: None,
+                compaction: None,
             },
         );
         Config {
@@ -837,6 +869,9 @@ impl Config {
             session_idle_ttl_secs: default_session_idle_ttl(),
             chat_session_ttl_secs: default_chat_session_ttl(),
             max_sessions_per_client: default_max_sessions(),
+            session_dir: None,
+            persist_sessions: None,
+            compaction: Default::default(),
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],
         }
@@ -1049,6 +1084,33 @@ mod tests {
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
         let cfg: Config = serde_json::from_str(r#"{"profiles":{},"sessionIdleTtlSecs":0,"chatSessionTtlSecs":5,"maxSessionsPerClient":0}"#).unwrap();
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (0, 5, 0));
+    }
+
+    #[test]
+    fn session_persistence_and_compaction_config() {
+        let mut cfg: Config = serde_json::from_str(r#"{"profiles":{},"dataDir":"/data"}"#).unwrap();
+        assert_eq!(cfg.sessions_dir(), Some(PathBuf::from("/data/sessions")));
+        cfg.session_dir = Some("/elsewhere".into());
+        assert_eq!(cfg.sessions_dir(), Some(PathBuf::from("/elsewhere")));
+        cfg.persist_sessions = Some(false);
+        assert_eq!(cfg.sessions_dir(), None);
+        let base = serde_json::json!({"profiles":{"p":{"workspaceRoots":["."],"contextWindow":50000,"compaction":{"thresholdPct":60,"model":"cheap"}}},
+            "compaction":{"keepRecentTokens":1000,"maxSummaryTokens":2000}});
+        let cfg: Config = serde_json::from_value(base.clone()).unwrap();
+        cfg.validate().unwrap();
+        let s = crate::compaction::CompactionSettings::resolve(&cfg.compaction, cfg.profiles["p"].compaction.as_ref());
+        assert_eq!((s.threshold_pct, s.keep_recent_tokens, s.max_summary_tokens, s.model.as_deref()), (60, 1000, 2000, Some("cheap")));
+        for (pointer, value, message) in [
+            ("/profiles/p/contextWindow", serde_json::json!(10), "contextWindow must be >= 1000"),
+            ("/profiles/p/compaction/thresholdPct", serde_json::json!(0), "profile 'p': compaction.thresholdPct"),
+            ("/compaction/maxSummaryTokens", serde_json::json!(1_000_000), "compaction.maxSummaryTokens"),
+        ] {
+            let mut v = base.clone();
+            *v.pointer_mut(pointer).unwrap() = value;
+            let cfg: Config = serde_json::from_value(v).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().contains(message), "{pointer}");
+        }
+        assert!(serde_json::from_value::<Config>(serde_json::json!({"profiles":{},"compaction":{"bogus":1}})).is_err());
     }
 
     #[cfg(unix)]

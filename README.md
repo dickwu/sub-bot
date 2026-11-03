@@ -7,7 +7,7 @@
 - OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
 - 设计细节见 [DESIGN.md](DESIGN.md)
 
-> 状态：v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；grep/find 工具等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -47,7 +47,7 @@
 
 ## 持久化、重启恢复与 issue 路由
 
-仅 `serve` 打开持久化 journal store：异步 task 状态和待投递 webhook 自动写入 `<dataDir>/state` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，不受 `--session-dir` 影响。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
+仅 `serve` 打开持久化 journal store：异步 task 状态和待投递 webhook 自动写入 `<dataDir>/state` 下的 `tasks.jsonl` / `deliveries.jsonl`，不依赖 SQLite。`--data-dir PATH` 优先于配置；默认是系统数据目录的 `sub-bot`，不受 `--session-dir` 影响（会话 JSONL 默认在 `<dataDir>/sessions`，见「会话持久化与恢复」）。目录权限为 0700，文件为 0600；一个目录仅供一个服务实例使用。记录包含任务结果和 webhook payload，请按敏感业务数据保护。
 
 默认目录按顺序选择：`BaseDirs::data_local_dir()/sub-bot`；系统目录不可用时使用非空且为绝对路径的 `$XDG_DATA_HOME/sub-bot`；否则 Unix 使用 `std::env::temp_dir()/sub-bot-<euid>`（非 Unix 为 `temp_dir()/sub-bot`）。回退时会警告一次，建议设置 `--data-dir` 或配置 `dataDir`（默认日志目录也使用该回退链，日志可用 `--log-dir` 单独指定）。临时回退目录按需以 0700 创建；Unix 上已有目录必须属于当前有效 UID，且不能允许组/其他用户写入，也不能是符号链接，否则 store、socket 和日志访问会返回错误，不会自动修复权限。临时目录可能被系统清理，持久服务应显式配置稳定的数据目录。
 
@@ -58,15 +58,133 @@
 }
 ```
 
-`run`、`rpc`、`models` 使用内存 store，不获取 dataDir 锁、不读取或写入这些 journal、不恢复任务或续投服务端 webhook，因此可与同一 dataDir 的 `serve` 并行运行。独立的日志输出和 `--session-dir` 会话历史设置不受影响。
+`run`、`rpc`、`models` 使用内存 store，不获取 dataDir 锁、不读取或写入这些 journal、不恢复任务或续投服务端 webhook，因此可与同一 dataDir 的 `serve` 并行运行。独立的日志输出和会话历史（`<dataDir>/sessions/<client>/`，每个会话一个文件，不需要锁）不受影响。
 
 启动时压缩日志、清理超过 `taskTtlSecs` 的结果。最后一个不完整行会被忽略；完整行损坏时，原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），恢复损坏行之前的记录，并上报 error issue `store_corrupt`。上次处于 queued/running 的任务不会重新执行工具，而是标记 failed，error 为 `interrupted by restart`，并上报 client/task 范围的 error issue `task_interrupted`。任务仍可由所属 client 通过 `GET /v1/tasks/{id}` 查询，直到 TTL 到期。
 
 待投递 webhook 继续原来的 `deliveryId` 和尝试次数；接收端必须按 ID 去重（至少一次投递，不保证恰好一次）。日志不保存 webhook 签名密钥，重启时按 URL 从当前配置重新解析；目标已删除（包括未保留到配置的请求级 callback URL）则标记 failed 并上报 issue。请在当前 client 的 webhook 配置中保留需要恢复的 callback 目标。
 
-SIGINT/SIGTERM 阻止新任务、取消运行中的 agent，并在 `shutdownGraceSecs`（默认 10 秒）内等待任务、issue reporter 和 webhook 投递队列；超时未完成的投递留在日志中，下次启动恢复。会话聊天历史仍由独立的 `--session-dir` 控制；这里不自动恢复 agent 执行。
+SIGINT/SIGTERM 阻止新任务、取消运行中的 agent，并在 `shutdownGraceSecs`（默认 10 秒）内等待任务、issue reporter 和 webhook 投递队列；超时未完成的投递留在日志中，下次启动恢复。会话聊天历史逐条写入会话 JSONL，重启后按 ID 访问即可恢复（见「会话持久化与恢复」）；被中断的运行不会自动重新执行。
 
 同步 `POST /v1/chat`、SSE 和会话运行也订阅所属 client 配置中接受 `issues` 的 webhook，遵守 `events` / `minSeverity`。运行结束后保留短暂订阅宽限期；取消订阅后路由缓存至少保留 `alerts.dedupWindowSecs`，已聚合 issue 还携带原始路由快照。因此窗口结束时的 `count > 1` 汇总仍到原 client，不会广播给其它 client（管理员全局 alerts 保持独立）。
+
+## 会话持久化与恢复
+
+### 存储位置与开关
+
+`serve`、`run`、`rpc` 默认把每个会话写成一个 JSONL：`<sessionDir>/<client>/<UTC 时间>_<sessionId>.jsonl`。`<sessionDir>` 的选择顺序：`--no-persist-sessions`（不持久化）> `--session-dir` / `SUB_BOT_SESSION_DIR` > 配置 `persistSessions: false`（不持久化）> 配置 `sessionDir` > `<dataDir>/sessions`。
+
+```json
+{ "dataDir": "/var/lib/sub-bot", "sessionDir": null, "persistSessions": true }
+```
+
+- `<client>` 子目录：HTTP 为配置中的 client 名，`run` 固定为 `local`，`rpc` 固定为 `stdio`。`models`、`ask`、`keys` 等命令不读写会话目录。
+- 目录 0700、文件 0600（与 dataDir 其它内容一致；临时回退 dataDir 同样检查属主和权限）。文件包含完整对话（工具输出、调用方覆盖的系统提示），请按敏感数据保护。
+- 不自动清理：`DELETE /v1/sessions/{id}?purge=true` 删除单个会话，或自行定期清理（例如 `find <sessionDir> -name '*.jsonl' -mtime +30 -delete`）。`/v1/chat` 自动创建的临时会话同样落盘。
+- 每条消息在加入上下文时立即追加写入（用户消息、助手消息、工具结果），不再等运行结束；进程崩溃最多丢失正在写的那一行。
+
+文件格式沿用 pi 的会话树（`id` / `parentId`），向后兼容：
+- header `{"type":"session","version":2,"id","profile","timestamp","meta":{...}}`；`meta` 记录重建会话所需的信息：`client`、`provider`、`account`、`model`、`explicitModel`、`api`、`cwd`、`requestedReasoningEffort`、`reasoningEffort`、`routing`、`tools`、`systemPrompt` / `appendSystemPrompt`（仅调用方覆盖时）、`systemPromptSha256`、`callerTools`（只有名字）、`ephemeral`、`title`（第一条用户消息预览）。
+- `{"type":"session_info","id","timestamp","meta":{...}}`：元数据更新（模型路由确定、推理强度修改、标题），不进入树，后写覆盖先写。
+- `{"type":"compaction",...,"summary","firstKeptEntryId","tokensBefore","tokensAfter"}`：见「上下文压缩」。
+- v1 文件（没有 `meta` / `session_info` / token 字段）照常加载：profile 取 header，cwd 取 profile 的第一个 workspaceRoot，模型取最后一条助手消息。
+
+### 重启后恢复（rehydrate）
+
+HTTP 上任何会话路由（`GET/PATCH/DELETE /v1/sessions/{id}`、`/messages`、`/prompt`、`/events`、`/abort`、`/compact`，以及带 `sessionId` 的 `/v1/chat`）遇到不在内存里的 ID 时，会从**同一 client** 的会话目录加载它，然后照常处理；其它 client 的会话一律 404。ID 必须是规范的小写 UUID，否则直接 404、不访问磁盘（防止路径穿越）。成功时记 info 日志 `session rehydrated from disk`（`session_id`、`messages`、`compacted`、`repaired_tool_calls`、`elapsed_ms`）。
+
+- 恢复的内容：上下文（压缩后的摘要 + 保留消息；Anthropic 签名 thinking 块与 tool_use / tool_result 配对原样保留）、profile、cwd（仍须位于 workspaceRoots 内）、provider / account、已确定的模型路由（不会重新路由，depth 不能再改）、请求的推理强度（按模型重新解析）、工具列表、调用方的系统提示覆盖、chat 会话的短 TTL。系统提示按当前 profile 与 AGENTS.md 重新构建（与创建时不同会记 info 日志）。之后的消息追加到同一个文件。
+- 不恢复：调用方回调工具（`callbackUrl` / token 不落盘，记 WARN）、中断的运行（不会自动重新执行）。
+- 恢复的会话计入 `maxSessionsPerClient`（满了返回 429）。不能恢复（文件损坏、profile / cwd / 模型 / 账号不再被允许、provider 未加载）返回 **409** `session cannot be resumed: ...`。
+- **崩溃修复**：如果最后一条助手消息里有工具调用没有结果（例如工具执行中进程退出），恢复时为每个缺失的调用追加一条错误工具结果 `interrupted: sub-bot restarted before the tool finished`，记 WARN 并上报 warn 级 issue `tool_interrupted`；崩溃留下的不完整末行会被截掉（WARN）。
+- 同一个会话不要同时在两个进程里使用（例如服务里的会话和 `run --resume` 同时写同一个文件）。
+
+### CLI 与 RPC
+
+```bash
+sub-bot run --json "分析 src/ 的结构"          # {"sessionId":"…","persisted":true,"resumed":false,…}
+sub-bot run "分析 src/ 的结构"                  # stdout 只有回复；stderr 打印 [session] <id>
+sub-bot run --resume <id> "继续，补上测试"       # 读取 <sessionDir>/local/<…>_<id>.jsonl，追加写入
+sub-bot rpc --resume <id>                       # <sessionDir>/stdio/；get_state 返回 sessionId / persisted
+sub-bot ask --resume <id> "继续"                # --resume 是 --session 的别名；服务重启后由服务端按需恢复
+```
+
+`run --resume` / `rpc --resume` 时 profile、模型、provider、账号、depth 都来自记录（命令行同名参数被忽略），`--reasoning-effort` 作为粘性修改生效；`--no-persist-sessions` 或 `persistSessions: false` 时 `--resume` 直接报错。
+
+### 列表与删除
+
+```bash
+curl -s 'localhost:7878/v1/sessions?limit=20' -H "Authorization: Bearer $T"
+# {"sessions":[{"sessionId":"…","profile":"coder","provider":"anthropic","account":"default","model":"claude-opus-5-5","cwd":"/work/app",
+#   "createdAt":1767225600000,"updatedAt":1767229200000,"messageCount":12,"inMemory":false,"running":false,"persisted":true,"ephemeral":false,
+#   "title":"给 src/lib.rs 加单元测试…"}]}
+curl -X DELETE "localhost:7878/v1/sessions/$SID" -H "Authorization: Bearer $T"              # {"deleted":true,"inMemory":true,"purged":false}
+curl -X DELETE "localhost:7878/v1/sessions/$SID?purge=true" -H "Authorization: Bearer $T"   # 同时删除 JSONL：{"deleted":true,"inMemory":false,"purged":true}
+```
+
+- 列表合并内存会话与磁盘会话（按 ID 去重，内存优先），按 `updatedAt` 倒序，`limit` 默认 50（1–1000）；时间为 Unix 毫秒，磁盘会话的 `updatedAt` 是文件修改时间，`messageCount` 是当前上下文（压缩后）的消息数。列表只读文件，不会加载会话。
+- `DELETE` 默认只删内存会话（运行中会被中止），JSONL 保留，之后按 ID 仍可恢复；只在磁盘上的会话也返回 200（`inMemory:false`）。`?purge=true` 同时删除 JSONL（之后 404）。
+
+## 上下文压缩
+
+长会话在接近模型上下文窗口时自动压缩：较早的消息被模型摘要成结构化总结，最近的消息原样保留（参照 pi coding-agent `core/compaction`）。
+
+### 配置
+
+```jsonc
+{
+  "compaction": {                 // 全局默认
+    "enabled": true,              // 自动压缩开关（手动 compact 不受影响）
+    "thresholdPct": 80,           // 估计 token > contextWindow × 80% 时压缩（1–100）
+    "keepRecentTokens": 20000,    // 原样保留的最近消息量（token 估计，0–1000000）
+    "model": null,                // 摘要用的模型（同一 provider），null = 会话当前模型
+    "maxSummaryTokens": 4000      // 摘要调用的输出上限（256–64000）
+  },
+  "profiles": {
+    "coder": {
+      "contextWindow": 200000,              // 可选：覆盖内置窗口表（>= 1000）
+      "compaction": {"thresholdPct": 70}    // 可选：逐字段覆盖全局设置
+    }
+  }
+}
+```
+
+内置上下文窗口（保守值）：Claude（已列出的 4.x / 5.x）200k；gpt-5.x / gpt-6.x 400k；gpt-4.1 1M；o 系列 200k；其它 128k。窗口包含输出，阈值留出了回复空间。
+
+### 触发与估计
+
+每次模型调用之前（包括同一次运行中工具调用之后的调用）估计上下文 token：最近一条成功助手消息报告的用量（`totalTokens`，即 input + cacheRead + cacheWrite + output，OpenAI 的 input 已含缓存）加上之后消息的 chars/4 估计；没有可用用量（或用量来自压缩之前）时用系统提示 + 工具声明 + 全部消息的 chars/4。估计值超过阈值且存在可压缩的部分时压缩。
+
+### 算法
+
+- **切点**：从最新消息往回累计约 `keepRecentTokens`。只在用户消息或助手消息之前切，绝不切在工具结果上，切点之后的每个工具结果，其工具调用也必须在切点之后（不拆开 tool_use / tool_result）。优先切在用户消息边界（保留完整回合）；预算点之后没有用户边界时才切在助手消息之前（该回合开头的用户消息进入摘要）。整个上下文不超过 `keepRecentTokens` 或没有可切的位置时不压缩。
+- **摘要**：用会话模型（或 `compaction.model`）做一次不带工具的调用，固定的摘要系统提示，要求输出结构化总结：Goal、Constraints & Preferences、Progress（Done / In Progress / Blocked）、Key Decisions、Files Touched、Open Questions、Next Steps、Critical Context。被摘要的消息序列化成纯文本：thinking 截断后作为纯文本，**签名和 redacted thinking 不会发给摘要模型**；工具结果截断到 2000 字符；附带从 read/edit/write 调用里提取的文件列表。已有摘要时把它放进 `<previous-summary>` 一并更新，摘要是累积的。
+- **新上下文** = [摘要用户消息（`The conversation history before this point was compacted into the following summary: <summary>…</summary>`）] + 保留的消息（原样不动，包括带签名的 thinking 块）。JSONL 里旧消息保留，追加一条 `compaction` 条目（`firstKeptEntryId` = 保留部分第一条消息），重启后恢复得到同样的压缩后上下文。
+- 摘要调用的用量在 compaction 结束事件的 `usage` 里，并计入 `run --json` 的 `totalUsage`。
+- **自动压缩失败**：记 WARN、上报 warn 级 issue `compaction_failed`（details：`reason`、`model`、`tokensBefore`、脱敏后的错误摘要），本次调用不压缩、照常继续（若随后超出 provider 的上下文，仍按原样报 `llm_context_overflow`）；60 秒内不再自动重试。abort 会取消进行中的摘要调用。
+
+### 手动压缩
+
+```bash
+curl -X POST localhost:7878/v1/sessions/$SID/compact -H "Authorization: Bearer $T" -d '{"instructions":"重点保留失败测试的信息"}'
+# {"compacted":true,"tokensBefore":152340,"tokensAfter":23810,"summaryChars":3120,"firstKeptEntryId":"3f9a1c2e","durationMs":8421,"usage":{…}}
+# RPC
+{"id":"9","type":"compact","instructions":"重点保留失败测试的信息"}
+```
+
+请求体可省略。会话正在运行 ⇒ **409**（RPC 为 `success:false`）；没有可压缩的内容 ⇒ 200 `{"compacted":false,…}`；摘要调用失败 ⇒ **502**（上下文不变）。手动压缩期间会话视为运行中：新消息排队，压缩结束后按顺序执行。
+
+### 事件与日志
+
+SSE、RPC、`ask --json` 的事件流上：
+
+```json
+{"type":"compaction","reason":"auto","phase":"start","tokensBefore":165000}
+{"type":"compaction","reason":"auto","phase":"end","tokensBefore":165000,"tokensAfter":24100,"durationMs":9120,"summaryChars":3402,"firstKeptEntryId":"3f9a1c2e","usage":{"input":141000,"output":900,"cacheRead":0,"totalTokens":141900,"reasoning":0}}
+{"type":"compaction","reason":"manual","phase":"end","tokensBefore":52000,"durationMs":1200,"error":"HTTP 500: …"}
+```
+
+`reason` 为 `auto` / `manual`；失败时 `end` 带 `error`。`run` 文本模式在 stderr 打印 `[compaction] auto: ~165000 -> ~24100 tokens`。日志：`auto compaction triggered`、`compaction started`、`context compacted`（info：tokens_before / tokens_after / summary_chars / duration_ms）、`compaction failed; continuing without compaction`（WARN）。相关 issue：`compaction_failed`（warn）、`tool_interrupted`（warn）、`session_persist_failed`（error，JSONL 写入失败）。
 
 ## LLM 重试与进度
 
@@ -150,7 +268,7 @@ curl --unix-socket ~/.local/share/sub-bot/sub-bot.sock http://localhost/v1/chat 
 sub-bot ask "请检查当前项目"
 sub-bot ask --json "逐事件输出 NDJSON"
 sub-bot ask --profile coder --async --json "运行测试并总结"
-printf '继续上次的任务' | sub-bot ask --session SESSION_ID -
+printf '继续上次的任务' | sub-bot ask --session SESSION_ID -   # --resume 是 --session 的别名；服务重启后同样有效
 sub-bot ask --socket /path/to/sub-bot.sock "hello"
 sub-bot ask --url http://127.0.0.1:7878 --token-file /path/to/token "hello"
 ```
@@ -249,6 +367,11 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "sessionIdleTtlSecs": 3600,                 // 普通会话空闲 TTL，0 禁用
   "chatSessionTtlSecs": 600,                  // /v1/chat 自动创建会话的空闲 TTL，0 禁用（独立于普通 TTL）
   "maxSessionsPerClient": 64,                // 每个 client 的内存会话上限，0 不限制
+  "sessionDir": null,                         // 会话 JSONL 目录（按 client 分子目录），默认 <dataDir>/sessions
+  "persistSessions": true,                    // false 关闭会话持久化（serve / run / rpc），见「会话持久化与恢复」
+  "compaction": {                             // 上下文压缩默认值，profile 的 compaction 逐字段覆盖，见「上下文压缩」
+    "enabled": true, "thresholdPct": 80, "keepRecentTokens": 20000, "model": null, "maxSummaryTokens": 4000
+  },
   "taskTtlSecs": 3600,                       // 已完成任务保留秒数（从完成时计时）；0 在下次清理时过期
   "webhookMaxAttempts": 6,                   // webhook 最大投递次数（含首次）
   "defaultReasoningEffort": "high",           // 可选：全局默认推理强度
@@ -274,6 +397,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
       "maxTurns": 50,
+      "contextWindow": null,                   // 可选：覆盖模型上下文窗口（token，>= 1000），用于自动压缩阈值
+      "compaction": {"thresholdPct": 70},      // 可选：覆盖全局 compaction 的部分字段
       "deepModel": "claude-fable-5-1",         // 可选：depth=deep 用的模型；anthropic profile 默认固定为 claude-fable-5-1；"latest:claude-fable" 跟随最新版
       "autoRoute": false,                      // 可选：true 时默认 depth=auto（第一次 prompt 前用 routerModel 分类）
       "routerModel": null,                     // 可选：分类用的模型，默认 = profile 基础模型
@@ -302,7 +427,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
   - `--reasoning-effort` / `--effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh|max` 或 provider 小写名称；`ask` 时作为 `/v1/chat` 顶层 `reasoningEffort` 发送（粘性）
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
-  - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放
+  - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放；优先于配置 `sessionDir`，默认 `<dataDir>/sessions`
+  - `--no-persist-sessions`：不持久化会话（同 `persistSessions: false`），优先于 `--session-dir` / `SUB_BOT_SESSION_DIR`
   - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
   - `--keychain-timeout-secs`（`SUB_BOT_KEYCHAIN_TIMEOUT_SECS`）：覆盖 `keychainTimeoutSecs`（>= 1），对 `serve` / `run` / `rpc` / `keys check` / `keys list` 等所有读取 Keychain 的命令生效
   - `--log-level`、`--log-dir`、`--log-format`
@@ -415,7 +541,7 @@ sub-bot ask --effort high "解释这个仓库"
 - `auto`（默认）：gpt-5.4 及以后、gpt-6.x、o 系列走 **Responses API**（`POST /v1/responses`，流式 SSE，`function_call` / `function_call_output`，`reasoning.effort`，usage 含 reasoning tokens），其它模型走 Chat Completions
 - 优先级：请求/命令行的 `api` > profile 的 `api` > `defaultApi`
 - 2026-10 实测：gpt-5.4 及以后在 Chat Completions 上不允许“函数工具 + reasoning_effort”，gpt-6.x 在 Chat Completions 上带工具完全不可用。`auto` 下遇到这种错误会自动切到 Responses 并记住；显式 `api: "chat"` 时只会去掉 reasoning_effort 重试一次（记 warn），仍然失败就直接报错并提示改用 `responses`
-- `run --json` 输出 `api`、`reasoningEffort`（**实际生效**的值）、`requestedReasoningEffort`（请求的值）、`usage`（最后一次调用）和 `totalUsage`（整次运行累计，含 `reasoning`）
+- `run --json` 输出 `sessionId`、`persisted`、`resumed`、`api`、`reasoningEffort`（**实际生效**的值）、`requestedReasoningEffort`（请求的值）、`usage`（最后一次调用）和 `totalUsage`（整次运行累计，含 `reasoning`、路由分类与压缩摘要调用）
 - 日志里 `llm` span 的 `api` / `reasoning_effort` 是实际发送的值（`-` 表示未发送）
 
 ## 日志
@@ -439,14 +565,16 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/health` | 健康检查（无需鉴权） |
 | `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`） |
 | `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`（未知字段返回 400），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
-| `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404 |
+| `GET /v1/sessions?limit=` | 列出自己的会话（内存 + 已持久化，按 ID 去重，按 `updatedAt` 倒序，`limit` 默认 50、最大 1000）：`{sessions: [{sessionId, profile, provider, account, model, cwd, createdAt, updatedAt, messageCount, inMemory, running, persisted, ephemeral, title}]}`，时间为 Unix 毫秒 |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`（未知字段返回 400），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, persisted, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
+| `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404。所有 `/v1/sessions/{id}/*` 路由和带 `sessionId` 的 `/v1/chat` 在会话不在内存时会从磁盘恢复，见「会话持久化与恢复」 |
 | `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?}`：修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
-| `DELETE /v1/sessions/{id}` | 删除自己的内存会话并中止运行，返回 `{"deleted":true}`；未知/非 owner 返回 404；不删除磁盘 JSONL |
+| `DELETE /v1/sessions/{id}?purge=` | 删除自己的内存会话并中止运行，返回 `{"deleted":true, "inMemory":bool, "purged":bool}`；默认保留磁盘 JSONL（之后仍可按 ID 恢复），`?purge=true` 同时删除 JSONL；未知/非 owner 返回 404 |
 | `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", reasoningEffort?, depth?}`，返回 202；`reasoningEffort` 粘性，`depth` 仅首个 prompt |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
-| `GET /v1/sessions/{id}/messages` | 消息历史 |
+| `GET /v1/sessions/{id}/messages` | 消息历史（当前上下文；压缩后第一条是摘要消息） |
+| `POST /v1/sessions/{id}/compact` | 立即压缩上下文，可选 `{instructions}`；返回 `{compacted, tokensBefore, tokensAfter, summaryChars, firstKeptEntryId, durationMs, usage}`；运行中 409，摘要调用失败 502 |
 | `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` 是 `session.profile` / `session.model` 的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
 
@@ -461,7 +589,7 @@ sub-bot ask --effort high "解释这个仓库"
 - `runTimeoutSecs`（profile，默认 `null`）限制整次运行（含工具和排队消息），对 HTTP、RPC、CLI 都生效。超时取消运行、记录 `run timed out` 警告，并发送 `agent_settled{aborted:true}`。
 - 非流式 `/v1/chat` 的 `timeoutSecs` 覆盖全局 `chatTimeoutSecs`（默认 900 秒）。超时 abort 后最多再等 5 秒收尾，返回 HTTP **504**：`{sessionId, error: "timeout", text, messages}`，保留已收到的部分文本和消息。`stream:true` 不使用此等待上限（仍受流空闲和运行超时限制）。
 
-会话在创建、提交消息、运行结束时刷新空闲计时；读取信息/历史或订阅 SSE 不刷新计时。`serve` 每隔最多 60 秒（更短的非零 TTL 优先）清理超过各自 TTL 且未运行的会话，并记录日志；运行中的会话不会被空闲清理。删除/过期仅释放内存中的会话，已有 JSONL 文件保留在磁盘，当前不支持按旧 ID 自动恢复。
+会话在创建、提交消息、运行结束时刷新空闲计时；读取信息/历史或订阅 SSE 不刷新计时。`serve` 每隔最多 60 秒（更短的非零 TTL 优先）清理超过各自 TTL 且未运行的会话，并记录日志；运行中的会话不会被空闲清理。删除/过期仅释放内存中的会话，JSONL 文件保留在磁盘，之后按旧 ID 访问会自动恢复（`DELETE ?purge=true` 才删除文件）。
 
 每个 client 最多保留 `maxSessionsPerClient` 个会话（包括 chat 自动创建的会话）。达到上限时先清理该 client 已过期的空闲会话；仍满则创建返回 HTTP **429** `{"error":"too many sessions..."}`，可主动 DELETE 腾出名额。其它创建参数错误仍返回 400。
 
@@ -488,6 +616,7 @@ SSE 的 `event:` 名称与 pi 一致，依次有：
 - `turn_end`
 - `agent_end`
 - `agent_settled{aborted}`：本次运行结束的标志
+- `compaction{reason, phase, tokensBefore, ...}`：上下文压缩开始/结束（见「上下文压缩」）
 
 ### 异步任务与 webhook（v0.4.0）
 
@@ -549,9 +678,9 @@ stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的
 ← {"type":"agent_settled","aborted":false}
 ```
 
-模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。
+模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。`rpc --resume <sessionId>` 恢复 `<sessionDir>/stdio/` 下的会话（ID 可从 `get_state` 取得）；ID 不存在时第一行输出 `{"type":"response","command":"start","success":false,...}` 并退出。
 
-支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
+支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`compact`（`{"instructions"?: string}` → 与 HTTP compact 相同的结果；运行中 `success:false`）、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`（含 `sessionId`、`persisted`、`model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
 
 ## API key
 

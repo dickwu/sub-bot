@@ -8,8 +8,8 @@ pub mod agent_loop;
 pub mod event;
 pub mod tool;
 
-pub use agent::{Agent, Disposition};
-pub use agent_loop::{run_loop, BeforeRun, Emit, LoopConfig, Shared};
+pub use agent::{Agent, Disposition, ExclusiveGuard};
+pub use agent_loop::{run_loop, BeforeRun, ContextHooks, Emit, LoopConfig, Shared};
 pub use event::AgentEvent;
 pub use tool::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 

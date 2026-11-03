@@ -1,4 +1,9 @@
-use crate::builtin::{clock::ClockTool, fs::*, http::HttpFetchTool};
+use crate::builtin::{
+    clock::ClockTool,
+    fs::*,
+    http::HttpFetchTool,
+    search::{FindTool, GrepTool},
+};
 use agent_core::AgentTool;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
@@ -22,8 +27,9 @@ pub struct ToolContext {
     pub shell_env: crate::ShellEnv,
 }
 
-/// 默认启用的编码工具（pi 的默认是 read/bash/edit/write，见 agent-session.ts 中的 defaultTools）。
-pub const DEFAULT_TOOLS: &[&str] = &["read", "ls", "edit", "write", "bash"];
+/// 默认启用的编码工具（pi 的默认是 read/bash/edit/write，见 agent-session.ts 中的 defaultTools；
+/// 这里额外默认启用只读的 ls / grep / find，模型不必依赖宿主机装有 rg / find）。
+pub const DEFAULT_TOOLS: &[&str] = &["read", "ls", "grep", "find", "edit", "write", "bash"];
 
 type Factory = Arc<dyn Fn(&ToolContext) -> Option<Arc<dyn AgentTool>> + Send + Sync>;
 
@@ -44,6 +50,8 @@ impl ToolRegistry {
         // 核心：pi coding-agent 内置工具
         r.register("read", Risk::ReadFs, |c| Some(Arc::new(ReadTool { root: c.cwd.clone() })));
         r.register("ls", Risk::ReadFs, |c| Some(Arc::new(LsTool { root: c.cwd.clone() })));
+        r.register("grep", Risk::ReadFs, |c| Some(Arc::new(GrepTool { root: c.cwd.clone() })));
+        r.register("find", Risk::ReadFs, |c| Some(Arc::new(FindTool { root: c.cwd.clone() })));
         r.register("edit", Risk::WriteFs, |c| Some(Arc::new(EditTool { root: c.cwd.clone() })));
         r.register("write", Risk::WriteFs, |c| Some(Arc::new(WriteTool { root: c.cwd.clone() })));
         r.register("bash", Risk::Exec, |c| Some(Arc::new(BashTool { root: c.cwd.clone(), env: c.shell_env.clone() })));
@@ -82,9 +90,29 @@ impl ToolRegistry {
 pub fn preset(name: &str) -> Option<Vec<String>> {
     let v: &[&str] = match name {
         "default" => DEFAULT_TOOLS,
-        "readonly" => &["read", "ls"],
-        "no-shell" => &["read", "ls", "edit", "write"],
+        "readonly" => &["read", "ls", "grep", "find"],
+        "no-shell" => &["read", "ls", "grep", "find", "edit", "write"],
         _ => return None,
     };
     Some(v.iter().map(|s| s.to_string()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn presets_include_read_only_search_tools() {
+        let r = ToolRegistry::with_builtins();
+        for name in ["default", "readonly", "no-shell"] {
+            let tools = preset(name).unwrap();
+            assert!(tools.contains(&"grep".to_string()) && tools.contains(&"find".to_string()), "{name}: {tools:?}");
+            // 预设里的每个工具都已注册
+            assert!(tools.iter().all(|t| r.risk(t).is_some()), "{name}: {tools:?}");
+        }
+        assert!(!preset("readonly").unwrap().iter().any(|t| r.risk(t) != Some(Risk::ReadFs)));
+        assert_eq!((r.risk("grep"), r.risk("find")), (Some(Risk::ReadFs), Some(Risk::ReadFs)));
+        let built = r.build(&["grep".into(), "find".into()], &ToolContext::default()).unwrap();
+        assert_eq!(built.iter().map(|t| t.name()).collect::<Vec<_>>(), ["grep", "find"]);
+    }
 }

@@ -1,8 +1,9 @@
 [package]
 name = "agent-tools"
-description = "可插拔工具注册表 + 可选内置工具（fs/shell/http/clock）+ 调用方回调工具"
+description = "可插拔工具注册表 + 可选内置工具（fs/search/shell/http/clock）+ 调用方回调工具"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]
@@ -17,6 +18,12 @@ anyhow.workspace = true
 reqwest.workspace = true
 chrono.workspace = true
 libc = "0.2"
+# 内嵌 ripgrep 引擎（BurntSushi/ripgrep 的库 crate，MIT OR Unlicense；grep-matcher 经 grep-regex/grep-searcher 引入）：grep / find 工具不依赖外部 rg
+grep-searcher = "0.1"
+grep-regex = "0.1"
+ignore = "0.4"
+globset = "0.4"
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

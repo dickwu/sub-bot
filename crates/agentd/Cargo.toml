@@ -3,6 +3,7 @@ name = "agentd"
 description = "对外服务进程：HTTP+SSE（带 Bearer token）与 stdio JSONL RPC（对应 coding-agent RPC 模式）"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [[bin]]

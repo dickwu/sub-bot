@@ -3,6 +3,7 @@ name = "agent-core"
 description = "Agent 循环（对应 pi-agent-core）：turn/tool 执行、事件流、steer/follow-up 队列"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

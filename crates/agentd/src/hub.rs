@@ -301,8 +301,14 @@ impl SessionHandle {
         let msg = Message::user_text(text);
         let this = self.clone();
         // 会话 span 挂在当前请求 span 之下，因此运行期间的日志同时带 request_id / bot / session_id / profile
-        let effort = self.agent.config.reasoning.get().map(|l| l.as_str()).unwrap_or("-");
-        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), account = %self.account, model = %self.agent.config.model.get(), reasoning_effort = effort);
+        // model / reasoning_effort 每个 span 只记录一次：text 日志里 `span.record` 是追加而非覆盖，
+        // 创建时就赋值、路由后再 record 会让同名字段出现两次。未路由时留空，由 route_first_run 记录实际值。
+        let requested = self.requested_effort().map(|l| l.as_str()).unwrap_or("-");
+        let span = tracing::info_span!("session_run", session_id = %self.id, bot = %self.owner, profile = %self.profile, provider = %self.agent.config.provider.id(), account = %self.account, model = tracing::field::Empty, requested_reasoning_effort = requested, reasoning_effort = tracing::field::Empty);
+        if self.dynamic.routing.lock().unwrap().decided {
+            span.record("model", tracing::field::display(self.agent.config.model.get()));
+            span.record("reasoning_effort", self.agent.config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"));
+        }
         let _entered = span.enter();
         let started = std::time::Instant::now();
         let disposition = self.agent.submit_with(msg, mode, move |new| {
@@ -1964,6 +1970,39 @@ pub(crate) mod tests {
         let seen = capture.0.lock().unwrap().clone();
         assert!(seen.contains(&"model:claude-fable-5-1".to_string()), "{seen:?}");
         assert!(seen.iter().any(|s| s.starts_with("reasoning_effort:")), "{seen:?}");
+    }
+
+    /// text 格式下 `span.record` 是追加的：session_run span 上每个字段只能出现一次（首次路由与后续 run 都一样）。
+    #[tokio::test]
+    async fn session_run_span_fields_not_duplicated_in_text_logs() {
+        use tracing_subscriber::layer::SubscriberExt;
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let writer = buf.clone();
+        let layer = tracing_subscriber::fmt::layer().with_ansi(false).with_writer(move || writer.clone());
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(layer));
+        let (hub, _) = claude_hub(vec![], |p| p.model = Some("claude-sonnet-4-6".into()));
+        let h = hub.create_session(&hub.config.clients[0], SessionRequest { reasoning_effort: Some(ThinkingLevel::Low), ..Default::default() }).unwrap();
+        prompt_and_wait(&h, "hello").await;
+        prompt_and_wait(&h, "again").await;
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().filter(|l| l.contains("run finished")).collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        for line in lines {
+            assert_eq!(line.matches(" reasoning_effort=").count(), 1, "{line}");
+            assert_eq!(line.matches(" model=").count(), 1, "{line}");
+            assert!(line.contains("requested_reasoning_effort=\"low\"") && line.contains(" reasoning_effort=\"medium\""), "{line}");
+        }
     }
 
     #[tokio::test]

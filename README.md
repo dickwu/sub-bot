@@ -1,13 +1,13 @@
 # sub-bot
 
-一个用 Rust 写的**本地编码 agent 服务**，架构仿照 [pi coding-agent](https://github.com/badlogic/pi-mono)。它内置 read / write / edit / ls / bash 等编码工具，不绑定具体项目，供其它 bot 通过 HTTP+SSE 或 stdio JSONL RPC 调用。
+一个用 Rust 写的**本地编码 agent 服务**，架构仿照 [pi coding-agent](https://github.com/badlogic/pi-mono)。它内置 read / write / edit / ls / grep / find / bash 等编码工具（grep / find 在进程内嵌入 ripgrep 引擎，无需安装 `rg`），不绑定具体项目，供其它 bot 通过 HTTP+SSE 或 stdio JSONL RPC 调用。
 
 - 仅支持 macOS 和 Linux（Ubuntu 等），单个二进制，TLS 用 rustls，不依赖 OpenSSL
 - 每个 bot 一个 token，token 映射到允许使用的 profile；会话互相隔离，每个会话有独立的工作目录（cwd）
 - OpenAI / Anthropic API key 从文件、macOS Keychain 或环境变量读入进程内存，不会通过任何接口返回，也不会写进日志；`sub-bot keys set` 可代为保存 key
-- 设计细节见 [DESIGN.md](DESIGN.md)
+- 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；grep/find 工具、会话恢复和压缩等功能见 DESIGN.md 的里程碑。
+> 状态：v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；内置 `grep` / `find` 工具见「内置工具与预设」；会话恢复和压缩等功能见 DESIGN.md 的里程碑。
 
 ## Claude (Anthropic)
 
@@ -260,7 +260,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "profiles": {
     "coder": {
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
-      "tools": ["read", "ls", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"
+      "tools": ["read", "ls", "grep", "find", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"（见「内置工具与预设」）
       "model": "gpt-6.1-sol",                  // profile 默认模型
       "allowedModels": ["gpt-6.1-sol", "gpt-6-astra"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制；其它 OpenAI 模型需在此显式添加
       "reasoningEffort": "high",               // 可选：none|minimal|low|medium|high|xhigh|max 或 provider 小写名称
@@ -426,6 +426,8 @@ sub-bot ask --effort high "解释这个仓库"
   - Linux：`~/.local/share/sub-bot/logs`
   - macOS：`~/Library/Application Support/sub-bot/logs`
 - 每行日志都带 span：`request_id`（沿用请求的 `X-Request-Id`，也会回写到响应头）/ `bot` / `session_id` / `profile` / `model` / `reasoning_effort` / `tool`
+  - `session_run` span：`requested_reasoning_effort` 是请求值，`reasoning_effort` 是按（路由后）实际模型解析的值；`model` / `reasoning_effort` 每个 span 只记录一次（text 格式不再出现重复字段）
+  - `grep` / `find` 工具在 debug 级各有一个 span（正则只记长度，不记原文；记录 root、glob、type 与各选项），结束时 debug 记录搜索文件数、匹配数、耗时和是否截断；无法读取的路径汇总为一条 warn（`search skipped unreadable paths`，不作为 issue 上报）
 - 不会记录 API key、bot token 或回调 token；提示词、输出和文件内容只记录长度
 
 ## 其它 bot 如何调用
@@ -855,11 +857,62 @@ CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各�
 - 被切走的账号冷却 `providers.<id>.failoverCooldownSecs` 秒（默认 60）：冷却期内新的调用把它排到链尾；所有账号都在冷却时仍按原顺序尝试。
 - 每次切换上报一条 warn issue `account_failover`（details `{from, to, reason: "rate_limit"|"quota", attempt}`，scope.account 更新为新账号），事件流里是一次 `message_retry`（reason `account failover: work -> default (quota)`），客户端应丢弃此前的部分输出。
 
+## 内置工具与预设
+
+| 工具 | 风险 | 说明 | `default` | `no-shell` | `readonly` |
+|---|---|---|:-:|:-:|:-:|
+| `read` | read_fs | 读取 UTF-8 文本文件 | ✓ | ✓ | ✓ |
+| `ls` | read_fs | 列目录 | ✓ | ✓ | ✓ |
+| `grep` | read_fs | 正则搜索文件内容（内嵌 ripgrep） | ✓ | ✓ | ✓ |
+| `find` | read_fs | 按 glob 查找文件/目录（内嵌 ripgrep 的 `ignore` 遍历器） | ✓ | ✓ | ✓ |
+| `edit` | write_fs | 精确文本替换 | ✓ | ✓ | |
+| `write` | write_fs | 覆盖写文件 | ✓ | ✓ | |
+| `bash` | exec | `sh -c` 执行命令 | ✓ | | |
+| `clock` | safe | 当前 UTC 时间（需显式列出） | | | |
+| `http_fetch` | network | 受 host 白名单限制的 GET（需显式列出） | | | |
+
+profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相对会话 cwd，拒绝绝对路径和 `..`。
+
+### `grep` / `find`：内嵌 ripgrep 引擎
+
+`grep` 和 `find` **在进程内嵌入 ripgrep 的搜索引擎**——直接链接 ripgrep 项目（[BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep)）的库 crate：`grep-searcher`、`grep-regex`（及 `grep-matcher`）、`ignore`（并行、遵守 `.gitignore` 的遍历器）和 `globset`。**不需要安装 `rg`**，也不会启动任何子进程；宿主机上没有 `rg` / `grep` / `find` 时模型也能搜索。语义尽量与 `rg` 一致：
+
+- 遵守 `.gitignore`（git 仓库内）、`.ignore`、`.rgignore`、全局 gitignore、`.git/info/exclude` 及父目录中的这些文件；默认跳过隐藏文件；不跟随符号链接；`.git` 目录始终跳过（即使 `hidden=true`）。
+- 二进制文件（含 NUL 字节）整体跳过；每行输出最多 500 字符（超出标注 `… [line truncated: N chars]`），整体输出最多 50,000 字节。
+- 并行遍历后按路径排序，输出稳定；路径相对会话 cwd，可直接交给 `read` / `edit`。
+- 截断时附带提示，例如 `[truncated (limit 100): showing 100 of 2345 matching lines in 87 file(s); refine pattern/path/glob/type, use outputMode=files_with_matches/count or raise limit (max 1000)]`。
+- 搜索在阻塞线程池上运行，会话 abort / 工具取消时尽快停止（返回 `grep aborted` / `find aborted`）。权限不足等读取失败不致命，在输出末尾汇总（`[N path(s) could not be read and were skipped, e.g. ...]`）。
+
+`grep` 参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `pattern` | 必填 | 正则（Rust regex 语法）；非法时报错 `invalid regex: ...` |
+| `path` | `.` | 文件或目录（相对 cwd，限制在 cwd 内；不存在报 `path not found`） |
+| `glob` | – | 字符串或数组，同 `rg -g`：`"*.rs"`、`["src/**", "!*.min.js"]`；`!` 前缀表示排除；不含 `/` 的 glob 匹配任意层级文件名 |
+| `type` | – | ripgrep 文件类型（字符串或数组），如 `rust`、`py`、`ts`；未知类型报 `unknown file type '...'` |
+| `ignoreCase` | – | `true` 强制不区分大小写，`false` 强制区分；设置后覆盖 `smartCase` |
+| `smartCase` | `true` | 同 `rg -S`：pattern 全小写时不区分大小写 |
+| `fixedStrings` | `false` | 按字面量匹配 |
+| `wordRegexp` | `false` | 只匹配整词 |
+| `multiline` | `false` | 允许跨行匹配（pattern 可含 `\n`）；`.` 默认不匹配换行，需要时用 `(?s)` |
+| `context` / `before` / `after` | `0` | 上下文行数（最多 20）；`before` / `after` 覆盖 `context` |
+| `hidden` | `false` | 搜索隐藏文件 |
+| `noIgnore` | `false` | 不遵守 ignore 文件 |
+| `maxCount` | – | 每个文件最多匹配数（`>= 1`），触达时附提示 |
+| `limit` | `100` | 返回的匹配行数上限（`files_with_matches` / `count` 下为文件数），最多 1000 |
+| `outputMode` | `content` | `content`：`path:line:text`，上下文行 `path-line-text`，不连续的行组（含跨文件）之间用 `--` 分隔；`files_with_matches`：每行一个路径；`count`：`path:匹配行数` |
+
+没有匹配时返回 `No matches found`（不是错误）。结果的 `details`：`{matches, filesMatched, filesSearched, shown, truncated, binarySkipped, errors, elapsedMs}`。
+
+`find` 参数：`pattern`（必填，glob；不含 `/` 时匹配文件名，如 `"*.rs"`；含 `/` 时匹配相对 `path` 的路径，如 `"src/**/mod.rs"`，`*` 不跨目录、`**` 跨目录）、`path`（默认 `.`）、`type`（`file` 默认 / `dir` / `any`）、`hidden`、`noIgnore`、`maxDepth`（1 = 直接子项）、`limit`（默认 200，最多 5000）。输出相对 cwd 的路径、排序、每行一个，目录带尾部 `/`；截断时附 `[truncated: showing N of M paths; ...]`，没有结果返回 `No files found`。`details`：`{matches, shown, truncated, entriesVisited, errors, elapsedMs}`。
+
 ## 工具资源上限
 
 - `bash`：通过 `sh -c` 运行，独立进程组；取消、超时或清理时杀掉整个进程组（含子孙进程）。`timeoutSecs` 默认 120 秒，最多 1800 秒，等待输出管道 EOF 也计入超时。stdout/stderr 各捕获 256 KiB（合计 512 KiB），继续排空超出的输出并报告丢弃字节数；返回文本最多 50,000 字节（另加状态/截断提示）。
 - `read`：最多读取 2 MiB，返回文本最多 50,000 字节，超出附截断提示。
 - `ls`：最多保留 1000 个目录项并排序，附省略项数。
+- `grep`：每行最多 500 字符，`limit` 默认 100 / 最多 1000 条匹配行，`context` 最多 20，返回文本最多 50,000 字节；`find`：`limit` 默认 200 / 最多 5000 条路径，返回文本最多 50,000 字节。均附截断提示，支持取消。
 - `http_fetch`：响应体最多读取 2 MiB，返回文本最多 50,000 字节，超出附截断提示；连接超时 15 秒，总超时 60 秒（含响应体读取），支持取消。
 - 调用方 `callback`：响应体最多 1 MiB，超出报错；总超时 120 秒（含响应体读取），支持取消。
 
@@ -868,3 +921,23 @@ CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各�
 - 默认只监听 `127.0.0.1`。如果要跨机器访问，请放在带 TLS 的反向代理后面。
 - 受管 key 目录（Linux `~/.config/sub-bot/keys`）必须是当前用户所有、权限 0700 的真实目录，key 文件为 0600；`sub-bot keys set` 遇到不满足的已有目录会拒绝写入而不是修改权限。
 - `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。
+
+## 许可证 / License
+
+sub-bot 以下列任一许可证授权，由你选择：
+
+- Apache License, Version 2.0（[LICENSE-APACHE](LICENSE-APACHE) 或 <http://www.apache.org/licenses/LICENSE-2.0>）
+- MIT license（[LICENSE-MIT](LICENSE-MIT) 或 <http://opensource.org/licenses/MIT>）
+
+除非你明确声明，否则你有意提交、以纳入本项目的任何贡献（按 Apache-2.0 许可证的定义）都将按上述双许可证授权，不附加任何其它条款或条件。
+
+内嵌的 ripgrep 库 crate（`grep-searcher`、`grep-regex`、`grep-matcher`、`ignore`、`globset`，`MIT OR Unlicense`）等第三方组件的声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)。
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

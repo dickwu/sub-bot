@@ -3,6 +3,7 @@ name = "agent-ai"
 description = "统一 LLM 层（对应 pi-ai）：消息类型、流式事件、Provider trait、OpenAI 实现"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

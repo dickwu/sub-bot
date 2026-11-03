@@ -3,6 +3,7 @@ name = "agent-session"
 description = "JSONL 会话树持久化（对应 coding-agent/src/core/session-manager.ts）"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 repository.workspace = true
 
 [dependencies]

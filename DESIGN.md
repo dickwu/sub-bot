@@ -150,8 +150,9 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `AgentTool` / `AgentEvent` | `agent-core/src/{tool,event}.rs`，事件名与 `docs/json.md` 一致 | ✅ |
 | 钩子 `beforeToolCall`/`afterToolCall`/`transformContext` | 在 `LoopConfig` 上加 `Arc<dyn Hooks>` | M3 |
 | `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：**核心工具** `read`、`write`、`edit`、`ls`、`bash`（PowerShell），全部限定在会话 cwd 内 | ✅（edit 已有单测） |
-| `tools/grep.ts`、`find.ts`、`file-mutation-queue.ts`、`truncate.ts` | `agent-tools/src/builtin/{grep,find}.rs`（用 `ignore` 和 `grep-searcher` crate），`mutation_queue.rs` | M1 |
-| `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, edit, write, bash`；预设有 `default`、`readonly`、`no-shell` | ✅ |
+| `tools/grep.ts`、`find.ts` | `agent-tools/src/builtin/search.rs`：进程内嵌 ripgrep 引擎（`grep-searcher` / `grep-regex` / `ignore` / `globset`，不依赖外部 `rg`），结果按路径排序、输出有界 | ✅ |
+| `file-mutation-queue.ts`、`truncate.ts` | `mutation_queue.rs` | M1 |
+| `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, grep, find, edit, write, bash`；预设有 `default`、`readonly`（read/ls/grep/find）、`no-shell`（再加 edit/write） | ✅ |
 | `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 cwd 向上查找到 workspaceRoot 为止）、cwd | ✅ |
 | `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_messages`） | ✅ 读写；恢复会话在 M2 |
 | `core/compaction/*` | `agent-compaction` crate | M2 |
@@ -333,7 +334,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
 | **M0（已完成，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；会话 cwd 与 workspaceRoots 校验；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件，越权 cwd 和工具被拒，401/404 隔离） |
-| **M1：编码能力补齐** | ✅ OpenAI Responses API（v0.3）；`grep`、`find`（遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
+| **M1：编码能力补齐** | ✅ OpenAI Responses API（v0.3）；✅ `grep`、`find`（内嵌 ripgrep，遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
 | **M1.5：Claude** | `agent-ai/src/anthropic.rs` 接入 Anthropic Messages API；profile 增加 `provider` 字段；Hub 持有多个 provider，按 profile 分派 | 先用离线单测覆盖 SSE 解析和请求体，有 key 后再做端到端测试 |
 | **M2：会话** | 恢复会话（`sessionId` 重开后加载 JSONL）；fork 和分支切换；`compaction`（自动压缩和 `compact` 命令）；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
 | **M3：安全与治理** | `beforeToolCall` 审批钩子（profile 可设 bash 需要调用方确认，确认通过 SSE/RPC 往返）；bash 命令允许和拒绝规则；每个 bot 的限流和并发上限；审计日志；内建 TLS；keyring | 只读 profile 无法写文件，也无法执行命令；审批流程可用 |

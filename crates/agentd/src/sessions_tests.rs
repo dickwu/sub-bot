@@ -23,13 +23,14 @@ use tower::ServiceExt;
 
 /// 脚本 provider：
 /// - 摘要请求（系统提示为摘要提示）⇒ `SUMMARY-<n>`（用量 15），`fail_summary` 时返回错误；
-/// - `/tool ...` 或工具结果之后 ⇒ 交给 FauxProvider；
+/// - `/tool ...` 或工具结果之后 ⇒ 交给 FauxProvider（`tool_thinking` 时工具调用前加一个带签名的 thinking 块）；
 /// - 其它 ⇒ 带签名 thinking 块 + `reply <n>`；`gate` 存在时等待一个 permit 再回复。
 #[derive(Default)]
 pub(crate) struct Script {
     pub seen: Mutex<Vec<Request>>,
     pub fail_summary: AtomicBool,
     pub gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    pub tool_thinking: AtomicBool,
     replies: AtomicUsize,
     summaries: AtomicUsize,
 }
@@ -75,7 +76,17 @@ impl Provider for Script {
             return Box::pin(futures::stream::iter(vec![event]));
         }
         if matches!(req.messages.last(), Some(Message::ToolResult(_))) || first_text(req.messages.last()).starts_with("/tool ") {
-            return agent_ai::faux::FauxProvider.stream(req, cancel);
+            let stream = agent_ai::faux::FauxProvider.stream(req, cancel);
+            if !self.tool_thinking.load(Ordering::SeqCst) {
+                return stream;
+            }
+            return Box::pin(futures::StreamExt::map(stream, |event| match event {
+                AssistantEvent::Done { mut message } if message.stop_reason == StopReason::ToolUse => {
+                    message.content.insert(0, Content::Thinking { thinking: "tool thinking".into(), signature: Some("sig-tool".into()) });
+                    AssistantEvent::Done { message }
+                }
+                other => other,
+            }));
         }
         let n = self.replies.fetch_add(1, Ordering::SeqCst) + 1;
         let gate = self.gate.lock().unwrap().clone();
@@ -363,7 +374,7 @@ async fn auto_compaction_is_cumulative_persisted_and_reloads() {
 }
 
 #[tokio::test]
-async fn compaction_keeps_signed_thinking_and_tool_pairs_verbatim() {
+async fn compaction_strips_kept_thinking_and_keeps_tool_pairs() {
     let script = Script::default();
     let mut a1 = AssistantMessage::empty("m");
     a1.content = vec![
@@ -384,7 +395,10 @@ async fn compaction_keeps_signed_thinking_and_tool_pairs_verbatim() {
     assert_eq!((cut.cut, cut.split_turn), (5, true));
     let call = crate::compaction::SummaryCall { provider: &script, model: "m", api: agent_ai::Api::Auto, max_tokens: 1000, llm_max_retries: None };
     let outcome = crate::compaction::compact(&call, &messages, cut, 0, Some("keep file names"), Default::default()).await.unwrap();
-    assert_eq!(outcome.context, vec![cp::summary_message("SUMMARY-1"), Message::Assistant(a3), result("c2")]);
+    // 保留的助手消息去掉了签名 thinking（Anthropic 的签名绑定到已被摘要改写的前缀），tool_use / tool_result 配对完整
+    let mut a3_kept = a3.clone();
+    a3_kept.content.remove(0);
+    assert_eq!(outcome.context, vec![cp::summary_message("SUMMARY-1"), Message::Assistant(a3_kept), result("c2")]);
     let prompt_text = first_text(script.summary_requests()[0].messages.first());
     assert!(prompt_text.contains("[User]: q2") && prompt_text.contains("keep file names") && prompt_text.contains("read: a.rs"));
     for secret in ["SIG-ONE", "SIG-TWO", "OPAQUE"] {
@@ -648,4 +662,132 @@ async fn pending_approval_blocks_compaction_and_resume_keeps_approval_gate() {
     assert!(p["reason"].as_str().unwrap().starts_with("session: tool 'ls' requires approval"), "{p}");
     hub1.abort_all().await;
     hub2.abort_all().await;
+}
+
+fn has_thinking(m: &Message) -> bool {
+    matches!(m, Message::Assistant(a) if a.content.iter().any(|c| matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. })))
+}
+
+fn stored_thinking_messages(path: &Path) -> usize {
+    file_entries(path).iter().filter(|e| matches!(e, Entry::Message { message, .. } if has_thinking(message))).count()
+}
+
+/// 自动压缩在工具循环中途切在助手消息前：保留的助手消息去掉签名 thinking（只剩 tool_use），tool_result 配对完整；
+/// JSONL 里的原消息不变，恢复得到与在线会话相同的上下文。
+#[tokio::test]
+async fn auto_compaction_mid_tool_loop_strips_kept_thinking_and_resume_matches() {
+    let dir = TempDir::new();
+    let (hub1, script) = hub(&dir, eager_compaction);
+    script.tool_thinking.store(true, Ordering::SeqCst);
+    let h = hub1.create_session(&client(&hub1, "default"), SessionRequest::default()).unwrap();
+    prompt(&h, "hello").await;
+    let c = compactions(&prompt(&h, "/tool ls {}").await);
+    // 工具调用前一次、工具结果之后一次
+    assert_eq!(c.len(), 4, "{c:?}");
+    let sent = script.main_requests().last().unwrap().messages.clone();
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[0], cp::summary_message("SUMMARY-2"));
+    let Message::Assistant(a) = &sent[1] else { panic!("assistant expected: {sent:?}") };
+    assert!(matches!(&a.content[..], [Content::ToolCall(t)] if t.name == "ls"), "{a:?}");
+    assert!(matches!(&sent[2], Message::ToolResult(r) if r.tool_call_id == a.tool_calls()[0].id));
+    // 摘要之后的上下文里没有任何压缩之前的 thinking
+    assert!(!sent.iter().any(has_thinking));
+    let context = h.agent.messages().await;
+    assert_eq!(&context[..3], &sent[..]);
+    // 文件里的原消息保留签名
+    let path = h.hooks.path().unwrap();
+    assert!(file_entries(&path).iter().any(|e| matches!(e, Entry::Message { message: Message::Assistant(a), .. }
+        if a.content.first() == Some(&Content::Thinking { thinking: "tool thinking".into(), signature: Some("sig-tool".into()) }))));
+    assert_eq!(Session::open(&path).unwrap().active_messages(), context);
+    let id = h.id.clone();
+    drop((h, hub1));
+    let (hub2, _) = hub(&dir, eager_compaction);
+    let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().unwrap();
+    assert_eq!(h.agent.messages().await, context);
+}
+
+/// 手动压缩：保留消息去掉 thinking；压缩之后的新消息保留自己的 thinking，直到下一次压缩保留（并去掉）它们；
+/// 恢复后发给模型的上下文与在线会话完全相同。
+#[tokio::test]
+async fn manual_compaction_strips_kept_thinking_new_messages_keep_theirs_and_resume_matches() {
+    // 保留最后一个回合：用户消息（"two" / "four"）1 token + 助手（"thinking n" + "reply n"）5 token
+    let keep_last_turn = |cfg: &mut Config| {
+        cfg.profiles.get_mut("default").unwrap().compaction = Some(crate::compaction::CompactionConfig { enabled: Some(false), keep_recent_tokens: Some(6), ..Default::default() });
+    };
+    let reply_only = |n: u32| vec![Content::Text { text: format!("reply {n}") }];
+    let assistant_content = |m: Option<&Message>| match m {
+        Some(Message::Assistant(a)) => a.content.clone(),
+        other => panic!("assistant expected: {other:?}"),
+    };
+    let signed = |n: u32| Content::Thinking { thinking: format!("thinking {n}"), signature: Some(format!("sig-{n}")) };
+    let dir = TempDir::new();
+    let (hub1, script) = hub(&dir, keep_last_turn);
+    let h = hub1.create_session(&client(&hub1, "default"), SessionRequest::default()).unwrap();
+    prompt(&h, "one").await;
+    prompt(&h, "two").await;
+    assert!(h.compact(None).await.unwrap().compacted);
+    let context = h.agent.messages().await;
+    assert_eq!(context.len(), 3, "{context:?}");
+    assert_eq!((context[0].clone(), first_text(context.get(1))), (cp::summary_message("SUMMARY-1"), "two".to_string()));
+    assert_eq!(assistant_content(context.get(2)), reply_only(2));
+    // 压缩后的调用：保留消息没有 thinking
+    prompt(&h, "three").await;
+    let sent = script.main_requests().last().unwrap().messages.clone();
+    assert_eq!(sent.len(), 4);
+    assert_eq!(assistant_content(sent.get(2)), reply_only(2));
+    // 压缩之后产生的消息保留签名 thinking 并原样回放
+    prompt(&h, "four").await;
+    let sent = script.main_requests().last().unwrap().messages.clone();
+    assert_eq!(assistant_content(sent.get(4)), vec![signed(3), Content::Text { text: "reply 3".into() }]);
+    // 第二次压缩保留 [four, reply 4]：reply 4 的 thinking 被去掉
+    assert!(h.compact(None).await.unwrap().compacted);
+    let context = h.agent.messages().await;
+    assert_eq!(context.len(), 3, "{context:?}");
+    assert_eq!((context[0].clone(), first_text(context.get(1))), (cp::summary_message("SUMMARY-2"), "four".to_string()));
+    assert_eq!(assistant_content(context.get(2)), reply_only(4));
+    prompt(&h, "five").await;
+    let context = h.agent.messages().await;
+    assert_eq!(assistant_content(context.get(4)), vec![signed(5), Content::Text { text: "reply 5".into() }]);
+    // JSONL 保留所有原始 thinking；重建得到相同的上下文
+    let path = h.hooks.path().unwrap();
+    assert_eq!(stored_thinking_messages(&path), 5);
+    assert_eq!(Session::open(&path).unwrap().active_messages(), context);
+    let id = h.id.clone();
+    drop((h, hub1));
+    let (hub2, script2) = hub(&dir, keep_last_turn);
+    let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().unwrap();
+    assert_eq!(h.agent.messages().await, context);
+    prompt(&h, "six").await;
+    let sent = &script2.main_requests()[0].messages;
+    assert_eq!(&sent[..5], &context[..]);
+    assert!(!has_thinking(&sent[2]) && has_thinking(&sent[4]));
+}
+
+/// 旧版本压缩过的会话（保留消息带签名 thinking，之后每次调用都 400）在恢复时自愈：发给模型的上下文不再带这些块。
+#[tokio::test]
+async fn rehydrate_heals_sessions_compacted_by_older_versions() {
+    let dir = TempDir::new();
+    let (hub1, _) = hub(&dir, |_| {});
+    let h = hub1.create_session(&client(&hub1, "default"), SessionRequest::default()).unwrap();
+    prompt(&h, "one").await;
+    prompt(&h, "two").await;
+    let (id, path) = (h.id.clone(), h.hooks.path().unwrap());
+    drop((h, hub1));
+    // 旧版本：压缩条目保留 [two, reply 2（带签名 thinking）]，之后的调用失败
+    let mut s = Session::open(&path).unwrap();
+    let kept = s.active_context()[2].0.clone().unwrap();
+    s.append_compaction("OLD".into(), kept, None, None).unwrap();
+    s.append_message(Message::user_text("three")).unwrap();
+    s.append_message(Message::Assistant(AssistantMessage::failed("faux", StopReason::Error, "Anthropic HTTP 400: Invalid `signature` in `thinking` block"))).unwrap();
+    drop(s);
+    let (hub2, script) = hub(&dir, |_| {});
+    let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().unwrap();
+    prompt(&h, "four").await;
+    let sent = &script.main_requests()[0].messages;
+    assert_eq!(sent[0], cp::summary_message("OLD"));
+    assert!(matches!(&sent[2], Message::Assistant(a) if a.content == vec![Content::Text { text: "reply 2".into() }]), "{sent:?}");
+    assert!(!sent.iter().any(has_thinking));
+    // 文件里的原消息不变（加上恢复后新回复的一条）
+    assert_eq!(stored_thinking_messages(&path), 3);
+    assert_eq!(Session::open(&path).unwrap().active_messages(), h.agent.messages().await);
 }

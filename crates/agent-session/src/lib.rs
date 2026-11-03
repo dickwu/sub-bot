@@ -460,6 +460,8 @@ impl Session {
     }
 
     /// 活动上下文：(entry id, 消息)。最近一次压缩之后为 [摘要（id None）] + 保留消息 + 新消息（对应 buildSessionContext）。
+    /// 保留消息（压缩之前写入的）去掉 thinking 块（见 [`compaction::strip_thinking`]），与在线压缩得到的上下文一致；
+    /// 文件里的消息本身不变。压缩之后追加的消息原样返回。
     pub fn active_context(&self) -> Vec<(Option<String>, Message)> {
         let chain = self.chain();
         let last_compaction = chain.iter().rposition(|e| matches!(e, Entry::Compaction { .. }));
@@ -472,7 +474,9 @@ impl Session {
                 if let Some(k) = chain[..c].iter().position(|e| e.id() == first_kept_entry_id) {
                     for e in &chain[k..c] {
                         if let Entry::Message { id, message, .. } = e {
-                            out.push((Some(id.clone()), message.clone()));
+                            if let Some(message) = compaction::strip_thinking(message.clone()) {
+                                out.push((Some(id.clone()), message));
+                            }
                         }
                     }
                 }
@@ -629,6 +633,66 @@ mod tests {
         let re = Session::open(&s.path).unwrap();
         assert_eq!(re.active_context(), ctx);
         assert!(re.is_compacted());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn has_thinking(m: &Message) -> bool {
+        matches!(m, Message::Assistant(a) if a.content.iter().any(|c| matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. })))
+    }
+
+    fn thinking_assistant(n: u32, rest: Vec<Content>) -> Message {
+        let mut a = AssistantMessage::empty("m");
+        a.content = vec![Content::Thinking { thinking: format!("t{n}"), signature: Some(format!("SIG-{n}")) }, Content::RedactedThinking { data: format!("R-{n}") }];
+        a.content.extend(rest);
+        if a.content.iter().any(|c| matches!(c, Content::ToolCall(_))) {
+            a.stop_reason = StopReason::ToolUse;
+        }
+        Message::Assistant(a)
+    }
+
+    #[test]
+    fn compaction_rebuild_strips_thinking_from_kept_messages_only() {
+        let dir = temp_dir("think");
+        let mut s = Session::create(&dir, "p").unwrap();
+        let text = |t: &str| Content::Text { text: t.into() };
+        let call = Content::ToolCall(ToolCall { id: "c1".into(), name: "read".into(), arguments: serde_json::json!({}) });
+        let tool_result = Message::ToolResult(ToolResultMessage { tool_call_id: "c1".into(), tool_name: "read".into(), content: vec![text("ok")], is_error: false, timestamp: 0 });
+        s.append_message(Message::user_text("one")).unwrap();
+        s.append_message(thinking_assistant(1, vec![text("r1")])).unwrap();
+        let kept = s.append_message(Message::user_text("two")).unwrap();
+        s.append_message(thinking_assistant(2, vec![call])).unwrap();
+        s.append_message(tool_result.clone()).unwrap();
+        // 只有 thinking 的助手消息（中止）：去掉后为空 ⇒ 从上下文中丢弃
+        s.append_message(thinking_assistant(3, vec![])).unwrap();
+        s.append_message(thinking_assistant(4, vec![text("r4")])).unwrap();
+        let before = s.active_messages();
+        assert_eq!(before.len(), 7);
+        // 在线压缩得到的上下文：摘要 + 去掉 thinking 的保留消息
+        let live: Vec<Message> = std::iter::once(compaction::summary_message("SUM")).chain(compaction::strip_kept_thinking(&before[2..])).collect();
+        s.append_compaction("SUM".into(), kept.clone(), None, None).unwrap();
+        assert_eq!(s.active_messages(), live);
+        assert_eq!(live.len(), 5);
+        assert!(!live.iter().any(has_thinking));
+        let Message::Assistant(a2) = &live[2] else { panic!("assistant") };
+        assert_eq!((a2.tool_calls()[0].id.as_str(), a2.content.len()), ("c1", 1));
+        assert_eq!(live[3], tool_result);
+        // 压缩之后的新消息保留 thinking
+        s.append_message(Message::user_text("three")).unwrap();
+        let after = thinking_assistant(5, vec![text("r5")]);
+        let after_id = s.append_message(after.clone()).unwrap();
+        let ctx = s.active_context();
+        assert_eq!(ctx.last().unwrap().1, after);
+        // 重建（重新打开）与内存结果相同；JSONL 里的原消息不变
+        let re = Session::open(&s.path).unwrap();
+        assert_eq!(re.active_context(), ctx);
+        let stored: Vec<&Message> = re.entries().iter().filter_map(|e| if let Entry::Message { message, .. } = e { Some(message) } else { None }).collect();
+        assert_eq!(stored.iter().filter(|m| has_thinking(m)).count(), 5);
+        // 第二次压缩保留 after ⇒ 它的 thinking 也被去掉
+        let mut re = re;
+        re.append_compaction("SUM2".into(), after_id, None, None).unwrap();
+        let Message::Assistant(mut expected) = after else { unreachable!() };
+        expected.content.retain(|c| matches!(c, Content::Text { .. }));
+        assert_eq!(re.active_messages(), vec![compaction::summary_message("SUM2"), Message::Assistant(expected)]);
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -133,14 +133,16 @@ pub struct Outcome {
 }
 
 /// 摘要 `messages[cut.start..cut.cut]`（上下文开头已有摘要时把它作为 previous summary，使摘要累积），重建上下文。
-/// 保留部分的消息（包括带签名的 thinking 块）原样不动。
+/// 保留部分的消息去掉 thinking / redacted thinking 块（Anthropic 把 thinking 签名绑定到之前的对话，摘要改写前缀后
+/// 旧签名失效，见 [`cp::strip_thinking`]）；其它内容（文本、工具调用、工具结果）原样不动。JSONL 里的原消息不变，
+/// 从 JSONL 重建（`Session::active_context`）做同样的处理。
 pub async fn compact(call: &SummaryCall<'_>, messages: &[Message], cut: CutPoint, overhead_tokens: u64, instructions: Option<&str>, cancel: CancellationToken) -> Result<Outcome, SummaryError> {
     let previous = (cut.start == 1).then(|| cp::summary_of(&messages[0])).flatten();
     let prompt = cp::summary_prompt(&messages[cut.start..cut.cut], previous, instructions);
     let (summary, usage) = summarize(call, prompt, cancel).await?;
     let mut context = Vec::with_capacity(messages.len() - cut.cut + 1);
     context.push(cp::summary_message(&summary));
-    context.extend_from_slice(&messages[cut.cut..]);
+    context.extend(cp::strip_kept_thinking(&messages[cut.cut..]));
     let tokens_after = overhead_tokens + context.iter().map(cp::estimate_tokens).sum::<u64>();
     Ok(Outcome { context, cut, summary, tokens_after, usage })
 }

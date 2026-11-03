@@ -80,6 +80,31 @@ pub fn summary_of(message: &Message) -> Option<&str> {
     }
 }
 
+/// 压缩之前就存在、被压缩保留下来的消息在发给模型的上下文里去掉 `Thinking` / `RedactedThinking` 块。
+///
+/// Anthropic 把 thinking 签名绑定到该块之前的整段对话；压缩用摘要改写了前缀，保留消息里的签名 thinking
+/// 从此每次调用都被拒绝（HTTP 400 "Invalid `signature` in `thinking` block … bound to a different conversation"）。
+/// 去掉这些块后请求合法（普通回合与工具循环中途都是：只有 tool_use 的助手消息 + tool_result 照样被接受）。
+/// 压缩之后新产生的消息不经过这里，保留自己的 thinking（它们的前缀就是压缩后的上下文）。JSONL 不改，
+/// 只有内存 / 重建出的上下文被处理，所以在线压缩与从 JSONL 重建得到相同的结果。
+///
+/// 只有因此变成空内容的助手消息会被丢弃（返回 None）：空内容意味着没有工具调用，不会拆开 tool_use / tool_result；
+/// 原本就为空的消息（例如失败的调用）和其它角色的消息原样返回。
+pub fn strip_thinking(message: Message) -> Option<Message> {
+    let Message::Assistant(mut a) = message else { return Some(message) };
+    let before = a.content.len();
+    a.content.retain(|c| !matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. }));
+    if a.content.is_empty() && before > 0 {
+        return None;
+    }
+    Some(Message::Assistant(a))
+}
+
+/// 对一组保留消息应用 [`strip_thinking`]。
+pub fn strip_kept_thinking(messages: &[Message]) -> Vec<Message> {
+    messages.iter().cloned().filter_map(strip_thinking).collect()
+}
+
 pub fn estimate_text_tokens(text: &str) -> u64 {
     (text.chars().count() as u64).div_ceil(4)
 }
@@ -400,6 +425,38 @@ mod tests {
         let mut e = AssistantMessage::failed("m", StopReason::Error, "x");
         e.usage.total_tokens = 5;
         assert!(!estimate_context_tokens(&[Message::Assistant(e)], 0, 0).from_usage);
+    }
+
+    #[test]
+    fn strip_thinking_keeps_text_and_tool_calls_and_drops_emptied_messages() {
+        let thinking = || Content::Thinking { thinking: "t".into(), signature: Some("SIG".into()) };
+        let redacted = || Content::RedactedThinking { data: "OPAQUE".into() };
+        // 文本回合：只剩文本
+        let mut text = AssistantMessage::empty("m");
+        text.content = vec![thinking(), redacted(), Content::Text { text: "answer".into() }];
+        // 工具循环中途：只剩 tool_use，配对的工具结果不受影响
+        let Message::Assistant(mut call) = assistant("", &["c1"]) else { unreachable!() };
+        call.content.insert(0, thinking());
+        // 只有 thinking（例如在 thinking 阶段中止）⇒ 变空 ⇒ 丢弃（没有工具调用，不影响配对）
+        let mut only = AssistantMessage::failed("m", StopReason::Aborted, "aborted");
+        only.content = vec![thinking(), redacted()];
+        // 原本就为空的失败消息原样保留
+        let failed = AssistantMessage::failed("m", StopReason::Error, "boom");
+        let kept = vec![user("q"), Message::Assistant(text), Message::Assistant(call), result("c1", "ok"), Message::Assistant(only), Message::Assistant(failed.clone())];
+        let stripped = strip_kept_thinking(&kept);
+        let mut text_expected = AssistantMessage::empty("m");
+        text_expected.content = vec![Content::Text { text: "answer".into() }];
+        assert_eq!(stripped, vec![user("q"), Message::Assistant(text_expected), assistant("", &["c1"]), result("c1", "ok"), Message::Assistant(failed)]);
+        for m in &stripped {
+            if let Message::Assistant(a) = m {
+                assert!(!a.content.iter().any(|c| matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. })));
+            }
+        }
+        // tool_use / tool_result 配对完整
+        assert!(matches!(&stripped[2], Message::Assistant(a) if a.tool_calls()[0].id == "c1" && a.stop_reason == StopReason::ToolUse));
+        assert!(matches!(&stripped[3], Message::ToolResult(r) if r.tool_call_id == "c1"));
+        // 用户消息、工具结果原样返回
+        assert_eq!(strip_thinking(user("x")), Some(user("x")));
     }
 
     #[test]

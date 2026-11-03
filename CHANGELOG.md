@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.10.1] - 2026-11-03
+
+### Fixed
+- **Context compaction broke Anthropic extended-thinking sessions**: after a compaction every following Anthropic call failed with HTTP 400 `Invalid signature in thinking block … bound to a different conversation`, because the kept assistant messages still carried signed `thinking` blocks whose signature is bound to the (now rewritten) preceding conversation. The session stayed broken, including after a restart. Kept messages created before a compaction now have their `thinking` / `redacted_thinking` blocks removed from the context sent to the model — for live auto compaction, manual compaction (HTTP / RPC / CLI) and when the context is rebuilt from the JSONL on resume. Text, tool calls and tool_use / tool_result pairing are unchanged; an assistant message left with no content is dropped (it has no tool calls). Messages produced after a compaction keep their thinking until a later compaction keeps them. The JSONL still stores the original messages, so sessions already broken by 0.10.0 heal when rehydrated with 0.10.1.
+
 ## [0.10.0] - 2026-11-03
 
 ### Added

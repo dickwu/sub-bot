@@ -3,14 +3,37 @@ use clap::Args;
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// 连接参数（`ask` 与 `turns` 共用）。
 #[derive(Args)]
-pub struct Ask {
+pub struct Connection {
     #[arg(long, conflicts_with = "url")]
     pub socket: Option<PathBuf>,
     #[arg(long)]
     pub url: Option<String>,
     #[arg(long)]
     pub token_file: Option<PathBuf>,
+}
+
+impl Connection {
+    /// token：--token-file > SUB_BOT_TOKEN；默认优先使用 `<dataDir>/sub-bot.sock`（存在时），否则 http://127.0.0.1:7878。
+    pub fn client(&self, data_dir: PathBuf) -> anyhow::Result<Client> {
+        let token = match &self.token_file {
+            Some(path) => Some(std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read token file"))?),
+            None => std::env::var("SUB_BOT_TOKEN").ok(),
+        };
+        let default_socket = data_dir.join("sub-bot.sock");
+        if self.socket.is_none() && self.url.is_none() {
+            crate::config::prepare_temp_data_dir(&default_socket, false)?;
+        }
+        let socket = self.socket.clone().or_else(|| (self.url.is_none() && default_socket.exists()).then_some(default_socket));
+        Client::new(socket, self.url.clone(), token.as_deref())
+    }
+}
+
+#[derive(Args)]
+pub struct Ask {
+    #[command(flatten)]
+    pub conn: Connection,
     #[arg(long)]
     pub profile: Option<String>,
     /// Continue a server session (also after a server restart: the server reloads it from its session directory).
@@ -41,6 +64,16 @@ pub struct Ask {
     /// Deny every tool call that the server's toolApproval policy asks about.
     #[arg(long)]
     pub auto_deny: bool,
+    /// Turn budget (model calls per run, >= 1, no cap): session.maxTurns for a new session; with --session it is applied
+    /// to the existing session first (POST /v1/sessions/{id}/turns).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_turns: Option<u64>,
+    /// What to do when the turn budget runs out (new sessions only): stop | ask | summarize.
+    #[arg(long)]
+    pub on_max_turns: Option<agent_core::OnMaxTurns>,
+    /// When the run pauses at the turn limit (onMaxTurns=ask), add N turns automatically (POST addTurns) and continue.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub auto_extend_turns: Option<u64>,
     /// Message, or - to read stdin.
     pub message: String,
 }
@@ -71,6 +104,32 @@ pub struct Client {
     /// 新会话的账号（session.account）
     account: Option<String>,
     approval: ApprovalMode,
+    /// 新会话的 session.maxTurns / session.onMaxTurns
+    max_turns: Option<u64>,
+    on_max_turns: Option<agent_core::OnMaxTurns>,
+    /// --auto-extend-turns：暂停在回合上限时自动 addTurns
+    auto_extend_turns: Option<u64>,
+    /// 暂停在回合上限时在 stderr 提示如何延长（--json 时不提示）
+    turn_hints: bool,
+}
+
+/// 因回合上限结束（stopReason max_turns）：stderr 已提示如何继续，退出码非零。
+#[derive(Debug)]
+pub struct MaxTurnsReached;
+
+impl std::fmt::Display for MaxTurnsReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request stopped at max_turns")
+    }
+}
+
+impl std::error::Error for MaxTurnsReached {}
+
+/// 文本模式的继续提示（stderr）。
+pub fn max_turns_line(turns_used: Option<u64>, max_turns: Option<u64>, session_id: &str, continue_cmd: &str) -> String {
+    let n = turns_used.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    let m = max_turns.map(|n| n.to_string()).unwrap_or_else(|| "?".into());
+    format!("max_turns reached ({n}/{m}). Continue: {continue_cmd} {session_id} \"<message>\" (add --max-turns N to raise the budget)")
 }
 
 impl Client {
@@ -98,7 +157,21 @@ impl Client {
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
         let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
-        Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None, account: None, approval: ApprovalMode::Ignore })
+        Ok(Self {
+            socket,
+            url,
+            token,
+            http,
+            provider: None,
+            effort: None,
+            depth: None,
+            account: None,
+            approval: ApprovalMode::Ignore,
+            max_turns: None,
+            on_max_turns: None,
+            auto_extend_turns: None,
+            turn_hints: false,
+        })
     }
 
     async fn response(
@@ -157,8 +230,43 @@ impl Client {
         if let Some(depth) = self.depth {
             body["depth"] = json!(depth);
         }
+        // 已有会话的 maxTurns 走 turns 端点（见 run）；onMaxTurns 只对新会话有效
+        if session.is_none() {
+            if let Some(n) = self.max_turns {
+                body["session"]["maxTurns"] = json!(n);
+            }
+            if let Some(mode) = self.on_max_turns {
+                body["session"]["onMaxTurns"] = json!(mode);
+            }
+        }
         body.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
         body
+    }
+
+    /// `POST /v1/sessions/{id}/turns`；非 2xx ⇒ 错误（含服务端错误文本）。
+    pub async fn post_turns(&self, session_id: &str, body: &Value) -> anyhow::Result<Value> {
+        let (status, v) = self.request(axum::http::Method::POST, &format!("/v1/sessions/{session_id}/turns"), Some(body)).await?;
+        if !status.is_success() {
+            return Err(http_error(status, Some(&v)));
+        }
+        Ok(v)
+    }
+
+    /// run 暂停在回合上限（turn_budget_exhausted action=ask，或会话视图 turnBudget.pause）：
+    /// --auto-extend-turns N ⇒ POST addTurns N；否则在 stderr 提示如何延长 / 停止。失败只在 stderr 提示。
+    async fn handle_turn_pause(&self, session_id: Option<&str>, event: &Value) {
+        let Some(sid) = session_id.and_then(|id| uuid::Uuid::parse_str(id).ok()) else { return };
+        let (used, max, timeout) = (&event["turnsUsed"], &event["maxTurns"], &event["timeoutSecs"]);
+        match self.auto_extend_turns {
+            Some(n) => match self.post_turns(&sid.to_string(), &json!({"addTurns": n})).await {
+                Ok(v) => eprintln!("[turns] max_turns reached ({used}/{max}); added {n} turns by --auto-extend-turns (maxTurns now {})", v["maxTurns"]),
+                Err(e) => eprintln!("[turns] cannot extend the turn budget: {e}"),
+            },
+            None if self.turn_hints => eprintln!(
+                "[turns] run paused at max_turns ({used}/{max}); waiting up to {timeout}s. Extend: sub-bot turns {sid} --add N (or stop: sub-bot turns {sid} --stop), or rerun with --auto-extend-turns N"
+            ),
+            None => {}
+        }
     }
 
     /// 按 [`ApprovalMode`] 处理一次 approval_required（SSE 事件或 GET approvals 列表项，字段相同）。失败只在 stderr 提示。
@@ -199,7 +307,14 @@ impl Client {
         }
     }
 
-    pub async fn ask_stream(&self, message: &str, profile: Option<&str>, session: Option<&str>, timeout_secs: u64, mut on_event: impl FnMut(&str, &Value) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    pub async fn ask_stream(
+        &self,
+        message: &str,
+        profile: Option<&str>,
+        session: Option<&str>,
+        timeout_secs: u64,
+        mut on_event: impl FnMut(&str, &Value) -> anyhow::Result<()>,
+    ) -> anyhow::Result<StreamOutcome> {
         use http_body_util::BodyExt;
         let request = async {
             let body = self.chat_body(message, profile, session, json!({"stream": true}));
@@ -225,13 +340,17 @@ impl Client {
                         anyhow::ensure!(event.is_object(), "invalid server event JSON");
                         on_event(data, &event)?;
                         outcome.event(&event);
-                        if event["type"] == "approval_required" {
+                        if event["type"] == "approval_required" || (event["type"] == "turn_budget_exhausted" && event["action"] == "ask") {
                             approvals.push(event);
                         }
                         Ok(())
                     })?;
                     for event in approvals.drain(..) {
-                        self.handle_approval(session_id.as_deref(), &event).await;
+                        if event["type"] == "turn_budget_exhausted" {
+                            self.handle_turn_pause(session_id.as_deref(), &event).await;
+                        } else {
+                            self.handle_approval(session_id.as_deref(), &event).await;
+                        }
                     }
                     if outcome.settled {
                         return outcome.finish();
@@ -262,6 +381,7 @@ impl Client {
         let path = format!("/v1/tasks/{id}");
         let session_id = response["sessionId"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()).map(|s| s.to_string());
         let mut handled = std::collections::HashSet::new();
+        let mut paused = None;
         loop {
             let (status, task) = self.request(axum::http::Method::GET, &path, None).await?;
             if !status.is_success() {
@@ -279,6 +399,16 @@ impl Client {
                                 self.handle_approval(Some(sid), item).await;
                             }
                         }
+                    }
+                }
+            }
+            // 同样轮询回合预算暂停（每次暂停只处理一次）
+            if let (true, Some(sid)) = (self.auto_extend_turns.is_some() || self.turn_hints, session_id.as_deref()) {
+                if let Ok((status, view)) = self.request(axum::http::Method::GET, &format!("/v1/sessions/{sid}"), None).await {
+                    let pause = &view["turnBudget"]["pause"];
+                    if status.is_success() && pause.is_object() && paused.as_ref() != Some(pause) {
+                        paused = Some(pause.clone());
+                        self.handle_turn_pause(Some(sid), pause).await;
                     }
                 }
             }
@@ -339,10 +469,15 @@ fn text_delta(event: &Value) -> Option<&str> {
     (event["type"] == "message_update" && update["type"] == "text_delta").then(|| update["delta"].as_str()).flatten()
 }
 
-#[derive(Default)]
-struct StreamOutcome {
+#[derive(Default, Debug)]
+pub struct StreamOutcome {
     settled: bool,
     error: Option<String>,
+    /// 本次 run 因回合上限结束（`run_outcome: max_turns`；每个 agent_start 重置）
+    pub max_turns_reached: bool,
+    /// 最近一次 turn_budget_exhausted 的 turnsUsed / maxTurns
+    pub turns_used: Option<u64>,
+    pub max_turns: Option<u64>,
 }
 
 impl StreamOutcome {
@@ -372,6 +507,12 @@ impl StreamOutcome {
             Some("run_outcome") if matches!(event["kind"].as_str(), Some("task_panic" | "run_timeout")) => {
                 self.error = Some(format!("agent failed: {}", event["kind"].as_str().unwrap()));
             }
+            Some("agent_start") => self.max_turns_reached = false,
+            Some("run_outcome") if event["kind"] == "max_turns" => self.max_turns_reached = true,
+            Some("turn_budget_exhausted") => {
+                self.turns_used = event["turnsUsed"].as_u64();
+                self.max_turns = event["maxTurns"].as_u64();
+            }
             Some("agent_settled") => {
                 self.settled = true;
                 if event["aborted"] == true {
@@ -383,12 +524,13 @@ impl StreamOutcome {
         }
     }
 
-    fn finish(self) -> anyhow::Result<()> {
-        if let Some(error) = self.error {
+    /// 回合上限结束不在这里报错（调用方打印继续提示后以 [`MaxTurnsReached`] 退出）。
+    fn finish(self) -> anyhow::Result<Self> {
+        if let (Some(error), false) = (&self.error, self.max_turns_reached) {
             anyhow::bail!("{error}");
         }
         anyhow::ensure!(self.settled, "server event stream ended before agent_settled");
-        Ok(())
+        Ok(self)
     }
 }
 
@@ -399,16 +541,18 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
         message.clear();
         tokio::io::stdin().read_to_string(&mut message).await?;
     }
-    let token = match &args.token_file {
-        Some(path) => Some(std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read token file"))?),
-        None => std::env::var("SUB_BOT_TOKEN").ok(),
-    };
-    let default_socket = data_dir.join("sub-bot.sock");
-    if args.socket.is_none() && args.url.is_none() {
-        crate::config::prepare_temp_data_dir(&default_socket, false)?;
+    anyhow::ensure!(args.on_max_turns.is_none() || args.session.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
+    let mut client = args.conn.client(data_dir)?;
+    client.max_turns = args.max_turns;
+    client.on_max_turns = args.on_max_turns;
+    client.auto_extend_turns = args.auto_extend_turns;
+    client.turn_hints = !args.json;
+    if let (Some(n), Some(id)) = (args.max_turns, args.session.as_deref()) {
+        // 已有会话：先通过 turns 端点设置上限（同时作用于正在进行的 run）
+        let sid = uuid::Uuid::parse_str(id).map_err(|_| anyhow::anyhow!("invalid session id '{id}' (expected a UUID)"))?;
+        let v = client.post_turns(&sid.to_string(), &json!({"maxTurns": n})).await?;
+        eprintln!("[turns] session {sid}: maxTurns {} -> {}", v["previous"], v["maxTurns"]);
     }
-    let socket = args.socket.clone().or_else(|| (args.url.is_none() && default_socket.exists()).then_some(default_socket));
-    let mut client = Client::new(socket, args.url.clone(), token.as_deref())?;
     client.provider = provider.map(str::to_owned);
     client.effort = effort;
     client.depth = if args.deep { Some(crate::routing::Depth::Deep) } else { args.depth };
@@ -445,20 +589,32 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
                 Ok(())
             })
             .await;
+        let limit = result.as_ref().ok().filter(|o| o.max_turns_reached);
         if !args.json {
             writeln!(stdout)?;
             stdout.flush()?;
         } else if let Some(id) = session_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
-            // 结束时附上会话的推理强度与路由信息（失败不影响退出码）。
+            // 结束时附上会话的推理强度、路由与回合信息（失败不影响退出码）。
             if let Ok((status, mut view)) = client.request(axum::http::Method::GET, &format!("/v1/sessions/{id}"), None).await {
                 if status.is_success() && view.is_object() {
                     view["type"] = json!("session_state");
+                    view["turnsUsed"] = view["turnBudget"]["lastRun"]["turnsUsed"].as_u64().map(Value::from).unwrap_or(json!(0));
+                    if limit.is_some() {
+                        view["stopReason"] = json!("max_turns");
+                        view["canContinue"] = json!(true);
+                    }
                     writeln!(stdout, "{view}")?;
                     stdout.flush()?;
                 }
             }
         }
-        return result;
+        let outcome = result?;
+        if outcome.max_turns_reached {
+            let id = session_id.as_deref().unwrap_or("<sessionId>");
+            eprintln!("{}", max_turns_line(outcome.turns_used, outcome.max_turns, id, "sub-bot ask --session"));
+            return Err(MaxTurnsReached.into());
+        }
+        return Ok(());
     }
     let response = client.ask_async(&message, args.profile.as_deref(), args.session.as_deref(), args.timeout).await?;
     let result = &response["result"];
@@ -466,6 +622,13 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
         println!("{response}");
     } else if let Some(text) = result["text"].as_str() {
         println!("{text}");
+    }
+    if result["stopReason"] == "max_turns" {
+        if !args.json {
+            let id = result["sessionId"].as_str().or(response["sessionId"].as_str()).unwrap_or("<sessionId>");
+            eprintln!("{}", max_turns_line(result["turnsUsed"].as_u64(), result["maxTurns"].as_u64(), id, "sub-bot ask --session"));
+        }
+        return Err(MaxTurnsReached.into());
     }
     anyhow::ensure!(
         response["status"] == "succeeded"

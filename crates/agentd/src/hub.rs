@@ -528,6 +528,12 @@ pub struct SessionRequest {
     pub caller_tools: Vec<CallerToolSpec>,
     /// 会话级工具审批策略（形状同 profile.toolApproval）；与 profile 策略取最严格的判定，因此只能收紧
     pub tool_approval: Option<agent_tools::ToolApproval>,
+    /// 覆盖 profile.maxTurns（>= 1，没有封顶）；运行期可用 `POST /v1/sessions/{id}/turns` 调整
+    pub max_turns: Option<u64>,
+    /// 覆盖 profile.onMaxTurns：stop | ask | summarize
+    pub on_max_turns: Option<agent_core::OnMaxTurns>,
+    /// 覆盖 profile.maxTurnsAskTimeoutSecs（>= 1）
+    pub max_turns_ask_timeout_secs: Option<u64>,
 }
 
 /// 第一次 prompt 之后不能再修改 depth（路由不会重新进行）。
@@ -1129,6 +1135,8 @@ impl Hub {
             bail!("profile '{profile_name}' is not allowed for client '{}'", client.name);
         }
         let p: &Profile = self.config.profiles.get(&profile_name).ok_or_else(|| anyhow::anyhow!("unknown profile '{profile_name}'"))?;
+        anyhow::ensure!(req.max_turns.is_none_or(|n| n >= 1), "maxTurns must be >= 1");
+        anyhow::ensure!(req.max_turns_ask_timeout_secs.is_none_or(|n| n >= 1), "maxTurnsAskTimeoutSecs must be >= 1");
 
         let allowed = expand_tools(&p.tools)?;
         let selected = match req.tools {
@@ -1282,6 +1290,9 @@ impl Hub {
                             caller_tools: (!caller_tools.is_empty()).then(|| caller_tools.clone()),
                             ephemeral: ephemeral.then_some(true),
                             tool_approval: req.tool_approval.as_ref().and_then(|t| serde_json::to_value(t).ok()),
+                            max_turns: req.max_turns,
+                            on_max_turns: req.on_max_turns.map(|m| m.as_str().to_string()),
+                            max_turns_ask_timeout_secs: req.max_turns_ask_timeout_secs,
                             title: None,
                         };
                         Some(Session::create_with_id(&dir.join(&client.name), &id, &profile_name, meta)?)
@@ -1306,6 +1317,9 @@ impl Hub {
         }));
         let hook = dynamic.clone();
         let approval = crate::approvals::gate(self.config.tool_approval_of(p), req.tool_approval);
+        let max_turns = req.max_turns.unwrap_or(p.max_turns);
+        let on_max_turns = req.on_max_turns.unwrap_or(p.on_max_turns);
+        let ask_timeout_secs = req.max_turns_ask_timeout_secs.unwrap_or(p.max_turns_ask_timeout_secs);
         let config = LoopConfig {
             provider,
             model: dynamic.model.clone(),
@@ -1315,7 +1329,8 @@ impl Hub {
             api,
             steering: Default::default(),
             follow_up: Default::default(),
-            max_turns: p.max_turns,
+            max_turns: max_turns.into(),
+            turn_gate: Arc::new(agent_core::TurnGate::new(on_max_turns, Duration::from_secs(ask_timeout_secs))),
             max_tokens: p.max_output_tokens,
             token_budget: p.token_budget,
             llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
@@ -1324,7 +1339,7 @@ impl Hub {
             approval,
             hooks: Some(hooks.clone()),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), persisted = ?persisted_path, restored = !history.is_empty(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), max_turns, on_max_turns = on_max_turns.as_str(), max_turns_ask_timeout_secs = ask_timeout_secs, persisted = ?persisted_path, restored = !history.is_empty(), "session created");
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -1614,6 +1629,8 @@ impl Hub {
             "isStreaming": h.agent.is_running(),
             "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
             "pendingApprovals": h.pending_approvals(),
+            "maxTurns": h.max_turns(),
+            "turnBudget": h.turn_budget(),
             "persisted": h.hooks.path().is_some(),
         });
         view.as_object_mut().unwrap().extend(h.effort_fields());
@@ -2372,7 +2389,6 @@ pub(crate) mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let mut cfg = config();
         cfg.alerts.dedup_window_secs = 1;
-        cfg.profiles.get_mut("default").unwrap().max_turns = 0;
         let target =
             |owner: &str, severity| ResolvedTarget { target: WebhookTarget { url: format!("{base}/{owner}"), secret: None }, events: Some(vec!["issues".into()]), min_severity: Some(severity) };
         cfg.clients[0].resolved_webhooks = vec![target("own", Severity::Warn), target("filtered", Severity::Fatal)];
@@ -2380,6 +2396,8 @@ pub(crate) mod tests {
         let reporter = Reporter::new(&cfg.alerts, None, vec![]);
         let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Memory).unwrap();
         let session = hub.create_session(&cfg.clients[0], SessionRequest::default()).unwrap();
+        // 配置校验要求 maxTurns >= 1；直接把运行期上限设为 0，让第一次模型调用就达到上限
+        session.agent.config.max_turns.set(0);
         let app = crate::http::test_router(hub.clone());
         let request = axum::http::Request::builder()
             .method("POST")
@@ -2591,13 +2609,17 @@ pub(crate) mod tests {
             let mut cfg = config();
             let profile = cfg.profiles.get_mut("default").unwrap();
             match kind {
-                "max_turns" => profile.max_turns = 0,
+                "max_turns" => {}
                 "token_budget_exceeded" => profile.token_budget = Some(0),
                 _ => profile.run_timeout_secs = Some(0),
             }
             let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
             Arc::get_mut(&mut hub).unwrap().issues = Reporter::new(&hub.config.alerts, None, vec![]);
             let h = hub.create_session(&hub.config.clients[0], SessionRequest::default()).unwrap();
+            if kind == "max_turns" {
+                // 配置校验要求 maxTurns >= 1；直接把运行期上限设为 0
+                h.agent.config.max_turns.set(0);
+            }
             let mut rx = h.subscribe();
             h.submit("/tool bash {\"command\":\"sleep 10\"}".into(), None);
             settled(&mut rx).await;

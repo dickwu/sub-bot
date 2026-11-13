@@ -1,5 +1,6 @@
 use crate::approval::{ApprovalDecision, ApprovedBy};
 use crate::tool::ToolResult;
+use crate::turn_budget::{OnMaxTurns, TurnBudgetChangedBy, TurnBudgetDecision};
 use agent_ai::{AssistantEvent, Message, ThinkingLevel, ToolResultMessage, Usage};
 use serde::Serialize;
 use serde_json::Value;
@@ -102,6 +103,36 @@ pub enum AgentEvent {
         approved: bool,
         reason: String,
         by: ApprovedBy,
+        wait_ms: u64,
+    },
+    /// 回合上限被调用方修改（立即作用于正在进行的 run，并保留给会话之后的 run）。
+    TurnBudgetChanged {
+        max_turns: u64,
+        previous: u64,
+        /// 当前 run 已用回合；空闲时 0
+        turns_used: u64,
+        by: TurnBudgetChangedBy,
+    },
+    /// 已用回合达到 ceil(0.8·maxTurns) 且仍有剩余；每个 run 一次，预算修改后可再次触发。
+    TurnBudgetLow {
+        turns_used: u64,
+        max_turns: u64,
+        remaining: u64,
+    },
+    /// 达到回合上限（模型调用之前）；`action` 为会话的 onMaxTurns。ask 时带等待时长与截止时间（Unix 毫秒）。
+    TurnBudgetExhausted {
+        turns_used: u64,
+        max_turns: u64,
+        action: OnMaxTurns,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timeout_secs: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+    },
+    /// ask 等待结束：extended（继续）/ stopped / timeout / cancelled。
+    TurnBudgetResolved {
+        decision: TurnBudgetDecision,
+        max_turns: u64,
         wait_ms: u64,
     },
 }

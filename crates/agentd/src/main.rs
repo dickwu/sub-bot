@@ -2,6 +2,7 @@
 //! - `serve`：HTTP + SSE，每个 bot 一个 Bearer token，token -> 允许的 profiles（默认只监听 127.0.0.1）
 //! - `rpc`：stdio JSONL RPC（对应 pi `--mode rpc`，见 coding-agent/src/modes/rpc/rpc-mode.ts）
 //! - `run`：一次性执行一个 prompt 并打印结果
+//! - `turns`：调整运行中会话的回合预算（maxTurns）
 //! - `models`：实时列出 provider 支持的模型
 //! - `hash-token`：生成配置文件里用的 token 哈希
 //!
@@ -35,6 +36,9 @@ mod sessions;
 #[cfg(test)]
 mod sessions_tests;
 mod store;
+mod turns;
+#[cfg(test)]
+mod turns_tests;
 pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
@@ -126,6 +130,8 @@ enum Cmd {
         /// 恢复已持久化的会话（<sessionDir>/stdio/ 下的 id），继续写入同一 JSONL
         #[arg(long)]
         resume: Option<String>,
+        #[command(flatten)]
+        turns: TurnArgs,
     },
     /// 一次性执行一个 prompt，打印最终回复后退出
     Run {
@@ -147,8 +153,12 @@ enum Cmd {
         /// 会话的 profile / model / provider / account / depth 来自记录，--reasoning-effort 作为粘性修改生效
         #[arg(long)]
         resume: Option<String>,
+        #[command(flatten)]
+        turns: TurnArgs,
         prompt: String,
     },
+    /// 调整服务端会话的回合预算（连接参数同 ask）：--set N（绝对值）| --add N（可为负）| --stop（停止暂停在上限的 run）；打印 JSON 响应
+    Turns(turns::Turns),
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
     Models {
         /// 列出全部（含 embedding、语音、图片、快照等）
@@ -204,6 +214,28 @@ pub struct AccountArg {
     /// 会话使用的账号（provider 下的命名账号）；受 profile 的 allowedAccounts 限制，越权直接报错
     #[arg(long, env = "SUB_BOT_ACCOUNT")]
     pub account: Option<String>,
+}
+
+/// 回合预算（run / rpc）：新会话写进会话选项；--resume 时 --max-turns 直接调整已恢复的会话。
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct TurnArgs {
+    /// 本会话单次 run 的模型调用上限（>= 1，没有封顶；覆盖 profile.maxTurns）
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub max_turns: Option<u64>,
+    /// 达到上限时：stop（默认）| ask（暂停等待调用方延长或停止）| summarize（再给一次不带工具的总结调用）。只对新会话有效
+    #[arg(long)]
+    pub on_max_turns: Option<agent_core::OnMaxTurns>,
+}
+
+impl TurnArgs {
+    /// 已恢复的会话：onMaxTurns 在创建时固定；maxTurns 作为运行期调整生效。
+    fn apply_to_resumed(&self, session: &hub::SessionHandle) -> anyhow::Result<()> {
+        anyhow::ensure!(self.on_max_turns.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
+        if let Some(n) = self.max_turns {
+            session.adjust_turns(agent_core::TurnChange::Set(n));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Subcommand)]
@@ -306,8 +338,8 @@ async fn main() -> anyhow::Result<()> {
         logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
         return keys::run(&cli, command);
     }
-    if let Cmd::Ask(ref args) = cli.cmd {
-        // ask only needs stderr diagnostics; never create a log directory or store.
+    if let Cmd::Ask(_) | Cmd::Turns(_) = cli.cmd {
+        // ask / turns only need stderr diagnostics; never create a log directory or store.
         logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
         // Read only dataDir: ask must not load provider/webhook secret files or initialize a Hub.
         let configured_dir = if cli.data_dir.is_none() {
@@ -327,7 +359,12 @@ async fn main() -> anyhow::Result<()> {
         } else {
             None
         };
-        return ask::run(args, cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir), cli.provider.as_deref(), cli.reasoning_effort).await;
+        let data_dir = cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir);
+        return match &cli.cmd {
+            Cmd::Turns(args) => turns::run(args, data_dir).await,
+            Cmd::Ask(args) => ask::run(args, data_dir, cli.provider.as_deref(), cli.reasoning_effort).await,
+            _ => unreachable!(),
+        };
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -431,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg| hub::SessionRequest {
+    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg, turns: &TurnArgs| hub::SessionRequest {
         provider: cli.provider.clone(),
         profile,
         model: cli.model.clone(),
@@ -439,6 +476,8 @@ async fn main() -> anyhow::Result<()> {
         depth,
         api: cli.api,
         account: account.account.clone(),
+        max_turns: turns.max_turns,
+        on_max_turns: turns.on_max_turns,
         ..Default::default()
     };
     match cli.cmd {
@@ -463,7 +502,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -472,13 +511,16 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile, depth, ref account, ref resume } => {
+        Cmd::Rpc { ref profile, depth, ref account, ref resume, ref turns } => {
             let hub = prepared_hub.clone().expect("prepared hub");
-            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account), resume.clone()).await;
+            if resume.is_some() {
+                anyhow::ensure!(turns.on_max_turns.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
+            }
+            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account, turns), resume.clone()).await;
             hub.mcp.shutdown().await;
             result?;
         }
-        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref turns, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             let client = local_client(&hub.config);
             let session = match resume {
@@ -487,9 +529,10 @@ async fn main() -> anyhow::Result<()> {
                     if let Some(level) = cli.reasoning_effort {
                         session.set_reasoning_effort(Some(level));
                     }
+                    turns.apply_to_resumed(&session)?;
                     session
                 }
-                None => hub.create_session(&client, session_req(profile.clone(), depth, account))?,
+                None => hub.create_session(&client, session_req(profile.clone(), depth, account, turns))?,
             };
             let persisted = session.hooks.path().is_some();
             if !json {
@@ -499,9 +542,11 @@ async fn main() -> anyhow::Result<()> {
             let mut events = session.subscribe();
             session.submit(prompt.clone(), None);
             let mut last = None;
-            let (mut total, mut turns, mut tool_calls) = (agent_ai::Usage::default(), 0usize, 0usize);
+            let (mut total, mut turn_count, mut tool_calls) = (agent_ai::Usage::default(), 0usize, 0usize);
             let mut used: Option<(Option<agent_ai::Api>, Option<ThinkingLevel>)> = None;
             let interactive = !json && approvals::tty_available();
+            // 本次 run 因回合上限结束（每个 agent_start 重置）与最近一次 turn_budget_exhausted 的统计
+            let mut limit = false;
             loop {
                 match events.recv().await {
                     Ok(AgentEvent::ApprovalRequired { call_id, tool, args, reason, .. }) => {
@@ -522,7 +567,7 @@ async fn main() -> anyhow::Result<()> {
                         let _ = session.resolve_approval(&call_id, decision, Some(why));
                     }
                     Ok(AgentEvent::MessageEnd { message: Message::Assistant(a) }) => {
-                        turns += 1;
+                        turn_count += 1;
                         tool_calls += a.tool_calls().len();
                         add_usage(&mut total, &a.usage);
                         if a.api.is_some() || session.agent.config.provider.id() == "anthropic" {
@@ -532,6 +577,15 @@ async fn main() -> anyhow::Result<()> {
                     }
                     Ok(AgentEvent::ToolExecutionStart { tool_name, .. }) if !json => {
                         eprintln!("[tool] {tool_name}")
+                    }
+                    Ok(AgentEvent::AgentStart) => limit = false,
+                    Ok(AgentEvent::RunOutcome { kind }) if kind == "max_turns" => limit = true,
+                    Ok(AgentEvent::TurnBudgetLow { turns_used, max_turns, remaining }) if !json => {
+                        eprintln!("[turns] {turns_used}/{max_turns} turns used ({remaining} left)")
+                    }
+                    Ok(AgentEvent::TurnBudgetExhausted { turns_used, max_turns, action: agent_core::OnMaxTurns::Ask, timeout_secs, .. }) if !json => {
+                        // run 在本进程内，外部无法延长；等待超时后停止
+                        eprintln!("[turns] paused at max_turns ({turns_used}/{max_turns}); `run` cannot be extended from outside this process, stopping after {}s (raise the budget up front with --max-turns N)", timeout_secs.unwrap_or_default())
                     }
                     Ok(AgentEvent::Compaction { reason, phase, tokens_before, tokens_after, error, .. }) if !json && phase == "end" => match (tokens_after, error) {
                         (_, Some(e)) => eprintln!("[compaction] {reason} failed: {e}"),
@@ -556,12 +610,21 @@ async fn main() -> anyhow::Result<()> {
                 add_usage(&mut total, &session.hooks.compaction_usage());
                 // account：最后一次调用实际使用的账号（failover 后可能不同于会话账号）
                 let account = last.account.clone().unwrap_or_else(|| session.account.clone());
-                let mut out = serde_json::json!({"sessionId": session.id, "persisted": persisted, "resumed": resume.is_some(), "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turns, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
+                let mut out = serde_json::json!({"sessionId": session.id, "persisted": persisted, "resumed": resume.is_some(), "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turn_count, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
                 out.as_object_mut().unwrap().extend(session.effort_fields());
+                out.as_object_mut().unwrap().extend(session.turn_result_fields(limit, last.error_message.as_deref()));
                 out["reasoningEffort"] = serde_json::json!(effort);
                 println!("{out}");
             } else {
                 println!("{}", last.text());
+            }
+            if limit {
+                if !json {
+                    let budget = session.turn_budget();
+                    let used = budget.last_run.map(|r| r.turns_used);
+                    eprintln!("{}", ask::max_turns_line(used, Some(budget.max_turns), &session.id, "sub-bot run --resume"));
+                }
+                return Err(ask::MaxTurnsReached.into());
             }
             if let Some(e) = last.error_message {
                 anyhow::bail!(e);
@@ -932,5 +995,47 @@ mod tests {
             assert_eq!(event.kind, "startup_failed");
             assert_eq!(event.details, serde_json::json!({}));
         }
+    }
+
+    #[test]
+    fn turn_budget_cli_flags() {
+        let Cmd::Run { turns, .. } = Cli::try_parse_from(["sub-bot", "run", "--max-turns", "500", "--on-max-turns", "summarize", "hi"]).unwrap().cmd else { panic!("run") };
+        assert_eq!((turns.max_turns, turns.on_max_turns), (Some(500), Some(agent_core::OnMaxTurns::Summarize)));
+        let Cmd::Rpc { turns, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--max-turns", "1", "--on-max-turns", "ask"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!((turns.max_turns, turns.on_max_turns), (Some(1), Some(agent_core::OnMaxTurns::Ask)));
+        // 没有封顶
+        let Cmd::Run { turns, .. } = Cli::try_parse_from(["sub-bot", "run", "--max-turns", "18446744073709551615", "hi"]).unwrap().cmd else { panic!("run") };
+        assert_eq!(turns.max_turns, Some(u64::MAX));
+        let Cmd::Ask(ask) = Cli::try_parse_from(["sub-bot", "ask", "--max-turns", "9", "--on-max-turns", "stop", "--auto-extend-turns", "50", "hi"]).unwrap().cmd else { panic!("ask") };
+        assert_eq!((ask.max_turns, ask.on_max_turns, ask.auto_extend_turns), (Some(9), Some(agent_core::OnMaxTurns::Stop), Some(50)));
+        for bad in [
+            &["sub-bot", "run", "--max-turns", "0", "hi"][..],
+            &["sub-bot", "ask", "--max-turns", "-1", "hi"],
+            &["sub-bot", "ask", "--on-max-turns", "extend", "hi"],
+            &["sub-bot", "ask", "--auto-extend-turns", "0", "hi"],
+            &["sub-bot", "rpc", "--on-max-turns", "never"],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+        let sid = "123e4567-e89b-12d3-a456-426614174000";
+        let Cmd::Turns(t) = Cli::try_parse_from(["sub-bot", "turns", sid, "--add", "-5", "--socket", "/tmp/s.sock"]).unwrap().cmd else { panic!("turns") };
+        assert_eq!((t.session_id.as_str(), t.body()), (sid, serde_json::json!({"addTurns": -5})));
+        assert_eq!(t.conn.socket.as_deref(), Some(std::path::Path::new("/tmp/s.sock")));
+        let Cmd::Turns(t) = Cli::try_parse_from(["sub-bot", "turns", sid, "--set", "300", "--url", "http://127.0.0.1:7878", "--token-file", "tok"]).unwrap().cmd else { panic!("turns") };
+        assert_eq!(t.body(), serde_json::json!({"maxTurns": 300}));
+        assert_eq!(t.conn.url.as_deref(), Some("http://127.0.0.1:7878"));
+        let Cmd::Turns(t) = Cli::try_parse_from(["sub-bot", "turns", sid, "--stop"]).unwrap().cmd else { panic!("turns") };
+        assert_eq!(t.body(), serde_json::json!({"stop": true}));
+        for bad in [&["sub-bot", "turns", sid][..], &["sub-bot", "turns", sid, "--set", "0"], &["sub-bot", "turns", sid, "--set", "3", "--stop"], &["sub-bot", "turns", "--add", "1"]] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn max_turns_continue_line() {
+        assert_eq!(
+            ask::max_turns_line(Some(150), Some(150), "s-1", "sub-bot ask --session"),
+            "max_turns reached (150/150). Continue: sub-bot ask --session s-1 \"<message>\" (add --max-turns N to raise the budget)"
+        );
     }
 }

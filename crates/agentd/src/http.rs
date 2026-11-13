@@ -111,6 +111,7 @@ fn router(st: AppState) -> Router {
         .route("/v1/sessions/{id}/approvals", get(crate::approvals::list))
         .route("/v1/sessions/{id}/approvals/{call_id}", post(crate::approvals::decide))
         .route("/v1/sessions/{id}/compact", post(compact_session))
+        .route("/v1/sessions/{id}/turns", post(crate::turns::post))
         .route("/v1/issues", get(issues))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/chat", post(chat))
@@ -182,7 +183,12 @@ fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
 
 /// 调用方自己的会话：内存里没有时从磁盘恢复（同一 client 的会话目录）。未知 / 非 owner / 非法 id ⇒ 404。
 async fn session(st: &AppState, c: &Client, id: &str) -> Result<Arc<SessionHandle>, (StatusCode, Json<serde_json::Value>)> {
-    match st.hub.get_or_load(c, id).await {
+    load_session(&st.hub, c, id).await
+}
+
+/// 同 [`session`]，供其它模块的 handler（如 turns）使用。
+pub(crate) async fn load_session(hub: &Arc<Hub>, c: &Client, id: &str) -> Result<Arc<SessionHandle>, (StatusCode, Json<serde_json::Value>)> {
+    match hub.get_or_load(c, id).await {
         Ok(Some(h)) => Ok(h),
         Ok(None) => Err(not_found()),
         Err(e) if e.is::<TooManySessions>() => Err((StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))),
@@ -240,11 +246,19 @@ struct PatchBody {
     reasoning_effort: Option<ThinkingLevel>,
     /// 只能在第一次 prompt 之前修改（否则 409）
     depth: Option<Depth>,
+    /// 回合上限（>= 1）；同 `POST /v1/sessions/{id}/turns {"maxTurns":N}`，立即作用于正在进行的 run
+    max_turns: Option<u64>,
 }
 
 async fn patch_session(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, ApiJson(b): ApiJson<PatchBody>) -> ApiResult {
+    if b.max_turns == Some(0) {
+        return Err(bad_request("maxTurns must be >= 1"));
+    }
     let h = session(&st, &c, &id).await?;
     apply_overrides(&h, b.reasoning_effort, b.depth)?;
+    if let Some(n) = b.max_turns {
+        h.adjust_turns(agent_core::TurnChange::Set(n));
+    }
     Ok(Json(st.hub.session_view(&h)).into_response())
 }
 
@@ -284,7 +298,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
                     "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
                         "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
-                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "maxTurns": p.max_turns, "onMaxTurns": p.on_max_turns, "maxTurnsAskTimeoutSecs": p.max_turns_ask_timeout_secs, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
             })
         })
         .collect();
@@ -446,7 +460,11 @@ impl WebhookEvents {
                 "final" => events.push("task.completed".into()),
                 "progress" => events.push("task.progress".into()),
                 "approval_required" => events.push(crate::approvals::WEBHOOK_EVENT.into()),
-                "all" => events.extend(["task.completed".into(), "task.progress".into(), crate::approvals::WEBHOOK_EVENT.into()]),
+                "turn_budget" => events.extend(crate::turns::WEBHOOK_EVENTS.map(String::from)),
+                "all" => {
+                    events.extend(["task.completed".into(), "task.progress".into(), crate::approvals::WEBHOOK_EVENT.into()]);
+                    events.extend(crate::turns::WEBHOOK_EVENTS.map(String::from));
+                }
                 "issues" => events.push("issues".into()),
                 _ => return Err(bad_request("invalid webhookEvents")),
             }
@@ -496,7 +514,7 @@ struct ChatBody {
 /// `/v1/chat` 文档化的顶层字段（未知字段错误里列出）。
 const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model"];
 /// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"；profile/model/reasoningEffort/depth/account 顶层可用）。
-const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools", "toolApproval"];
+const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools", "toolApproval", "maxTurns", "onMaxTurns", "maxTurnsAskTimeoutSecs"];
 
 /// 错误信息里展示的字段名：去掉控制字符并截断（只回显键名，不回显任何值）。
 fn field_label(key: &str) -> String {
@@ -560,7 +578,9 @@ fn webhook_targets(c: &Client, callback: Option<&serde_json::Value>, events: &We
                 TargetSpec::Url(url) => (url, None, None),
                 TargetSpec::Full { url, events, min_severity, .. } => (url, events, min_severity),
             };
-            if events.as_ref().is_some_and(|es| es.iter().any(|e| !matches!(e.as_str(), "task.completed" | "task.progress" | "issues" | crate::approvals::WEBHOOK_EVENT))) {
+            if events.as_ref().is_some_and(|es| {
+                es.iter().any(|e| !matches!(e.as_str(), "task.completed" | "task.progress" | "issues" | crate::approvals::WEBHOOK_EVENT | crate::turns::WEBHOOK_LOW | crate::turns::WEBHOOK_EXHAUSTED))
+            }) {
                 return Err(bad_request("invalid target events"));
             }
             let url = crate::config::webhook_url(&value).ok_or_else(|| bad_request("callbackUrl must be an http/https URL"))?;
@@ -618,6 +638,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
     }
     let rx = h.subscribe(); // 先订阅再提交，避免漏事件
     let approval_rx = b.asynchronous.then(|| h.subscribe());
+    let turns_rx = b.asynchronous.then(|| h.subscribe());
     let submit_error = || {
         if st.hub.is_shutting_down() {
             (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error": "server is shutting down"})))
@@ -639,6 +660,16 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
         if let (Some(approval_rx), false) = (approval_rx, approval_queues.is_empty()) {
             crate::approvals::forward_to_webhooks(task.task_id.clone(), h.clone(), approval_rx, approval_queues);
         }
+        let turn_queues: Vec<_> = queues
+            .iter()
+            .filter_map(|(t, q)| {
+                let wanted: Vec<_> = crate::turns::WEBHOOK_EVENTS.into_iter().filter(|e| t.wants(e)).collect();
+                (!wanted.is_empty()).then(|| (wanted, q.clone()))
+            })
+            .collect();
+        if let (Some(turns_rx), false) = (turns_rx, turn_queues.is_empty()) {
+            crate::turns::forward_to_webhooks(task.task_id.clone(), h.clone(), turns_rx, turn_queues);
+        }
         let response = (
             StatusCode::ACCEPTED,
             [("location", status_url.clone())],
@@ -654,7 +685,9 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
             let outcome = outcome.unwrap_or_else(|_| {
                 h.agent.abort();
                 h.report_issue(Severity::Fatal, "task_panic", "runtime", "Internal panic", json!({}));
-                ChatOutcome { status: TaskStatus::Failed, body: json!({"sessionId": h.id, "error": "internal panic"}) }
+                let mut body = json!({"error": "internal panic"});
+                body.as_object_mut().unwrap().extend(h.turn_result_fields(false, None));
+                ChatOutcome { status: TaskStatus::Failed, body }
             });
             if let Some(task) = st.hub.finish_task(&task.task_id, outcome.status, outcome.body) {
                 for (target, queue) in queues {
@@ -693,6 +726,8 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
     let mut aborted = false;
     let mut timed_out = false;
     let mut panicked = false;
+    // 最近一次 run 因回合上限结束（run_outcome max_turns；每个 agent_start 重置）
+    let mut max_turns = false;
     let mut deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     loop {
         let event = tokio::select! {
@@ -711,7 +746,10 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
             event = rx.recv() => event,
         };
         match event {
-            Ok(AgentEvent::AgentStart) => segment_start = new_messages.len(),
+            Ok(AgentEvent::AgentStart) => {
+                segment_start = new_messages.len();
+                max_turns = false;
+            }
             Ok(AgentEvent::MessageRetry { .. }) => partial_text.clear(),
             Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
             Ok(AgentEvent::MessageEnd { message }) => {
@@ -741,13 +779,16 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
                 break;
             }
             Ok(AgentEvent::RunOutcome { kind }) if kind == "task_panic" => panicked = true,
+            Ok(AgentEvent::RunOutcome { kind }) if kind == "max_turns" => max_turns = true,
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => h.report_lag(n),
             Err(_) => break,
         }
     }
     if panicked {
-        return ChatOutcome { status: TaskStatus::Failed, body: json!({"sessionId": h.id, "error": "internal panic"}) };
+        let mut body = json!({"error": "internal panic"});
+        body.as_object_mut().unwrap().extend(h.turn_result_fields(false, None));
+        return ChatOutcome { status: TaskStatus::Failed, body };
     }
     if timed_out {
         if partial_text.is_empty() {
@@ -756,6 +797,7 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
         let account = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { a.account.clone() } else { None }).unwrap_or_else(|| h.account.clone());
         let mut body = json!({"sessionId": h.id, "error": "timeout", "text": partial_text, "model": h.model(), "account": account, "messages": new_messages});
         body.as_object_mut().unwrap().extend(h.effort_fields());
+        body.as_object_mut().unwrap().extend(h.turn_result_fields(false, None));
         return ChatOutcome { status: TaskStatus::Timeout, body };
     }
     let last = new_messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a.clone()) } else { None });
@@ -780,6 +822,9 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
         "messages": new_messages,
     });
     body.as_object_mut().unwrap().extend(h.effort_fields());
+    // turnsUsed / maxTurns 总是给出；因回合上限结束时 stopReason 改为 "max_turns"，并附 canContinue 与继续方式
+    let error = last.as_ref().and_then(|a| a.error_message.clone());
+    body.as_object_mut().unwrap().extend(h.turn_result_fields(max_turns && !aborted, error.as_deref()));
     ChatOutcome { status, body }
 }
 

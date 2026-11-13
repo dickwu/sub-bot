@@ -526,6 +526,9 @@ impl Hub {
             tools: meta.tools.clone(),
             caller_tools: vec![],
             tool_approval,
+            max_turns: meta.max_turns,
+            on_max_turns: meta.on_max_turns.as_deref().map(str::parse).transpose().map_err(|e: String| ResumeFailed(format!("invalid onMaxTurns in session file: {e}")))?,
+            max_turns_ask_timeout_secs: meta.max_turns_ask_timeout_secs,
         };
         if let Some(names) = meta.caller_tools.as_ref().filter(|n| !n.is_empty()) {
             tracing::warn!(issue = "typed", session_id = %id, caller_tools = ?names, "caller tools are not restored (callback URLs and tokens are not persisted)");

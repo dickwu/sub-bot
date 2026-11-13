@@ -63,6 +63,15 @@ pub struct SessionMeta {
     /// 会话级工具审批策略（请求的 `toolApproval`，只能收紧 profile 策略）；恢复时与当前 profile 策略叠加
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_approval: Option<serde_json::Value>,
+    /// 会话级回合上限（请求的 `maxTurns`；运行期调整只保留在内存里）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u64>,
+    /// 会话级 onMaxTurns（stop | ask | summarize）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_max_turns: Option<String>,
+    /// 会话级 maxTurnsAskTimeoutSecs
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns_ask_timeout_secs: Option<u64>,
     /// 第一条用户消息的预览
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -92,6 +101,9 @@ impl SessionMeta {
             caller_tools,
             ephemeral,
             tool_approval,
+            max_turns,
+            on_max_turns,
+            max_turns_ask_timeout_secs,
             title
         );
     }

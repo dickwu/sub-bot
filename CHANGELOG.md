@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.4] - 2026-11-04
+
+### Added
+- **Turn budget controls (caller-only)**: the calling ("main") agent controls the per-run turn budget (`maxTurns` = model calls per run). There is no cap on the value or on extensions, and the model has no tool to extend its own turns.
+  - Profile fields `onMaxTurns` (`stop` default | `ask` | `summarize`) and `maxTurnsAskTimeoutSecs` (default 600, >= 1); `maxTurns` is now validated `>= 1`.
+  - Per-session / per-request `maxTurns`, `onMaxTurns`, `maxTurnsAskTimeoutSecs` in `POST /v1/sessions` and the `/v1/chat` `session` object (invalid ⇒ 400); persisted in the session file like `toolApproval`, so rehydrated sessions keep them.
+  - Runtime adjustment: `POST /v1/sessions/{id}/turns` with exactly one of `{"maxTurns":N}`, `{"addTurns":N}` (may be negative, result clamped to >= 1) or `{"stop":true}` (409 when nothing is paused); response `{sessionId, maxTurns, previous, turnsUsed, running, paused}`; 400 invalid body, 404 unknown session / other owner. `PATCH /v1/sessions/{id}` also accepts `maxTurns`. The limit is read before every model call, so changes apply to the running run and to later runs; lowering it below the turns already used stops the run at the next check.
+  - On reaching the limit: `stop` ends the run (`max_turns`); `summarize` injects a `[sub-bot]` user message and makes one tool-less call (still `max_turns`); `ask` pauses before the model call until the caller raises the limit (continue), sends `stop`, aborts (abort / delete / run timeout), or `maxTurnsAskTimeoutSecs` expires (stop). The session view and `get_state` show `maxTurns` and `turnBudget` (`paused`, `pause`, `lastRun`, …); paused tasks stay `running`.
+  - Events `turn_budget_low` (once per run at ceil(0.8·maxTurns), re-armed after a change), `turn_budget_exhausted {turnsUsed, maxTurns, action, timeoutSecs?, expiresAt?}`, `turn_budget_changed {maxTurns, previous, turnsUsed, by}`, `turn_budget_resolved {decision, maxTurns, waitMs}`, with INFO logs (`session_id`, structured fields).
+  - Webhooks: new `webhookEvents` value `turn_budget` (included in `all`) delivering `task.turn_budget_low` and `task.turn_budget_exhausted` (`data` adds `taskId`, `sessionId`, `turnsUrl`).
+  - Final results (`/v1/chat` sync and async, `run --json`, `ask --json` `session_state`, `ask --async`) always carry `sessionId`, `turnsUsed`, `maxTurns`; when stopped by the limit also `stopReason: "max_turns"` and `canContinue: true`, and the error reads `max_turns reached (N/M turns used); continue by sending another prompt with sessionId <id>`.
+  - RPC command `set_max_turns` (`maxTurns` | `addTurns` | `stop`).
+  - CLI: `--max-turns N` / `--on-max-turns stop|ask|summarize` on `run`, `ask` and `rpc` (`ask --session` / `run --resume` apply `--max-turns` to the existing session); `ask --auto-extend-turns N`; new `sub-bot turns <sessionId> (--set N | --add N | --stop)` with ask's connection options, printing the JSON response. Text mode prints `max_turns reached (N/M). Continue: …` on stderr and keeps the non-zero exit code.
+
+### Changed
+- Default `maxTurns` raised from 50 (profiles) / 30 (built-in fallback config) to **150**.
+- `max_turns` issue reporting is unchanged.
+
 ## [0.10.3] - 2026-11-03
 
 ### Fixed

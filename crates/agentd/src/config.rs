@@ -61,8 +61,15 @@ pub struct Profile {
     /// 是否允许调用方注册回调工具
     #[serde(default)]
     pub allow_caller_tools: bool,
+    /// 单次 run 的模型调用上限（回合预算，>= 1，默认 150）；调用方可按会话覆盖、运行期调整（没有上限封顶）
     #[serde(default = "default_max_turns")]
-    pub max_turns: usize,
+    pub max_turns: u64,
+    /// 达到 maxTurns 时："stop"（默认，直接结束）| "ask"（暂停等待调用方延长或停止）| "summarize"（再给一次不带工具的总结调用）
+    #[serde(default)]
+    pub on_max_turns: agent_core::OnMaxTurns,
+    /// onMaxTurns=ask 时等待调用方的秒数（>= 1，默认 600）；超时停止 run
+    #[serde(default = "default_max_turns_ask_timeout_secs")]
+    pub max_turns_ask_timeout_secs: u64,
     /// 深度模型（depth=deep 或自动路由判定为 deep 时使用）。anthropic profile 默认固定为 `claude-fable-5-1`；
     /// 也可写 `latest:<prefix>`，按 provider 模型目录解析为该前缀下版本号最新的模型。
     #[serde(default)]
@@ -102,8 +109,11 @@ fn default_tools() -> Vec<String> {
 fn yes() -> bool {
     true
 }
-fn default_max_turns() -> usize {
-    50
+pub fn default_max_turns() -> u64 {
+    150
+}
+pub fn default_max_turns_ask_timeout_secs() -> u64 {
+    agent_core::turn_budget::DEFAULT_ASK_TIMEOUT_SECS
 }
 
 pub const MAX_TARGETS: usize = 10;
@@ -674,6 +684,8 @@ impl Config {
         }
         for (name, profile) in &self.profiles {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            anyhow::ensure!(profile.max_turns >= 1, "profile '{name}': maxTurns must be >= 1");
+            anyhow::ensure!(profile.max_turns_ask_timeout_secs >= 1, "profile '{name}': maxTurnsAskTimeoutSecs must be >= 1");
             if let Some(policy) = &profile.tool_approval {
                 policy.validate().map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?;
             }
@@ -846,7 +858,9 @@ impl Config {
                 shell_env: Default::default(),
                 allow_system_prompt_override: true,
                 allow_caller_tools: true,
-                max_turns: 30,
+                max_turns: default_max_turns(),
+                on_max_turns: Default::default(),
+                max_turns_ask_timeout_secs: default_max_turns_ask_timeout_secs(),
                 deep_model: None,
                 auto_route: false,
                 router_model: None,
@@ -1524,6 +1538,38 @@ mod tests {
         let mut cfg = cfg;
         cfg.profiles.get_mut("own").unwrap().tool_approval = Some(ToolApproval::Rules(agent_tools::approval::ApprovalRules { timeout_secs: 0, ..Default::default() }));
         assert_eq!(cfg.validate().unwrap_err().to_string(), "profile 'own': toolApproval.timeoutSecs must be between 1 and 86400");
+    }
+
+    #[test]
+    fn max_turns_defaults_and_validation() {
+        let base = serde_json::json!({"profiles": {"p": {"workspaceRoots": ["."]}}, "clients": []});
+        let cfg: Config = serde_json::from_value(base.clone()).unwrap();
+        cfg.validate().unwrap();
+        let p = &cfg.profiles["p"];
+        assert_eq!((p.max_turns, p.on_max_turns, p.max_turns_ask_timeout_secs), (150, agent_core::OnMaxTurns::Stop, 600));
+        let fallback = Config::fallback("faux".into(), "t", PathBuf::from("."));
+        let d = &fallback.profiles["default"];
+        assert_eq!((d.max_turns, d.on_max_turns, d.max_turns_ask_timeout_secs), (150, agent_core::OnMaxTurns::Stop, 600));
+        let mut custom = base.clone();
+        custom["profiles"]["p"] = serde_json::json!({"workspaceRoots": ["."], "maxTurns": 7, "onMaxTurns": "ask", "maxTurnsAskTimeoutSecs": 30});
+        let cfg: Config = serde_json::from_value(custom).unwrap();
+        cfg.validate().unwrap();
+        let p = &cfg.profiles["p"];
+        assert_eq!((p.max_turns, p.on_max_turns, p.max_turns_ask_timeout_secs), (7, agent_core::OnMaxTurns::Ask, 30));
+        for (field, value, expected) in [
+            ("maxTurns", serde_json::json!(0), "profile 'p': maxTurns must be >= 1"),
+            ("maxTurnsAskTimeoutSecs", serde_json::json!(0), "profile 'p': maxTurnsAskTimeoutSecs must be >= 1"),
+            ("onMaxTurns", serde_json::json!("extend"), "unknown variant `extend`"),
+            ("maxTurns", serde_json::json!(-1), "invalid value"),
+        ] {
+            let mut invalid = base.clone();
+            invalid["profiles"]["p"][field] = value;
+            let error = match serde_json::from_value::<Config>(invalid) {
+                Ok(cfg) => cfg.validate().unwrap_err().to_string(),
+                Err(e) => e.to_string(),
+            };
+            assert!(error.contains(expected), "{field}: {error}");
+        }
     }
 
     #[test]

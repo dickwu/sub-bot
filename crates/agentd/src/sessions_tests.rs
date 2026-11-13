@@ -791,3 +791,21 @@ async fn rehydrate_heals_sessions_compacted_by_older_versions() {
     assert_eq!(stored_thinking_messages(&path), 3);
     assert_eq!(Session::open(&path).unwrap().active_messages(), h.agent.messages().await);
 }
+
+#[tokio::test]
+async fn turn_budget_options_survive_rehydration() {
+    let dir = TempDir::new();
+    let (hub1, _) = hub(&dir, |_| {});
+    let me = client(&hub1, "default");
+    let req = SessionRequest { max_turns: Some(7), on_max_turns: Some(agent_core::OnMaxTurns::Ask), max_turns_ask_timeout_secs: Some(30), ..Default::default() };
+    let h = hub1.create_session(&me, req).unwrap();
+    prompt(&h, "hello").await;
+    let meta = Session::open(&h.hooks.path().unwrap()).unwrap().meta().clone();
+    assert_eq!((meta.max_turns, meta.on_max_turns.as_deref(), meta.max_turns_ask_timeout_secs), (Some(7), Some("ask"), Some(30)));
+    let id = h.id.clone();
+    drop((h, hub1));
+    let (hub2, _) = hub(&dir, |_| {});
+    let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().expect("rehydrated");
+    let budget = h.turn_budget();
+    assert_eq!((budget.max_turns, budget.on_max_turns, budget.ask_timeout_secs), (7, agent_core::OnMaxTurns::Ask, 30));
+}

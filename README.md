@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
+> 状态：v0.10.4（回合预算：默认 `maxTurns` 改为 150；调用方可按会话 / 请求设置 `maxTurns` / `onMaxTurns`，运行中通过 `POST /v1/sessions/{id}/turns` 或 `sub-bot turns` 提高 / 降低 / 停止，没有封顶，模型不能自己延长；达到上限时 stop / ask / summarize，见「回合预算（maxTurns）」）。v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
 
 ## Claude (Anthropic)
 
@@ -408,7 +408,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
       "toolApproval": "never",                 // 可选：never（默认）| always | {default, tools, bash, timeoutSecs, onTimeout}，见「工具调用审批」
       "mcpServers": ["fs"],                    // 可选：MCP 服务器（全局名字 / {name, tools} 收窄 / 内联定义）；不填 = 没有 MCP 工具
-      "maxTurns": 50,
+      "maxTurns": 150,                         // 可选：单次 run 的模型调用上限（回合预算，>= 1，默认 150，没有封顶）；见「回合预算（maxTurns）」
+      "onMaxTurns": "stop",                    // 可选：达到上限时 stop（默认）| ask（暂停等调用方延长）| summarize（再给一次不带工具的总结调用）
+      "maxTurnsAskTimeoutSecs": 600,           // 可选：onMaxTurns=ask 时等待调用方的秒数（>= 1，默认 600），超时停止
       "contextWindow": null,                   // 可选：覆盖模型上下文窗口（token，>= 1000），用于自动压缩阈值
       "compaction": {"thresholdPct": 70},      // 可选：覆盖全局 compaction 的部分字段
       "deepModel": "claude-fable-5-1",         // 可选：depth=deep 用的模型；anthropic profile 默认固定为 claude-fable-5-1；"latest:claude-fable" 跟随最新版
@@ -583,7 +585,7 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/sessions?limit=` | 列出自己的会话（内存 + 已持久化，按 ID 去重，按 `updatedAt` 倒序，`limit` 默认 50、最大 1000）：`{sessions: [{sessionId, profile, provider, account, model, cwd, createdAt, updatedAt, messageCount, inMemory, running, persisted, ephemeral, title}]}`，时间为 Unix 毫秒 |
 | `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?, toolApproval?}`（未知字段返回 400；`toolApproval` 只能收紧 profile 策略，会随会话持久化，恢复后仍生效），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, pendingApprovals, persisted, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
 | `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404。所有 `/v1/sessions/{id}/*` 路由和带 `sessionId` 的 `/v1/chat` 在会话不在内存时会从磁盘恢复，见「会话持久化与恢复」 |
-| `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?}`：修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
+| `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?, maxTurns?}`：maxTurns 立即调整回合上限（见「回合预算（maxTurns）」）；修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
 | `DELETE /v1/sessions/{id}?purge=` | 删除自己的内存会话并中止运行，返回 `{"deleted":true, "inMemory":bool, "purged":bool}`；默认保留磁盘 JSONL（之后仍可按 ID 恢复），`?purge=true` 同时删除 JSONL；未知/非 owner 返回 404 |
 | `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", reasoningEffort?, depth?}`，返回 202；`reasoningEffort` 粘性，`depth` 仅首个 prompt |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
@@ -591,6 +593,7 @@ sub-bot ask --effort high "解释这个仓库"
 | `GET /v1/sessions/{id}/messages` | 消息历史（当前上下文；压缩后第一条是摘要消息） |
 | `GET /v1/sessions/{id}/approvals` | 等待中的工具调用审批，见「工具调用审批」 |
 | `POST /v1/sessions/{id}/approvals/{callId}` | `{decision: "approve"\|"deny", reason?}` 决定一次审批：200 / 未知 404 / 已决定 409 |
+| `POST /v1/sessions/{id}/turns` | 调整回合预算 `{maxTurns}` \| `{addTurns}` \| `{stop:true}`，见「回合预算（maxTurns）」 |
 | `POST /v1/sessions/{id}/compact` | 立即压缩上下文，可选 `{instructions}`；返回 `{compacted, tokensBefore, tokensAfter, summaryChars, firstKeptEntryId, durationMs, usage}`；运行中 409，摘要调用失败 502 |
 | `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` 是 `session.profile` / `session.model` 的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
@@ -651,7 +654,7 @@ curl -s localhost:7878/v1/tasks/<id> -H "Authorization: Bearer $BOT_TOKEN"
 - 两个 URL 都未设置时仍能异步执行，只轮询、不投递。密钥文件不可读或 trim 后为空会阻止配置加载；密钥不进入 Debug、任务 JSON 或日志。webhook 日志不得含完整 URL、签名或正文。
 - 任务 JSON 包括 `taskId`, `owner`, `sessionId`, `status`, `createdAt`/`finishedAt`（Unix 毫秒）, `result`, `error`, `delivery`。状态为 `running | succeeded | failed | timeout | aborted`；运行中结果/完成时间为 null。`result` 与同步 chat 响应一致，含 `text`, `messages`，正常结束还含 `usage`, `stopReason`, `error`, `aborted`。超时按 `timeoutSecs` / `chatTimeoutSecs` 取消运行，保留部分文本，任务状态为 `timeout`（轮询本身仍返回 200）。
 - 任务与会话独立保留，完成后 `taskTtlSecs`（默认 3600 秒）由 sweeper 清理，运行中的任务不清理。任务和待投递队列仅在内存中，重启不恢复；关机中不接受新 chat，已有任务取消并收尾。投递不阻塞任务完成，进程退出不保证排空所有 webhook。
-- `webhookEvents` 为 `final`（默认）、`progress`、`approval_required`、`issues`、`all`（= final + progress + approval_required）或它们的数组。`approval_required` 投递 `task.approval_required`（见「工具调用审批」）。完成（包括失败/超时/取消）发送 `task.completed`，`data` 为含结果的任务快照。`all` 另发送 `task.progress`：工具结束时 `{taskId,toolName,toolCallId,isError}`，assistant 消息结束时 `{taskId,text}`。每个任务使用一个队列按序投递，最终事件最后发送。`delivery` 是最近一次投递状态：`deliveryId,event,state`（pending/delivered/failed）, `attempts,lastStatus,lastError`；最终事件正文是投递前快照，最新投递状态请轮询。
+- `webhookEvents` 为 `final`（默认）、`progress`、`approval_required`、`turn_budget`、`issues`、`all`（= final + progress + approval_required + turn_budget）或它们的数组。`approval_required` 投递 `task.approval_required`（见「工具调用审批」）；`turn_budget` 投递 `task.turn_budget_low` / `task.turn_budget_exhausted`（见「回合预算（maxTurns）」）。完成（包括失败/超时/取消）发送 `task.completed`，`data` 为含结果的任务快照。`all` 另发送 `task.progress`：工具结束时 `{taskId,toolName,toolCallId,isError}`，assistant 消息结束时 `{taskId,text}`。每个任务使用一个队列按序投递，最终事件最后发送。`delivery` 是最近一次投递状态：`deliveryId,event,state`（pending/delivered/failed）, `attempts,lastStatus,lastError`；最终事件正文是投递前快照，最新投递状态请轮询。
 
 Webhook 使用 `POST`、`Content-Type: application/json`，正文：
 
@@ -1168,6 +1171,53 @@ profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相�
 没有匹配时返回 `No matches found`（不是错误）。结果的 `details`：`{matches, filesMatched, filesSearched, shown, truncated, binarySkipped, errors, elapsedMs}`。
 
 `find` 参数：`pattern`（必填，glob；不含 `/` 时匹配文件名，如 `"*.rs"`；含 `/` 时匹配相对 `path` 的路径，如 `"src/**/mod.rs"`，`*` 不跨目录、`**` 跨目录）、`path`（默认 `.`）、`type`（`file` 默认 / `dir` / `any`）、`hidden`、`noIgnore`、`maxDepth`（1 = 直接子项）、`limit`（默认 200，最多 5000）。输出相对 cwd 的路径、排序、每行一个，目录带尾部 `/`；截断时附 `[truncated: showing N of M paths; ...]`，没有结果返回 `No files found`。`details`：`{matches, shown, truncated, entriesVisited, errors, elapsedMs}`。
+## 回合预算（maxTurns）
+
+`maxTurns` 是单次 run（一次 prompt 及其工具循环）里**模型调用次数**的上限，默认 150。只有调用方（主 agent）能设置和调整它：没有任何封顶，模型也没有可以延长回合的工具。
+
+- **配置**：profile `maxTurns`（>= 1，默认 150）、`onMaxTurns`（`stop` 默认 | `ask` | `summarize`）、`maxTurnsAskTimeoutSecs`（>= 1，默认 600）。`maxTurns: 0` 等非法值在加载配置时报错。
+- **按会话 / 请求覆盖**：`POST /v1/sessions` 或 `/v1/chat` 的 `session` 对象里写 `maxTurns` / `onMaxTurns` / `maxTurnsAskTimeoutSecs`，覆盖 profile 的值（非法值 ⇒ 400；放在 chat 顶层 ⇒ 400 提示放进 `"session"`）。这些值与 `toolApproval` 一样写进会话文件，重启恢复后仍然有效。CLI：`run` / `ask` / `rpc` 支持 `--max-turns N`（>= 1）与 `--on-max-turns stop|ask|summarize`；`ask --session <id> --max-turns N` 先通过下面的 turns 接口调整已有会话（`--on-max-turns` 只对新会话有效），`run --resume <id> --max-turns N` 同理。
+- **运行中调整**：上限在每次模型调用前读取，修改立即作用于正在进行的 run，也保留给该会话之后的 run（只在内存里；重启恢复后回到创建时的值）。降到已用回合以下 ⇒ run 在下一次检查时达到上限。
+
+| 方法和路径 | 说明 |
+|---|---|
+| `POST /v1/sessions/{id}/turns` | 请求体恰好一个：`{"maxTurns":N}`（绝对值，>= 1）\| `{"addTurns":N}`（可为负，结果至少 1）\| `{"stop":true}`（停止暂停在上限的 run，没有暂停 ⇒ 409）。200 响应 `{"sessionId","maxTurns","previous","turnsUsed","running","paused"}`（空闲时 `turnsUsed` 为 0）；请求体非法 ⇒ 400；未知会话 / 非 owner ⇒ 404 |
+| `PATCH /v1/sessions/{id}` | 也接受 `{"maxTurns":N}`（同上） |
+| `GET /v1/sessions/{id}` | 会话视图带 `maxTurns` 与 `turnBudget:{maxTurns, onMaxTurns, askTimeoutSecs, running, paused, turnsUsed, pause?, lastRun?}`；暂停时 `pause:{turnsUsed, maxTurns, timeoutSecs, pausedAt, expiresAt}` |
+
+```bash
+sub-bot turns <sessionId> --add 50        # 或 --set 300 / --stop；连接参数同 ask（--url / --socket / --token-file），打印 JSON 响应
+```
+
+RPC：`{"id":"9","type":"set_max_turns","maxTurns":300}`（或 `"addTurns":50` / `"stop":true`），响应 `data` 与 HTTP 相同，失败时 `success:false`；`get_state` 带 `maxTurns` 与 `turnBudget`。
+
+### 达到上限
+
+“达到上限”指模型调用前已用回合 >= maxTurns。按 `onMaxTurns`：
+
+- **stop**（默认）：run 结束，`run_outcome` 为 `max_turns`（照旧上报 `max_turns` issue）。最终结果的错误文本为 `max_turns reached (150/150 turns used); continue by sending another prompt with sessionId <id>`。
+- **summarize**：再做一次**不带工具**的模型调用（不计入回合），先注入一条用户消息 `[sub-bot] Turn limit reached. Do not call tools; summarize progress, what remains, and next steps.`；结果仍是 `max_turns`。
+- **ask**：在模型调用之前暂停，等待调用方：提高上限（新上限 > 已用回合）⇒ 继续；`stop` ⇒ 停止；abort / 会话删除 / runTimeout ⇒ 中止；`maxTurnsAskTimeoutSecs` 超时 ⇒ 停止。暂停期间会话视图 `turnBudget.paused: true`，`isStreaming` 和异步任务状态保持 running。
+
+最终结果（`/v1/chat` 同步 / 异步、`run --json`、`ask --json` 的 `session_state`、`ask --async`）总是带 `sessionId`、`turnsUsed`、`maxTurns`；因上限结束时另加 `stopReason: "max_turns"` 与 `canContinue: true`——用同一个 `sessionId` 再发一条消息即可继续（需要时先提高上限）。文本模式下 `run` / `ask` 在 stderr 打印 `max_turns reached (N/M). Continue: sub-bot ask --session <id> "<message>" (add --max-turns N to raise the budget)` 并以非零退出码结束（`run` 提示的是 `sub-bot run --resume <id>`）。
+
+`ask --auto-extend-turns N`：run 暂停在上限（ask 模式）时自动 `addTurns N` 并在 stderr 记录；不加时 stderr 提示 `sub-bot turns <id> --add N`。`run` 是进程内运行，外部无法延长，ask 模式会等到超时停止——请预先用 `--max-turns` 给够预算。
+
+### 事件、webhook 与日志
+
+```json
+{"type":"turn_budget_low","turnsUsed":120,"maxTurns":150,"remaining":30}
+{"type":"turn_budget_exhausted","turnsUsed":150,"maxTurns":150,"action":"ask","timeoutSecs":600,"expiresAt":1740000600000}
+{"type":"turn_budget_changed","maxTurns":200,"previous":150,"turnsUsed":150,"by":"caller"}
+{"type":"turn_budget_resolved","decision":"extended","maxTurns":200,"waitMs":5321}
+```
+
+- `turn_budget_low`：已用回合达到 ceil(0.8·maxTurns) 且仍有剩余时发出，每个 run 一次；预算被修改后重新武装。
+- `turn_budget_exhausted`：`action` 为 `stop` / `summarize` / `ask`；只有 ask 带 `timeoutSecs` / `expiresAt`（Unix 毫秒）并等待。
+- `turn_budget_resolved.decision`：`extended | stopped | timeout | cancelled`。`turn_budget_changed.by`：`caller`（`timeout` 预留）。
+- 异步任务 `webhookEvents` 新增 `turn_budget`（`all` 也包含），投递 `task.turn_budget_low` 与 `task.turn_budget_exhausted`，`data` 为事件字段加 `{taskId, sessionId, turnsUrl}`；回调目标对象的 `events` 也可写这两个名字。
+- 日志：INFO `turn budget changed`（session_id、max_turns、previous、turns_used、by）、`turn budget low`、`turn budget exhausted`、`turn budget wait resolved`；ask 超时为 WARN `turn budget wait timed out; stopping the run`。
+
 ## 工具调用审批（toolApproval）
 
 每次执行工具之前按策略判定 **allow / ask / deny**：allow 直接执行；deny 不执行，模型收到错误工具结果 `tool call denied by policy: <reason>` 后继续；ask 暂停这次工具调用，发出 `approval_required` 事件，等调用方批准或拒绝（或超时 / abort）。默认 `"never"`，不配置时行为与以前完全相同。

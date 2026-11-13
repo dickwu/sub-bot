@@ -1,4 +1,8 @@
-use crate::{event::AgentEvent, tool::*};
+use crate::{
+    event::AgentEvent,
+    tool::*,
+    turn_budget::{LastRun, OnMaxTurns, Resolution},
+};
 use agent_ai::*;
 use futures::{future::join_all, StreamExt};
 use std::{
@@ -86,8 +90,10 @@ pub struct LoopConfig {
     pub steering: Queue,
     /// agent 将要停止时注入（对应 `getFollowUpMessages`）。
     pub follow_up: Queue,
-    /// 安全上限，防止工具死循环。
-    pub max_turns: usize,
+    /// 单次 run 的模型调用上限（回合预算）；运行期可由调用方修改，每次模型调用前读取。
+    pub max_turns: Shared<u64>,
+    /// 达到 max_turns 时的处理（stop / summarize / ask）与运行期状态；调用方通过同一个 Arc 调整 / 停止。
+    pub turn_gate: Arc<crate::turn_budget::TurnGate>,
     /// 每次模型调用的输出 token 上限（含推理 token）
     pub max_tokens: Option<u32>,
     pub llm_max_retries: Option<u32>,
@@ -123,10 +129,18 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
     emit(AgentEvent::TurnStart);
     let mut pending = prompts;
     pending.extend(drain(&cfg.steering));
-    let mut turns = 0usize;
+    let mut turns = 0u64;
     let mut first = true;
     let mut used_tokens = 0u64;
+    // 最后一次调用已强制（token 预算或 summarize）：本轮结束后停止
     let mut budget_forced = false;
+    let gate = &cfg.turn_gate;
+    let _running = gate.begin();
+    // 计入预算的模型调用数（summarize 的总结调用不计入）
+    let mut turns_used = 0u64;
+    let mut limit_reached = false;
+    let mut low_fired = false;
+    let mut seen_changes = gate.changes();
 
     'outer: loop {
         let mut more_tool_calls = true;
@@ -144,9 +158,63 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
 
             turns += 1;
             let over_budget = cfg.token_budget.is_some_and(|b| used_tokens >= b);
-            let assistant = if turns > cfg.max_turns {
-                emit(AgentEvent::RunOutcome { kind: "max_turns".into() });
-                AssistantMessage::failed(&cfg.model.get(), StopReason::Error, "max_turns exceeded")
+            let mut max_turns = cfg.max_turns.get();
+            let mut turn_limit = None;
+            if turns > max_turns {
+                let used = turns - 1;
+                turn_limit = match gate.on_max() {
+                    OnMaxTurns::Ask => match gate.wait(&cfg.max_turns, used, &cancel, &emit).await {
+                        Resolution::Extended(n) => {
+                            max_turns = n;
+                            None
+                        }
+                        Resolution::Stopped | Resolution::Timeout => Some(TurnLimit::Stop),
+                        Resolution::Cancelled => Some(TurnLimit::Cancelled),
+                    },
+                    action => {
+                        tracing::info!(turns_used = used, max_turns, action = action.as_str(), "turn budget exhausted");
+                        emit(AgentEvent::TurnBudgetExhausted { turns_used: used, max_turns, action, timeout_secs: None, expires_at: None });
+                        Some(if action == OnMaxTurns::Summarize { TurnLimit::Summarize } else { TurnLimit::Stop })
+                    }
+                };
+            }
+            if turn_limit.is_none() {
+                // 预算被修改后重新武装低预算提醒
+                let changes = gate.changes();
+                if changes != seen_changes {
+                    seen_changes = changes;
+                    low_fired = false;
+                }
+                let used = turns - 1;
+                if !low_fired && max_turns > used && used >= crate::turn_budget::low_threshold(max_turns) {
+                    low_fired = true;
+                    let remaining = max_turns - used;
+                    tracing::info!(turns_used = used, max_turns, remaining, "turn budget low");
+                    emit(AgentEvent::TurnBudgetLow { turns_used: used, max_turns, remaining });
+                }
+            }
+            let assistant = if let Some(limit) = turn_limit {
+                let used = turns - 1;
+                let model = cfg.model.get();
+                match limit {
+                    TurnLimit::Cancelled => AssistantMessage::failed(&model, StopReason::Aborted, "aborted"),
+                    TurnLimit::Stop => {
+                        limit_reached = true;
+                        emit(AgentEvent::RunOutcome { kind: "max_turns".into() });
+                        AssistantMessage::failed(&model, StopReason::Error, format!("max_turns reached ({used}/{} turns used)", cfg.max_turns.get()))
+                    }
+                    TurnLimit::Summarize => {
+                        limit_reached = true;
+                        budget_forced = true;
+                        emit(AgentEvent::RunOutcome { kind: "max_turns".into() });
+                        let m = Message::user_text("[sub-bot] Turn limit reached. Do not call tools; summarize progress, what remains, and next steps.");
+                        emit(AgentEvent::MessageStart { message: m.clone() });
+                        emit(AgentEvent::MessageEnd { message: m.clone() });
+                        push(context, cfg, &m);
+                        new_messages.push(m);
+                        stream_assistant(context, cfg, cancel.clone(), &emit, false).await
+                    }
+                }
             } else if over_budget && budget_forced {
                 AssistantMessage::failed(&cfg.model.get(), StopReason::Error, "token budget exceeded")
             } else if over_budget {
@@ -162,6 +230,10 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
             } else {
                 stream_assistant(context, cfg, cancel.clone(), &emit, true).await
             };
+            if turn_limit.is_none() {
+                turns_used = turns;
+                gate.set_used(turns_used);
+            }
             used_tokens += assistant.usage.total_tokens;
             let am = Message::Assistant(assistant.clone());
             push(context, cfg, &am);
@@ -209,8 +281,17 @@ pub async fn run_loop(context: &Mutex<Vec<Message>>, prompts: Vec<Message>, cfg:
         }
         pending = follow;
     }
+    gate.finish(LastRun { turns_used, max_turns: cfg.max_turns.get(), limit_reached });
     emit(AgentEvent::AgentEnd { messages: new_messages.clone() });
     new_messages
+}
+
+/// 达到回合上限后的本轮处理。
+#[derive(Clone, Copy)]
+enum TurnLimit {
+    Stop,
+    Summarize,
+    Cancelled,
 }
 
 async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cancel: CancellationToken, emit: &Emit, with_tools: bool) -> AssistantMessage {
@@ -400,7 +481,8 @@ mod tests {
             api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
-            max_turns: 5,
+            max_turns: 5.into(),
+            turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
             token_budget: None,
@@ -451,7 +533,8 @@ mod tests {
             api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
-            max_turns: 50,
+            max_turns: 50.into(),
+            turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
             token_budget: Some(250),
@@ -511,7 +594,8 @@ mod tests {
             api: Default::default(),
             steering: Default::default(),
             follow_up: Default::default(),
-            max_turns: 5,
+            max_turns: 5.into(),
+            turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
             token_budget: None,

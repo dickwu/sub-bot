@@ -11,6 +11,13 @@
 
 ---
 
+## 回合预算（maxTurns，v0.10.4）
+
+- **原则**：只有调用方（主 agent）能调整预算；没有封顶，也不给模型任何“延长回合”的工具。默认 `maxTurns` 150（profile 与 `Config::fallback` 一致），`onMaxTurns` 默认 stop，ask 默认等待 600 秒。
+- **运行时**（`agent_core::turn_budget`）：`LoopConfig.max_turns: Shared<u64>`，`run_loop` 每次模型调用前读取，所以 HTTP / RPC / CLI 的修改立即作用于正在进行的 run 并保留给之后的 run。`LoopConfig.turn_gate: Arc<TurnGate>` 保存 `onMaxTurns`、ask 超时与运行期状态（running、已用回合、挂起项、最近一次 run 的 `LastRun`、调整计数）。`turns > maxTurns` 时：stop ⇒ `RunOutcome{max_turns}` + 错误消息 `max_turns reached (N/M turns used)`；summarize ⇒ 注入 `[sub-bot]` 用户消息后做一次不带工具的调用（不计回合），结果仍是 max_turns；ask ⇒ `TurnGate::wait`，与 `ApprovalGate` 同构：挂起项 + oneshot，`select!` 等待调用方 / cancel / 超时；`adjust` 与挂起共用一把锁（避免“刚提高上限、循环才挂起”的竞争），新上限 > 已用回合才唤醒；超时/取消与调用方竞争时以“谁取走挂起项”为准。`adjust_with` 在唤醒之前（持锁）发 `turn_budget_changed`，保证它先于 `turn_budget_resolved`。`turn_budget_low` 在已用回合 >= ceil(0.8·max) 且有剩余时发一次，调整计数变化后重新武装。`RunGuard` 在 run 结束（含 panic / future 被丢弃）时清除 running 与挂起项。
+- **服务侧**（`agentd::turns`）：`SessionRequest.{maxTurns, onMaxTurns, maxTurnsAskTimeoutSecs}` 覆盖 profile，写入 `SessionMeta`（与 `toolApproval` 一样），恢复会话时读回；运行期调整只在内存里。`POST /v1/sessions/{id}/turns`（`TurnsBody` 恰好一个字段，`deny_unknown_fields`）、`PATCH` 的 `maxTurns`、RPC `set_max_turns`、CLI `sub-bot turns`（复用 `ask::Connection` 与 `ask::Client`）共用 `SessionHandle::apply_turns`。会话视图 / get_state 带 `maxTurns` 与 `turnBudget`。最终结果由 `turn_result_fields` 补 `sessionId/turnsUsed/maxTurns`，本次 run 收到 `run_outcome: max_turns` 时再补 `stopReason:"max_turns"`、`canContinue:true` 与继续提示。异步任务另开一个订阅，把 `turn_budget_low/exhausted` 投递为 `task.turn_budget_*` webhook（`webhookEvents: turn_budget`，`all` 包含）。max_turns issue 上报保持不变（`RunOutcome` ⇒ warn issue）。
+- **CLI**：`run` / `ask` / `rpc` 的 `--max-turns`（clap `range(1..)`）与 `--on-max-turns`；`ask --session` 的 `--max-turns` 先 POST turns；`ask --auto-extend-turns N` 在 SSE 的 `turn_budget_exhausted{action:ask}`（`--async` 时轮询会话视图的 `turnBudget.pause`）上 POST `addTurns`；文本模式因上限结束时 stderr 打印继续命令、退出码非零（`MaxTurnsReached`）。
+
 ## 工具调用审批（toolApproval）
 
 - **运行时**（`agent_core::approval`）：`LoopConfig.approval: Option<Arc<ApprovalGate>>`。`run_one` 在工具 span 内、执行之前调用 `ApprovalGate::check`（只对存在的工具）：`ApprovalPolicy::evaluate(tool, args) -> Verdict{Allow|Ask|Deny}`；Deny 直接返回错误工具结果并发 `approval_resolved{by:policy}`；Ask 把 `(callId → oneshot)` 放进挂起表、发 `approval_required`，`select!` 等待调用方 / `cancel`（abort、runTimeout、删除会话）/ 超时。超时或取消与调用方决定竞争时以“谁从挂起表里取走条目”为准；最近 1024 个已决定 callId 用于区分 409 与 404。并行批次（`join_all`）里每个调用独立等待；顺序批次逐个等待。

@@ -36,7 +36,7 @@ impl AnthropicProvider {
         Self {
             api_key,
             base_url: format!("{}/v1", base.strip_suffix("/v1").unwrap_or(base)),
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().map_err(|_| "cannot initialize Anthropic HTTP client".into()),
+            http: crate::http::client_builder().connect_timeout(Duration::from_secs(30)).build().map_err(|_| "cannot initialize Anthropic HTTP client".into()),
             stream_idle_timeout,
         }
     }

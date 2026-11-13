@@ -251,7 +251,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 
 ## (d) 跨平台构建与分发
 
-- **纯 Rust TLS**：`reqwest` 使用 `rustls-tls`，不依赖 OpenSSL，所以各平台都能静态或近静态链接。
+- **纯 Rust TLS**：`reqwest` 使用 `rustls-no-provider`，所有客户端经 `agent_ai::http::client_builder()` 预配置 rustls（ring + webpki-roots），不依赖 OpenSSL / aws-lc，所以各平台都能静态或近静态链接。
 - **Shell**：
   - `bash` 工具运行 `sh -c`（只支持 macOS / Linux，`agentd` 在非 unix 平台上会直接编译失败）；
   - 进程设置 `kill_on_drop`，有超时，并支持取消。

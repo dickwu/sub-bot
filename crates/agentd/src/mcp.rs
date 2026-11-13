@@ -569,8 +569,8 @@ impl Server {
         Ok((ChildHandle { pid, exit: exit_rx, stderr: lines, closing, kill: Some(kill_tx) }, stdout, stdin))
     }
 
-    fn http_transport(&self) -> Result<StreamableHttpClientTransport<reqwest13::Client>, String> {
-        use reqwest13::header::{HeaderName, HeaderValue};
+    fn http_transport(&self) -> Result<StreamableHttpClientTransport<reqwest::Client>, String> {
+        use reqwest::header::{HeaderName, HeaderValue};
         let url = self.cfg.url.clone().unwrap_or_default();
         let mut headers = std::collections::HashMap::new();
         let mut put = |name: &str, value: String| -> Result<(), String> {
@@ -727,26 +727,13 @@ fn signal_group(pid: Option<u32>, signal: Signal) {
     let _ = (pid, signal);
 }
 
-/// MCP 的 HTTP 客户端：rustls + ring + webpki-roots（与其它出站请求一致，不依赖系统 OpenSSL），不跟随重定向（避免请求头被带到别的主机）。
-fn http_client() -> Result<reqwest13::Client, String> {
-    static CLIENT: std::sync::OnceLock<reqwest13::Client> = std::sync::OnceLock::new();
+/// MCP 的 HTTP 客户端：共享构建器（rustls + ring + webpki-roots，与其它出站请求一致，不依赖系统 OpenSSL），不跟随重定向（避免请求头被带到别的主机）。
+fn http_client() -> Result<reqwest::Client, String> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     if let Some(c) = CLIENT.get() {
         return Ok(c.clone());
     }
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("TLS setup failed: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-    let client = reqwest13::Client::builder()
-        .tls_backend_preconfigured(tls)
-        .connect_timeout(Duration::from_secs(30))
-        .redirect(reqwest13::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("HTTP client setup failed: {e}"))?;
+    let client = agent_ai::http::client_builder().connect_timeout(Duration::from_secs(30)).redirect(reqwest::redirect::Policy::none()).build().map_err(|e| format!("HTTP client setup failed: {e}"))?;
     Ok(CLIENT.get_or_init(|| client).clone())
 }
 

@@ -60,7 +60,7 @@ impl ToolRegistry {
         r.register("http_fetch", Risk::Network, |c| {
             Some(Arc::new(HttpFetchTool {
                 allow_hosts: c.http_allow_hosts.clone(),
-                http: reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15)).timeout(std::time::Duration::from_secs(60)).build().expect("http client"),
+                http: agent_ai::http::client_builder().connect_timeout(std::time::Duration::from_secs(15)).timeout(std::time::Duration::from_secs(60)).build().expect("http client"),
             }))
         });
         r

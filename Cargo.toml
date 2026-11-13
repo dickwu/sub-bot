@@ -16,7 +16,10 @@ futures = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# TLS 只用 rustls + ring + webpki-roots（发布为静态 musl 二进制，不引入 aws-lc / openssl）；客户端统一经 agent_ai::http::client_builder() 构建
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "stream", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
@@ -26,10 +29,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
-directories = "5"
-rand = "0.8"
-sha2 = "0.10"
-hmac = "0.12"
+directories = "6"
+rand = "0.10"
+sha2 = "0.11"
+hmac = "0.13"
 agent-ai = { path = "crates/agent-ai" }
 agent-core = { path = "crates/agent-core" }
 agent-tools = { path = "crates/agent-tools" }

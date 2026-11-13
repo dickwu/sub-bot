@@ -261,7 +261,7 @@ impl Reporter {
             flushing: AtomicBool::new(false),
             summaries: AtomicUsize::new(0),
             semaphore: Arc::new(Semaphore::new(32)),
-            deliverer: Deliverer::new(reqwest::Client::new(), policy),
+            deliverer: Deliverer::new(agent_ai::http::client(), policy),
             disabled,
         }
     }

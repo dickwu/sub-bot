@@ -2376,7 +2376,17 @@ pub(crate) mod tests {
         drop(hub);
         assert!(weak.upgrade().is_none());
         healthy.store(true, Ordering::Relaxed);
-        let hub = Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent).unwrap();
+        // flock 跟随打开的文件描述：并行测试里别的线程 fork 的子进程可能暂时持有它的副本（CI 上可复现），最多等 15 秒重试。
+        let mut reopen = 0;
+        let hub = loop {
+            match Hub::with_reporter(cfg.clone(), "faux", None, None, reporter.clone(), StoreMode::Persistent) {
+                Err(e) if reopen < 1500 && format!("{e:#}").contains("is in use by another sub-bot server") => {
+                    reopen += 1;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                other => break other.unwrap(),
+            }
+        };
         let restored = hub.get_task(&cfg.clients[0], &task.task_id).unwrap();
         assert_eq!(restored.status, TaskStatus::Failed);
         assert_eq!(restored.error.as_deref(), Some("interrupted by restart"));

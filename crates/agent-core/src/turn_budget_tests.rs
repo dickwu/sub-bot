@@ -90,6 +90,7 @@ fn setup(max_turns: u64, on_max: OnMaxTurns, timeout: Duration, hook: impl Fn(us
         turn_gate: gate,
         max_tokens: None,
         llm_max_retries: None,
+        stream_idle_timeout: None,
         token_budget: None,
         run_timeout: None,
         before_run: None,

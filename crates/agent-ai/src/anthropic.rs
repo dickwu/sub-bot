@@ -4,7 +4,7 @@ mod tests;
 use crate::{
     openai::{drain_sse_lines, idle_timeout_error, redact},
     provider::*,
-    retry::{retry_after, run_with_retries, CallError},
+    retry::{record_bytes, retry_after, run_with_retries, CallError, RetryCtx},
     types::*,
 };
 use futures::StreamExt;
@@ -27,7 +27,7 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(api_key: crate::secrets::Secret, base_url: Option<String>) -> Self {
-        Self::with_stream_idle_timeout(api_key, base_url, Duration::from_secs(300))
+        Self::with_stream_idle_timeout(api_key, base_url, Duration::from_secs(crate::DEFAULT_STREAM_IDLE_TIMEOUT_SECS))
     }
 
     pub fn with_stream_idle_timeout(api_key: crate::secrets::Secret, base_url: Option<String>, stream_idle_timeout: Duration) -> Self {
@@ -36,7 +36,7 @@ impl AnthropicProvider {
         Self {
             api_key,
             base_url: format!("{}/v1", base.strip_suffix("/v1").unwrap_or(base)),
-            http: crate::http::client_builder().connect_timeout(Duration::from_secs(30)).build().map_err(|_| "cannot initialize Anthropic HTTP client".into()),
+            http: crate::http::llm_client_builder().build().map_err(|_| "cannot initialize Anthropic HTTP client".into()),
             stream_idle_timeout,
         }
     }
@@ -57,6 +57,11 @@ impl AnthropicProvider {
         if let Some(id) = response.headers().get("request-id").and_then(|v| v.to_str().ok()) {
             tracing::debug!(request_id = %self.safe(id), status = response.status().as_u16(), "Anthropic response received");
         }
+    }
+
+    /// Per-request override (session / profile) > this instance's default (account > provider > global).
+    fn idle_timeout(&self, req: &Request) -> Duration {
+        req.stream_idle_timeout.unwrap_or(self.stream_idle_timeout)
     }
 
     async fn run(&self, req: &mut Request, tx: mpsc::Sender<AssistantEvent>) -> Result<AssistantMessage, CallError> {
@@ -80,7 +85,7 @@ impl AnthropicProvider {
             }
             let status = response.status();
             let retry_after = response.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(retry_after);
-            let text = tokio::time::timeout(self.stream_idle_timeout, response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
+            let text = tokio::time::timeout(self.idle_timeout(req), response.text()).await.ok().and_then(Result::ok).unwrap_or_default();
             let lower = text.to_ascii_lowercase();
             if status == reqwest::StatusCode::BAD_REQUEST
                 && !req.raw_effort
@@ -92,9 +97,9 @@ impl AnthropicProvider {
                 req.reasoning = None; // At most one adjustment, also retained across transient retries.
                 continue;
             }
-            return Err(CallError { reason: format!("Anthropic HTTP {status}: {text}"), transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after });
+            return Err(CallError::http(format!("Anthropic HTTP {status}: {text}"), status, retry_after));
         };
-        let mut message = parse_stream(response, &req.model, &tx, self).await?;
+        let mut message = parse_stream(response, &req.model, &tx, self, self.idle_timeout(req)).await?;
         message.reasoning_effort = req.reasoning;
         Ok(message)
     }
@@ -117,10 +122,11 @@ impl Provider for AnthropicProvider {
                 let started = std::time::Instant::now();
                 let model = req.model.clone();
                 let max_retries = if req.raw_effort { 0 } else { req.llm_max_retries.unwrap_or(3) };
-                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), "request sent");
+                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), idle_timeout_secs = provider.idle_timeout(&req).as_secs(), max_retries, "request sent");
                 let mut state = (provider, req);
+                let ctx = RetryCtx { provider: "anthropic", model: &model };
                 let result = tokio::select! {
-                    result = run_with_retries(&mut state, max_retries, &tx, |state, tx| Box::pin(state.0.run(&mut state.1, tx))) => Some(result),
+                    result = run_with_retries(&mut state, max_retries, &tx, ctx, |state, tx| Box::pin(state.0.run(&mut state.1, tx))) => Some(result),
                     _ = cancel.cancelled() => None,
                     _ = tx.closed() => return,
                 };
@@ -424,11 +430,12 @@ impl StreamState {
             }
             "message_stop" => self.completed = true,
             "error" => {
-                return Err(CallError {
-                    reason: format!("Anthropic stream error: {}", value["error"]),
-                    transient: matches!(value["error"]["type"].as_str(), Some("overloaded_error" | "api_error" | "rate_limit_error")),
-                    retry_after: None,
-                })
+                let (transient, kind) = match value["error"]["type"].as_str() {
+                    Some("overloaded_error" | "api_error") => (true, "overloaded"),
+                    Some("rate_limit_error") => (true, "rate_limit"),
+                    _ => (false, "other"),
+                };
+                return Err(CallError { reason: format!("Anthropic stream error: {}", value["error"]), transient, retry_after: None, kind });
             }
             _ => {} // ping and future informational events
         }
@@ -447,14 +454,15 @@ impl StreamState {
     }
 }
 
-async fn parse_stream(response: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, provider: &AnthropicProvider) -> Result<AssistantMessage, CallError> {
-    let idle_timeout = provider.stream_idle_timeout;
+async fn parse_stream(response: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, provider: &AnthropicProvider, idle_timeout: Duration) -> Result<AssistantMessage, CallError> {
     let _ = tx.send(AssistantEvent::Start).await;
     let mut state = StreamState::new(model);
     let mut bytes = response.bytes_stream();
     let mut buffer = vec![];
     while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| idle_timeout_error(idle_timeout))? {
-        buffer.extend_from_slice(&chunk.map_err(|_| "stream body read error".to_string())?);
+        let chunk = chunk.map_err(|_| "stream body read error".to_string())?;
+        record_bytes(chunk.len());
+        buffer.extend_from_slice(&chunk);
         for data in drain_sse_lines(&mut buffer) {
             let value: Value = serde_json::from_str(&data).map_err(|_| "Anthropic invalid SSE JSON".to_string())?;
             // AssistantMessage has no provider-specific ID field; trace it alongside request-id.

@@ -111,6 +111,9 @@ enum Cmd {
         /// 仅在没有配置文件时使用：单一 client 的 token；不填则随机生成（不打印）
         #[arg(long, env = "SUB_BOT_TOKEN", hide_env_values = true)]
         token: Option<String>,
+        /// 覆盖配置的全局 streamIdleTimeoutSecs（1..=7200）；provider / 账号 / profile / 请求级设置仍然优先
+        #[arg(long, value_parser = parse_stream_idle_timeout)]
+        stream_idle_timeout_secs: Option<u64>,
     },
     /// 向已运行的服务提问（默认优先使用本地 Unix socket）
     ///
@@ -132,6 +135,8 @@ enum Cmd {
         resume: Option<String>,
         #[command(flatten)]
         turns: TurnArgs,
+        #[command(flatten)]
+        llm: LlmArgs,
     },
     /// 一次性执行一个 prompt，打印最终回复后退出
     Run {
@@ -155,6 +160,8 @@ enum Cmd {
         resume: Option<String>,
         #[command(flatten)]
         turns: TurnArgs,
+        #[command(flatten)]
+        llm: LlmArgs,
         prompt: String,
     },
     /// 调整服务端会话的回合预算（连接参数同 ask）：--set N（绝对值）| --add N（可为负）| --stop（停止暂停在上限的 run）；打印 JSON 响应
@@ -237,6 +244,33 @@ impl TurnArgs {
         Ok(())
     }
 }
+
+/// clap 校验 `--stream-idle-timeout-secs`（与配置 / HTTP 同一上限与文案）。
+pub fn parse_stream_idle_timeout(value: &str) -> Result<u64, String> {
+    let secs: u64 = value.parse().map_err(|e| format!("{e}"))?;
+    config::check_stream_idle_timeout("streamIdleTimeoutSecs", secs).map_err(|e| e.to_string())?;
+    Ok(secs)
+}
+
+/// 新会话的 LLM 流参数（run / rpc / ask）；写进会话选项并随会话持久化，恢复的会话沿用创建时的值。
+#[derive(clap::Args, Clone, Debug, Default)]
+pub struct LlmArgs {
+    /// 流空闲超时（秒，1..=7200，默认 1800）：连续这么久没有收到任何字节 ⇒ 按瞬时错误重试。覆盖 profile / 账号 / provider / 全局配置
+    #[arg(long, value_parser = parse_stream_idle_timeout)]
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// 瞬时 LLM 错误的重试次数（0..=20；0 = 不重试），覆盖 profile / 全局 llmMaxRetries
+    #[arg(long, value_parser = clap::value_parser!(u32).range(..=i64::from(agent_ai::MAX_LLM_MAX_RETRIES)))]
+    pub llm_max_retries: Option<u32>,
+}
+
+impl LlmArgs {
+    pub fn is_set(&self) -> bool {
+        self.stream_idle_timeout_secs.is_some() || self.llm_max_retries.is_some()
+    }
+}
+
+/// 恢复已有会话时 LLM 参数固定为创建时的值。
+pub const LLM_ARGS_RESUME_ERROR: &str = "--stream-idle-timeout-secs / --llm-max-retries only apply to new sessions (they are fixed when the session is created)";
 
 #[derive(Subcommand)]
 enum IssuesCmd {
@@ -400,6 +434,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(secs) = cli.keychain_timeout_secs {
         loaded.keychain_timeout_secs = secs;
     }
+    if let Cmd::Serve { stream_idle_timeout_secs: Some(secs), .. } = cli.cmd {
+        loaded.stream_idle_timeout_secs = secs;
+    }
     #[cfg(unix)]
     if let Cmd::Serve { unix_socket: Some(path), .. } = &cli.cmd {
         loaded.unix_socket = Some(path.clone().unwrap_or_else(|| loaded.data_dir().join("sub-bot.sock")));
@@ -468,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg, turns: &TurnArgs| hub::SessionRequest {
+    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg, turns: &TurnArgs, llm: &LlmArgs| hub::SessionRequest {
         provider: cli.provider.clone(),
         profile,
         model: cli.model.clone(),
@@ -478,6 +515,8 @@ async fn main() -> anyhow::Result<()> {
         account: account.account.clone(),
         max_turns: turns.max_turns,
         on_max_turns: turns.on_max_turns,
+        stream_idle_timeout_secs: llm.stream_idle_timeout_secs,
+        llm_max_retries: llm.llm_max_retries,
         ..Default::default()
     };
     match cli.cmd {
@@ -511,20 +550,22 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile, depth, ref account, ref resume, ref turns } => {
+        Cmd::Rpc { ref profile, depth, ref account, ref resume, ref turns, ref llm } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             if resume.is_some() {
                 anyhow::ensure!(turns.on_max_turns.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
+                anyhow::ensure!(!llm.is_set(), LLM_ARGS_RESUME_ERROR);
             }
-            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account, turns), resume.clone()).await;
+            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account, turns, llm), resume.clone()).await;
             hub.mcp.shutdown().await;
             result?;
         }
-        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref turns, ref prompt } => {
+        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref turns, ref llm, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             let client = local_client(&hub.config);
             let session = match resume {
                 Some(id) => {
+                    anyhow::ensure!(!llm.is_set(), LLM_ARGS_RESUME_ERROR);
                     let session = resume_session(&hub, &client, id)?;
                     if let Some(level) = cli.reasoning_effort {
                         session.set_reasoning_effort(Some(level));
@@ -532,7 +573,7 @@ async fn main() -> anyhow::Result<()> {
                     turns.apply_to_resumed(&session)?;
                     session
                 }
-                None => hub.create_session(&client, session_req(profile.clone(), depth, account, turns))?,
+                None => hub.create_session(&client, session_req(profile.clone(), depth, account, turns, llm))?,
             };
             let persisted = session.hooks.path().is_some();
             if !json {
@@ -995,6 +1036,28 @@ mod tests {
             assert_eq!(event.kind, "startup_failed");
             assert_eq!(event.details, serde_json::json!({}));
         }
+    }
+
+    #[test]
+    fn llm_stream_cli_flags_are_validated() {
+        let Cmd::Run { llm, .. } = Cli::try_parse_from(["sub-bot", "run", "--stream-idle-timeout-secs", "7200", "--llm-max-retries", "20", "hi"]).unwrap().cmd else { panic!("run") };
+        assert_eq!((llm.stream_idle_timeout_secs, llm.llm_max_retries), (Some(7200), Some(20)));
+        let Cmd::Rpc { llm, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--stream-idle-timeout-secs", "1", "--llm-max-retries", "0"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!((llm.stream_idle_timeout_secs, llm.llm_max_retries), (Some(1), Some(0)));
+        let Cmd::Ask(ask) = Cli::try_parse_from(["sub-bot", "ask", "--stream-idle-timeout-secs", "3600", "hi"]).unwrap().cmd else { panic!("ask") };
+        assert_eq!((ask.llm.stream_idle_timeout_secs, ask.llm.llm_max_retries), (Some(3600), None));
+        let Cmd::Serve { stream_idle_timeout_secs, .. } = Cli::try_parse_from(["sub-bot", "serve", "--stream-idle-timeout-secs", "900"]).unwrap().cmd else { panic!("serve") };
+        assert_eq!(stream_idle_timeout_secs, Some(900));
+        for args in [
+            &["sub-bot", "run", "--stream-idle-timeout-secs", "0", "hi"][..],
+            &["sub-bot", "ask", "--stream-idle-timeout-secs", "7201", "hi"],
+            &["sub-bot", "serve", "--stream-idle-timeout-secs", "0"],
+        ] {
+            let error = Cli::try_parse_from(args).err().expect("rejected").to_string();
+            assert!(error.contains("streamIdleTimeoutSecs must be between 1 and 7200 (2 hours)"), "{error}");
+        }
+        assert!(Cli::try_parse_from(["sub-bot", "rpc", "--llm-max-retries", "21"]).is_err());
+        assert!(Cli::try_parse_from(["sub-bot", "run", "--stream-idle-timeout-secs", "x", "hi"]).is_err());
     }
 
     #[test]

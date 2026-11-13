@@ -161,7 +161,9 @@ impl Provider for FailoverProvider {
                                     // typed：hub 收到下面的 Retry 后上报 account_failover issue，日志不再重复转成 log_warn
                                     tracing::warn!(issue = "typed", provider = %slot.key.provider, from = %slot.key.account, to = %next.key.account, class, "account failover");
                                     let reason = format!("{FAILOVER_PREFIX}{} -> {} ({class})", slot.key.account, next.key.account);
-                                    if tx.send(AssistantEvent::Retry { attempt, reason }).await.is_err() {
+                                    // failover 只发生在还没有任何内容之前：没有要丢弃的工具调用，也不等待
+                                    let retry = AssistantEvent::Retry { attempt, reason, max_retries: (order.len() - 1) as u32, delay_ms: 0, kind: "account_failover".into(), discarded_tool_calls: 0 };
+                                    if tx.send(retry).await.is_err() {
                                         return;
                                     }
                                     switched = true;
@@ -245,6 +247,7 @@ mod tests {
             api: agent_ai::Api::Auto,
             max_tokens: None,
             llm_max_retries: Some(0),
+            stream_idle_timeout: None,
         }
     }
 

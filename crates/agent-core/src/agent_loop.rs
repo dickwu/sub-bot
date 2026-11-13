@@ -96,7 +96,10 @@ pub struct LoopConfig {
     pub turn_gate: Arc<crate::turn_budget::TurnGate>,
     /// 每次模型调用的输出 token 上限（含推理 token）
     pub max_tokens: Option<u32>,
+    /// 瞬态错误的额外重试次数（重试不消耗回合）；None = provider 默认（3）。
     pub llm_max_retries: Option<u32>,
+    /// 覆盖 provider 实例的流空闲超时（会话 / profile 级）；None = provider 实例默认（账号 > provider > 全局）。
+    pub stream_idle_timeout: Option<std::time::Duration>,
     /// 单次运行的总 token 预算：达到后再给模型一次“不带工具、直接给出最终答复”的机会，然后停止
     pub token_budget: Option<u64>,
     /// 单次运行的时间上限；None 表示不限时。
@@ -318,6 +321,7 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
         api: cfg.api,
         max_tokens: cfg.max_tokens,
         llm_max_retries: cfg.llm_max_retries,
+        stream_idle_timeout: cfg.stream_idle_timeout,
     };
     emit(AgentEvent::MessageStart { message: Message::Assistant(AssistantMessage::empty(&model)) });
     let mut stream = cfg.provider.stream(req, cancel.clone());
@@ -337,8 +341,16 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
             },
         };
         match &ev {
-            AssistantEvent::Retry { attempt, reason } => {
-                emit(AgentEvent::MessageRetry { attempt: *attempt, reason: reason.clone() });
+            AssistantEvent::Retry { attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls } => {
+                // 同一次模型调用的重放：不消耗回合，也不再触发 before_call（压缩）。
+                emit(AgentEvent::MessageRetry {
+                    attempt: *attempt,
+                    reason: reason.clone(),
+                    max_retries: *max_retries,
+                    delay_ms: *delay_ms,
+                    kind: kind.clone(),
+                    discarded_tool_calls: *discarded_tool_calls,
+                });
                 continue;
             }
             AssistantEvent::Done { message } | AssistantEvent::Error { message } => final_msg = Some(message.clone()),
@@ -485,6 +497,7 @@ mod tests {
             turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
+            stream_idle_timeout: None,
             token_budget: None,
             run_timeout: None,
             before_run: None,
@@ -537,6 +550,7 @@ mod tests {
             turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
+            stream_idle_timeout: None,
             token_budget: Some(250),
             run_timeout: None,
             before_run: None,
@@ -598,6 +612,7 @@ mod tests {
             turn_gate: Default::default(),
             max_tokens: None,
             llm_max_retries: None,
+            stream_idle_timeout: None,
             token_budget: None,
             run_timeout: None,
             before_run: None,

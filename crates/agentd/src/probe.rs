@@ -131,6 +131,7 @@ async fn probe_level(provider: &dyn Provider, model: &str, api: Api, level: Thin
             1024
         }),
         llm_max_retries: Some(0),
+        stream_idle_timeout: None,
     };
     let (result, thinking_rejected) = attempt(provider, req.clone(), if anthropic { variant.variant() } else { api.as_str() }).await;
     if anthropic && thinking.is_none() && thinking_rejected {

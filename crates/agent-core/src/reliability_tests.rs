@@ -61,10 +61,12 @@ async fn openai_stream_retries_keep_only_successful_message() {
                     socket.shutdown().await.unwrap();
                 }
             });
-            let provider = agent_ai::openai::OpenAiProvider::with_stream_idle_timeout(agent_ai::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(150));
+            // The instance default would never fire within the test; the per-request override (session / profile) must win.
+            let provider = agent_ai::openai::OpenAiProvider::with_stream_idle_timeout(agent_ai::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_secs(600));
             let mut cfg = config(Arc::new(provider));
             cfg.api = api;
             cfg.llm_max_retries = Some(1);
+            cfg.stream_idle_timeout = Some(Duration::from_millis(150));
             let context = std::sync::Mutex::new(vec![]);
             let events = Arc::new(std::sync::Mutex::new(vec![]));
             let captured = events.clone();
@@ -78,7 +80,8 @@ async fn openai_stream_retries_keep_only_successful_message() {
             });
             let messages = tokio::time::timeout(Duration::from_secs(8), crate::agent_loop::run_loop(&context, vec![Message::user_text("test")], &cfg, cancel, emit)).await.unwrap();
             server.abort();
-            let success = matches!(scenario, "500" | "text" | "idle" | "408" | "429");
+            // "tool": a transient failure after tool-call deltas were streamed is replayed too (tools only run after Done).
+            let success = matches!(scenario, "500" | "text" | "idle" | "tool" | "408" | "429");
             assert_eq!(count.load(Ordering::SeqCst), if success || scenario == "exhaust" { 2 } else { 1 }, "{api:?} {scenario}");
             let assistants: Vec<_> = messages.iter().filter_map(|m| if let Message::Assistant(a) = m { Some(a) } else { None }).collect();
             assert_eq!(assistants.len(), 1);
@@ -98,6 +101,26 @@ async fn openai_stream_retries_keep_only_successful_message() {
             assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::MessageRetry { attempt: 1, .. })).count(), usize::from(success || scenario == "exhaust" || scenario == "cancel"));
             if scenario == "text" {
                 assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { assistant_message_event: AssistantEvent::TextDelta { delta, .. } } if delta == "discard me")));
+            }
+            let retry = events.iter().find_map(|e| match e {
+                AgentEvent::MessageRetry { attempt, max_retries, kind, discarded_tool_calls, delay_ms, .. } => Some((*attempt, *max_retries, kind.clone(), *discarded_tool_calls, *delay_ms)),
+                _ => None,
+            });
+            if let Some((attempt, max_retries, kind, discarded, delay_ms)) = retry {
+                let expected = match scenario {
+                    "idle" => "idle_timeout",
+                    "text" | "tool" => "stream_error",
+                    _ => "http_status",
+                };
+                assert_eq!((attempt, max_retries, kind.as_str(), discarded), (1, 1, expected, u32::from(scenario == "tool")), "{api:?} {scenario}");
+                assert!((1000..=1250).contains(&delay_ms), "{delay_ms}");
+            }
+            if scenario == "tool" {
+                assert!(events.iter().any(|e| matches!(e, AgentEvent::MessageUpdate { assistant_message_event: AssistantEvent::ToolcallStart { .. } })));
+                assert!(assistants[0].tool_calls().is_empty());
+                assert!(!events.iter().any(|e| matches!(e, AgentEvent::ToolExecutionStart { .. })));
+                // The replay does not consume a turn: exactly one turn ran.
+                assert_eq!(events.iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count(), 1);
             }
         }
     }
@@ -140,6 +163,7 @@ fn config(provider: Arc<dyn Provider>) -> LoopConfig {
         turn_gate: Default::default(),
         max_tokens: None,
         llm_max_retries: None,
+        stream_idle_timeout: None,
         token_budget: None,
         run_timeout: None,
         before_run: None,

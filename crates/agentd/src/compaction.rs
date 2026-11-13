@@ -81,6 +81,8 @@ pub struct SummaryCall<'a> {
     pub api: agent_ai::Api,
     pub max_tokens: u32,
     pub llm_max_retries: Option<u32>,
+    /// 会话的流空闲超时覆盖（与主调用一致）
+    pub stream_idle_timeout: Option<std::time::Duration>,
 }
 
 /// 摘要调用失败：错误信息 + 已消耗的用量（计入 totalUsage）。
@@ -103,6 +105,7 @@ pub async fn summarize(call: &SummaryCall<'_>, prompt: String, cancel: Cancellat
         api: call.api,
         max_tokens: Some(call.max_tokens),
         llm_max_retries: call.llm_max_retries,
+        stream_idle_timeout: call.stream_idle_timeout,
     };
     let mut stream = call.provider.stream(req, cancel.clone());
     while let Some(event) = stream.next().await {

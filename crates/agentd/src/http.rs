@@ -291,6 +291,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                 let provider = st.hub.profile_provider(p);
                 let model = st.hub.profile_model(p);
                 let account = st.hub.profile_account(p, provider);
+                let llm = st.hub.llm_settings(p, provider, account, None, None);
                 json!({"name": n, "provider": provider, "account": account, "allowedAccounts": st.hub.allowed_accounts(p),
                     "fallbackAccounts": st.hub.fallback_accounts(p, provider, account), "model": model, "allowedModels": p.allowed_models,
                     "reasoningEffort": p.reasoning_effort.or(st.hub.config.default_reasoning_effort),
@@ -298,7 +299,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
                     "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
                         "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
-                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "maxTurns": p.max_turns, "onMaxTurns": p.on_max_turns, "maxTurnsAskTimeoutSecs": p.max_turns_ask_timeout_secs, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "maxTurns": p.max_turns, "onMaxTurns": p.on_max_turns, "maxTurnsAskTimeoutSecs": p.max_turns_ask_timeout_secs, "streamIdleTimeoutSecs": llm.stream_idle_timeout_secs, "llmMaxRetries": llm.llm_max_retries, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
             })
         })
         .collect();
@@ -514,7 +515,21 @@ struct ChatBody {
 /// `/v1/chat` 文档化的顶层字段（未知字段错误里列出）。
 const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model"];
 /// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"；profile/model/reasoningEffort/depth/account 顶层可用）。
-const SESSION_ONLY_FIELDS: &[&str] = &["provider", "cwd", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools", "toolApproval", "maxTurns", "onMaxTurns", "maxTurnsAskTimeoutSecs"];
+const SESSION_ONLY_FIELDS: &[&str] = &[
+    "provider",
+    "cwd",
+    "systemPrompt",
+    "appendSystemPrompt",
+    "api",
+    "tools",
+    "callerTools",
+    "toolApproval",
+    "maxTurns",
+    "onMaxTurns",
+    "maxTurnsAskTimeoutSecs",
+    "streamIdleTimeoutSecs",
+    "llmMaxRetries",
+];
 
 /// 错误信息里展示的字段名：去掉控制字符并截断（只回显键名，不回显任何值）。
 fn field_label(key: &str) -> String {
@@ -723,6 +738,8 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
     let mut new_messages: Vec<Message> = vec![];
     let mut segment_start = 0;
     let mut partial_text = String::new();
+    // 当前助手消息在 partial_text 里的起点：重试只丢弃这一条消息的部分文本
+    let mut message_text_start = 0;
     let mut aborted = false;
     let mut timed_out = false;
     let mut panicked = false;
@@ -750,7 +767,8 @@ async fn collect_chat(h: &SessionHandle, mut rx: tokio::sync::broadcast::Receive
                 segment_start = new_messages.len();
                 max_turns = false;
             }
-            Ok(AgentEvent::MessageRetry { .. }) => partial_text.clear(),
+            Ok(AgentEvent::MessageStart { message: Message::Assistant(_) }) => message_text_start = partial_text.len(),
+            Ok(AgentEvent::MessageRetry { .. }) => partial_text.truncate(message_text_start),
             Ok(AgentEvent::MessageUpdate { assistant_message_event: agent_ai::AssistantEvent::TextDelta { delta, .. } }) => partial_text.push_str(&delta),
             Ok(AgentEvent::MessageEnd { message }) => {
                 if let (Some((id, queue)), Message::Assistant(a)) = (progress, &message) {
@@ -1570,6 +1588,43 @@ mod tests {
             assert_eq!(hub.evict_idle(std::time::Instant::now() + std::time::Duration::from_secs(601)), 1);
             assert!(hub.get(&client, &h.id).is_none());
         }
+    }
+
+    /// 第一次调用：文本 + bash 工具调用；之后：部分文本 → Retry → 重放文本，然后挂起（由 chat 超时结束）。
+    struct RetryThenStall(std::sync::atomic::AtomicUsize);
+    impl agent_ai::Provider for RetryThenStall {
+        fn id(&self) -> &str {
+            "faux"
+        }
+        fn stream(&self, req: agent_ai::Request, _: tokio_util::sync::CancellationToken) -> agent_ai::EventStream {
+            use agent_ai::AssistantEvent as E;
+            let delta = |text: &str| E::TextDelta { content_index: 0, delta: text.into() };
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let mut message = agent_ai::AssistantMessage::empty(&req.model);
+                message.content = vec![
+                    agent_ai::Content::Text { text: "kept ".into() },
+                    agent_ai::Content::ToolCall(agent_ai::ToolCall { id: "c1".into(), name: "bash".into(), arguments: json!({"command": "true"}) }),
+                ];
+                message.stop_reason = agent_ai::StopReason::ToolUse;
+                return Box::pin(futures::stream::iter(vec![delta("kept "), E::Done { message }]));
+            }
+            let retry = E::Retry { attempt: 1, reason: "stream idle timeout after 1s".into(), max_retries: 3, delay_ms: 0, kind: "idle_timeout".into(), discarded_tool_calls: 0 };
+            Box::pin(futures::stream::iter(vec![delta("discarded "), retry, delta("final")]).chain(futures::stream::pending()))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_timeout_partial_text_drops_only_the_retried_attempt() {
+        let mut cfg = config();
+        cfg.profiles.get_mut("default").unwrap().load_context_files = false;
+        cfg.chat_timeout_secs = 1;
+        let mut hub = Hub::new(cfg, "faux", None, None).unwrap();
+        Arc::get_mut(&mut hub).unwrap().providers.insert("faux".into(), Arc::new(RetryThenStall(Default::default())));
+        let app = router(AppState { hub: hub.clone() });
+        let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "go"})).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert_eq!(body["text"], "kept final");
+        hub.abort_all().await;
     }
 
     fn reviewer_app() -> Router {

@@ -74,6 +74,9 @@ pub struct Ask {
     /// When the run pauses at the turn limit (onMaxTurns=ask), add N turns automatically (POST addTurns) and continue.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     pub auto_extend_turns: Option<u64>,
+    /// session.streamIdleTimeoutSecs / session.llmMaxRetries for a new session (fixed for the session's lifetime).
+    #[command(flatten)]
+    pub llm: crate::LlmArgs,
     /// Message, or - to read stdin.
     pub message: String,
 }
@@ -107,6 +110,8 @@ pub struct Client {
     /// 新会话的 session.maxTurns / session.onMaxTurns
     max_turns: Option<u64>,
     on_max_turns: Option<agent_core::OnMaxTurns>,
+    /// 新会话的 session.streamIdleTimeoutSecs / session.llmMaxRetries
+    llm: crate::LlmArgs,
     /// --auto-extend-turns：暂停在回合上限时自动 addTurns
     auto_extend_turns: Option<u64>,
     /// 暂停在回合上限时在 stderr 提示如何延长（--json 时不提示）
@@ -169,6 +174,7 @@ impl Client {
             approval: ApprovalMode::Ignore,
             max_turns: None,
             on_max_turns: None,
+            llm: Default::default(),
             auto_extend_turns: None,
             turn_hints: false,
         })
@@ -237,6 +243,12 @@ impl Client {
             }
             if let Some(mode) = self.on_max_turns {
                 body["session"]["onMaxTurns"] = json!(mode);
+            }
+            if let Some(secs) = self.llm.stream_idle_timeout_secs {
+                body["session"]["streamIdleTimeoutSecs"] = json!(secs);
+            }
+            if let Some(n) = self.llm.llm_max_retries {
+                body["session"]["llmMaxRetries"] = json!(n);
             }
         }
         body.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap_or_default());
@@ -464,6 +476,67 @@ impl SseParser {
     }
 }
 
+/// ask 的文本输出。`message_retry` 丢弃当前助手消息的部分内容：
+/// - 终端（`live`）：逐 delta 输出；重试时换行并在 stderr 标注上面的部分输出已作废；
+/// - 管道 / 文件：按消息缓冲，`message_end`（或流结束）时才写出，重试丢弃缓冲——stdout 里不会出现重复的文本。
+pub struct TextPrinter {
+    live: bool,
+    pending: String,
+    /// live 模式下当前消息已经写出的字节数
+    printed: usize,
+}
+
+impl TextPrinter {
+    pub fn new(live: bool) -> Self {
+        Self { live, pending: String::new(), printed: 0 }
+    }
+
+    /// 处理一个事件；返回 stderr 提示（重试时）。
+    pub fn event(&mut self, out: &mut impl std::io::Write, event: &Value) -> std::io::Result<Option<String>> {
+        if let Some(delta) = text_delta(event) {
+            if self.live {
+                write!(out, "{delta}")?;
+                self.printed += delta.len();
+            } else {
+                self.pending.push_str(delta);
+            }
+            return Ok(None);
+        }
+        match event["type"].as_str() {
+            Some("message_retry") => {
+                let discarded = self.pending.len() + self.printed;
+                self.pending.clear();
+                if std::mem::take(&mut self.printed) > 0 {
+                    writeln!(out)?;
+                }
+                let note = format!(
+                    "[retry {}/{}] {}: {}; {}",
+                    event["attempt"],
+                    event["maxRetries"],
+                    event["kind"].as_str().unwrap_or("retry"),
+                    event["reason"].as_str().unwrap_or(""),
+                    if self.live && discarded > 0 { "partial output above is discarded, replaying" } else { "replaying" }
+                );
+                Ok(Some(note))
+            }
+            Some("message_end") => {
+                self.printed = 0;
+                self.flush(out)?;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// 写出缓冲中的文本（流异常结束时也输出已收到的部分，与逐 delta 输出一致）。
+    pub fn flush(&mut self, out: &mut impl std::io::Write) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            write!(out, "{}", std::mem::take(&mut self.pending))?;
+        }
+        Ok(())
+    }
+}
+
 fn text_delta(event: &Value) -> Option<&str> {
     let update = &event["assistantMessageEvent"];
     (event["type"] == "message_update" && update["type"] == "text_delta").then(|| update["delta"].as_str()).flatten()
@@ -542,8 +615,10 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
         tokio::io::stdin().read_to_string(&mut message).await?;
     }
     anyhow::ensure!(args.on_max_turns.is_none() || args.session.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
+    anyhow::ensure!(!args.llm.is_set() || args.session.is_none(), crate::LLM_ARGS_RESUME_ERROR);
     let mut client = args.conn.client(data_dir)?;
     client.max_turns = args.max_turns;
+    client.llm = args.llm.clone();
     client.on_max_turns = args.on_max_turns;
     client.auto_extend_turns = args.auto_extend_turns;
     client.turn_hints = !args.json;
@@ -572,6 +647,7 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
         let mut session_id = None;
+        let mut printer = TextPrinter::new(std::io::IsTerminal::is_terminal(&std::io::stdout()));
         let result = client
             .ask_stream(&message, args.profile.as_deref(), args.session.as_deref(), args.timeout, |data, event| {
                 if event["type"] == "session" {
@@ -580,10 +656,8 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
                 if args.json {
                     // Preserve the server JSON, removing only SSE's physical line breaks for NDJSON.
                     writeln!(stdout, "{}", data.replace(['\r', '\n'], ""))?;
-                } else if let Some(delta) = text_delta(event) {
-                    write!(stdout, "{delta}")?;
-                } else {
-                    return Ok(());
+                } else if let Some(note) = printer.event(&mut stdout, event)? {
+                    eprintln!("{note}");
                 }
                 stdout.flush()?;
                 Ok(())
@@ -591,6 +665,7 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
             .await;
         let limit = result.as_ref().ok().filter(|o| o.max_turns_reached);
         if !args.json {
+            printer.flush(&mut stdout)?;
             writeln!(stdout)?;
             stdout.flush()?;
         } else if let Some(id) = session_id.as_deref().and_then(|id| uuid::Uuid::parse_str(id).ok()) {
@@ -675,6 +750,44 @@ mod tests {
         let body = client.chat_body("hi", Some("p"), None, json!({"async": true}));
         assert_eq!(body["session"]["account"], "work");
         assert_eq!((body["reasoningEffort"].clone(), body["depth"].clone(), body["async"].clone(), body["session"]["profile"].clone()), (json!("max"), json!("deep"), json!(true), json!("p")));
+        assert!(body["session"].get("streamIdleTimeoutSecs").is_none() && body["session"].get("llmMaxRetries").is_none());
+        client.llm = crate::LlmArgs { stream_idle_timeout_secs: Some(3600), llm_max_retries: Some(0) };
+        let body = client.chat_body("hi", None, None, json!({}));
+        assert_eq!((body["session"]["streamIdleTimeoutSecs"].clone(), body["session"]["llmMaxRetries"].clone()), (json!(3600), json!(0)));
+        // Existing sessions keep the values fixed at creation.
+        let body = client.chat_body("hi", None, Some("s"), json!({}));
+        assert!(body["session"].get("streamIdleTimeoutSecs").is_none());
+    }
+
+    fn retry_event(attempt: u32) -> Value {
+        json!({"type": "message_retry", "attempt": attempt, "maxRetries": 3, "kind": "idle_timeout", "reason": "stream idle timeout after 1800s", "delayMs": 1000, "discardedToolCalls": 1})
+    }
+
+    fn delta(text: &str) -> Value {
+        json!({"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "contentIndex": 0, "delta": text}})
+    }
+
+    #[test]
+    fn printer_never_duplicates_text_after_retry() {
+        let end = json!({"type": "message_end", "message": {"role": "assistant"}});
+        // Piped output: buffered per message, the discarded attempt never reaches stdout.
+        let (mut out, mut printer) = (Vec::new(), TextPrinter::new(false));
+        let mut notes = vec![];
+        for event in [delta("Hel"), retry_event(1), delta("Hello"), delta(" world"), end.clone(), delta("!")] {
+            notes.extend(printer.event(&mut out, &event).unwrap());
+        }
+        printer.flush(&mut out).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "Hello world!");
+        assert_eq!(notes, ["[retry 1/3] idle_timeout: stream idle timeout after 1800s; replaying"]);
+        // Terminal: streamed live; a retry breaks the line and the note says the partial output above is void.
+        let (mut out, mut printer) = (Vec::new(), TextPrinter::new(true));
+        let mut notes = vec![];
+        for event in [delta("Hel"), retry_event(1), retry_event(2), delta("Hello"), end] {
+            notes.extend(printer.event(&mut out, &event).unwrap());
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "Hel\nHello");
+        assert!(notes[0].ends_with("partial output above is discarded, replaying"), "{notes:?}");
+        assert!(notes[1].starts_with("[retry 2/3]") && notes[1].ends_with("; replaying"), "{notes:?}");
     }
 
     #[cfg(unix)]

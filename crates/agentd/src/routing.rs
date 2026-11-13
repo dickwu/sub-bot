@@ -97,7 +97,8 @@ pub struct Classification {
 }
 
 /// 一次分类调用；返回 (结果或错误, 用量)。
-pub async fn classify(provider: &dyn Provider, model: &str, task: &str) -> (Result<Classification, String>, Option<Usage>) {
+/// `stream_idle_timeout`：会话的流空闲超时覆盖（None ⇒ provider 实例默认）。
+pub async fn classify(provider: &dyn Provider, model: &str, task: &str, stream_idle_timeout: Option<std::time::Duration>) -> (Result<Classification, String>, Option<Usage>) {
     let req = Request {
         model: model.into(),
         system_prompt: Some(ROUTER_SYSTEM_PROMPT.into()),
@@ -109,6 +110,7 @@ pub async fn classify(provider: &dyn Provider, model: &str, task: &str) -> (Resu
         api: agent_ai::Api::Auto,
         max_tokens: Some(ROUTER_MAX_TOKENS),
         llm_max_retries: Some(1),
+        stream_idle_timeout,
     };
     let cancel = tokio_util::sync::CancellationToken::new();
     let _guard = cancel.clone().drop_guard();

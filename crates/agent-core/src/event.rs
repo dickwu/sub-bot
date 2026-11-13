@@ -58,10 +58,21 @@ pub enum AgentEvent {
     MessageStart {
         message: Message,
     },
-    /// Discard the partial assistant message; attempt is the 1-based retry number.
+    /// Discard the partial assistant message (text, thinking and streamed tool calls; none of them ran)
+    /// and wait for the replay. `attempt` is the 1-based retry number out of `maxRetries`; `kind` is
+    /// `idle_timeout` | `stream_error` | `incomplete` | `headers_timeout` | `http_status` | `connect` |
+    /// `overloaded` | `rate_limit` | `account_failover`; `reason` is redacted.
     MessageRetry {
         attempt: u32,
         reason: String,
+        #[serde(default)]
+        max_retries: u32,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        kind: String,
+        #[serde(default)]
+        discarded_tool_calls: u32,
     },
     MessageUpdate {
         assistant_message_event: AssistantEvent,

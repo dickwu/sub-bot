@@ -84,6 +84,7 @@ fn agent(calls: Vec<(&'static str, &'static str)>, timeout: Duration, approve_on
         turn_gate: Default::default(),
         max_tokens: None,
         llm_max_retries: None,
+        stream_idle_timeout: None,
         token_budget: None,
         run_timeout: None,
         before_run: None,

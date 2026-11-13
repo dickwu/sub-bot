@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.10.5] - 2026-11-13
+
+### Added
+- **Configurable stream idle timeout**: `streamIdleTimeoutSecs` (seconds without any streamed byte before the connection is considered dead) accepts **1..=7200** (2 hours) and can be set globally, per provider (`providers.<id>.streamIdleTimeoutSecs`), per account (`providers.<id>.accounts.<name>.streamIdleTimeoutSecs`), per profile (`profiles.<name>.streamIdleTimeoutSecs`) and per request (`session.streamIdleTimeoutSecs` in `POST /v1/sessions` / `/v1/chat`). Precedence: request > profile > account > provider > global. Account/provider/global values are the provider instance default (failover accounts keep their own); profile/request values travel with every request (`Request.stream_idle_timeout`), including compaction summary and routing classifier calls. Out-of-range values: config load error naming the exact key path, HTTP 400, or a clap error — all `streamIdleTimeoutSecs must be between 1 and 7200 (2 hours)`.
+- Per-request **`session.llmMaxRetries`** (0..=20; request > profile > global).
+- CLI: `--stream-idle-timeout-secs N` and `--llm-max-retries N` on `run`, `ask` and `rpc` (new sessions; rejected together with `--resume` / `ask --session`); `serve --stream-idle-timeout-secs N` overrides the global config value.
+- Both values are persisted with the session (like `maxTurns`), so resumed sessions keep them; the session view and `GET /v1/profiles` show the effective `streamIdleTimeoutSecs` and `llmMaxRetries`.
+- **TCP keepalive** on LLM HTTP clients (`agent_ai::http::llm_client_builder`: first probe after 30s, every 10s, 5 probes). There are no HTTP/2 PINGs because TLS ALPN only offers http/1.1.
+- `message_retry` events (and `AssistantEvent::Retry`) carry structured fields: `attempt` (1-based), `maxRetries`, `delayMs`, `kind` (`idle_timeout` | `stream_error` | `incomplete` | `headers_timeout` | `http_status` | `connect` | `overloaded` | `rate_limit` | `account_failover`), redacted `reason`, `discardedToolCalls`. The `llm_retry` issue details include them as well.
+- Logging: WARN per retry (provider, model, attempt/max, kind, delay_ms, bytes received, seconds since the last byte, discarded_tool_calls), INFO when a retried call succeeds (attempts used), typed ERROR when retries are exhausted. Session creation warns when the profile `runTimeoutSecs` is shorter than the idle timeout and logs DEBUG when `chatTimeoutSecs` is.
+
+### Changed
+- Default `streamIdleTimeoutSecs` raised from 300 to **1800** seconds. `chatTimeoutSecs` stays 900.
+- **Transient stream failures are retried even after tool-call events were streamed.** Tools only run after the final `Done`, so the partial message (text, thinking with its signature, tool-call deltas) is discarded and the call replayed; retries do not consume a turn and compaction runs once per model call. Only transient errors are retried (connect/request errors, body read errors, idle timeout, headers timeout, premature EOF, HTTP 408/429/5xx, Anthropic in-stream `overloaded_error` / `api_error`); other 4xx never are, and `probe-efforts` keeps 0 retries. Backoff: exponential with jitter, max 30s, `Retry-After` as a floor.
+- `chatTimeoutSecs` (and request `timeoutSecs`) bounds the whole `/v1/chat` run, sync **and async**; callers running long coding tasks should pass `timeoutSecs` (no upper cap) — documented next to `streamIdleTimeoutSecs`.
+- Headers-timeout classification uses a prefix match (the 120s headers timeout itself is unchanged).
+
+### Dependencies
+- `rmcp` requirement 3.8 → 3.10 (lockfile already current; `cargo update` found nothing newer, no incompatible upgrades available).
+
+### Fixed
+- No duplicated output after a retry: the non-streaming `/v1/chat` timeout response drops only the retried message's partial text (earlier messages of the run are kept); `sub-bot ask` text mode buffers per message when stdout is not a terminal and, on a terminal, breaks the line and notes on stderr that the partial output above is discarded.
+
 ## [0.10.4] - 2026-11-13
 
 ### Added

@@ -22,6 +22,8 @@ pub struct Request {
     pub max_tokens: Option<u32>,
     /// Additional transient-error attempts; None uses the default (3).
     pub llm_max_retries: Option<u32>,
+    /// Overrides the provider instance's stream idle timeout (max gap between body bytes) for this request.
+    pub stream_idle_timeout: Option<std::time::Duration>,
 }
 
 /// 原始能力探测的 Anthropic thinking 变体，不改变正常请求的模型机制。

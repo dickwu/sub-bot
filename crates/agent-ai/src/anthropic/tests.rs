@@ -26,16 +26,24 @@ async fn handler(State(mock): State<Mock>, request: HttpRequest) -> Response<Bod
     let value = if bytes.is_empty() { Value::Null } else { serde_json::from_slice(&bytes).unwrap() };
     mock.requests.lock().unwrap().push((uri, value));
     let (status, body) = mock.replies.lock().unwrap().pop_front().unwrap_or((500, "unexpected request".into()));
+    // A trailing STALL marker keeps the connection open without sending more bytes (idle timeout tests).
+    let (body, stall) = match body.strip_suffix(STALL) {
+        Some(body) => (body.to_string(), true),
+        None => (body, false),
+    };
     // Split even UTF-8 and JSON across transport chunks.
     let chunks: Vec<Result<Vec<u8>, std::io::Error>> = body.as_bytes().chunks(7).map(|chunk| Ok(chunk.to_vec())).collect();
+    let tail = if stall { futures::stream::pending().boxed() } else { futures::stream::empty().boxed() };
     Response::builder()
         .status(status)
         .header("content-type", "text/event-stream")
         .header("request-id", "req-test")
         .header("retry-after", "0")
-        .body(Body::from_stream(futures::stream::iter(chunks)))
+        .body(Body::from_stream(futures::stream::iter(chunks).chain(tail)))
         .unwrap()
 }
+
+const STALL: &str = "<stall>";
 
 struct Server {
     url: String,
@@ -69,6 +77,7 @@ fn request() -> Request {
         api: Api::Auto,
         max_tokens: None,
         llm_max_retries: Some(1),
+        stream_idle_timeout: None,
         raw_effort: false,
         thinking: None,
     }
@@ -308,18 +317,67 @@ async fn transient_failures_retry_and_discard_partial_text() {
 }
 
 #[tokio::test]
-async fn errors_after_tool_start_never_retry() {
+async fn errors_after_tool_start_retry_and_discard_partial_tool_calls_and_signatures() {
+    let body = sse(vec![
+        json!({"type":"message_start", "message":{"id":"msg-1", "usage":{"input_tokens":1}}}),
+        json!({"type":"content_block_start", "index":0, "content_block":{"type":"thinking", "thinking":""}}),
+        json!({"type":"content_block_delta", "index":0, "delta":{"type":"thinking_delta", "thinking":"discarded"}}),
+        json!({"type":"content_block_delta", "index":0, "delta":{"type":"signature_delta", "signature":"discarded-signature"}}),
+        json!({"type":"content_block_stop", "index":0}),
+        json!({"type":"content_block_start", "index":1, "content_block":{"type":"tool_use", "id":"a", "name":"read", "input":{}}}),
+        json!({"type":"error", "error":{"type":"overloaded_error", "message":"busy"}}),
+    ]);
+    let server = server(vec![(200, body), (200, sse(text_events()))]).await;
+    let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
+    let events = collect(&provider, request()).await;
+    let tool_start = events.iter().position(|e| matches!(e, AssistantEvent::ToolcallStart { .. })).expect("tool call streamed");
+    let retry = events.iter().position(|e| matches!(e, AssistantEvent::Retry { .. })).expect("retried");
+    assert!(tool_start < retry);
+    let AssistantEvent::Retry { attempt, max_retries, kind, discarded_tool_calls, reason, .. } = &events[retry] else { unreachable!() };
+    assert_eq!((*attempt, *max_retries, kind.as_str(), *discarded_tool_calls), (1, 1, "overloaded", 1));
+    assert!(reason.contains("overloaded_error"));
+    let message = done(&events);
+    assert_eq!(message.text(), "你好 world");
+    assert!(message.tool_calls().is_empty());
+    // The discarded attempt's thinking (and its signature) is never part of the final message.
+    assert!(!message.content.iter().any(|c| matches!(c, Content::Thinking { .. })));
+    assert!(!serde_json::to_string(&message).unwrap().contains("discarded-signature"));
+    assert_eq!(server.mock.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn non_transient_stream_errors_after_tool_start_do_not_retry() {
     let body = sse(vec![
         json!({"type":"content_block_start", "index":0, "content_block":{"type":"tool_use", "id":"a", "name":"read", "input":{}}}),
-        json!({"type":"error", "error":{"type":"overloaded_error", "message":"busy"}}),
+        json!({"type":"error", "error":{"type":"invalid_request_error", "message":"bad"}}),
     ]);
     let server = server(vec![(200, body)]).await;
     let provider = AnthropicProvider::new(crate::Secret::new("test-key"), Some(server.url.clone()));
     let events = collect(&provider, request()).await;
-    assert!(events.iter().any(|e| matches!(e, AssistantEvent::ToolcallStart { .. })));
     assert!(!events.iter().any(|e| matches!(e, AssistantEvent::Retry { .. })));
     assert!(matches!(events.last(), Some(AssistantEvent::Error { .. })));
     assert_eq!(server.mock.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn request_idle_timeout_overrides_instance_default() {
+    // The first reply stalls after partial text: only the 200ms request override (not the 600s instance default) can fire.
+    let stalled = sse(text_events()[..4].to_vec()) + STALL;
+    let server = server(vec![(200, stalled), (200, sse(text_events()))]).await;
+    let provider = AnthropicProvider::with_stream_idle_timeout(crate::Secret::new("test-key"), Some(server.url.clone()), Duration::from_secs(600));
+    assert_eq!(provider.idle_timeout(&request()), Duration::from_secs(600));
+    let mut req = request();
+    req.stream_idle_timeout = Some(Duration::from_millis(200));
+    assert_eq!(provider.idle_timeout(&req), Duration::from_millis(200));
+    let events = collect(&provider, req).await;
+    assert_eq!(done(&events).text(), "你好 world");
+    let retries: Vec<_> = events.iter().filter_map(|e| if let AssistantEvent::Retry { kind, reason, .. } = e { Some((kind.clone(), reason.clone())) } else { None }).collect();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0].0, "idle_timeout");
+    assert!(retries[0].1.starts_with("stream idle timeout after 0.2s"), "{}", retries[0].1);
+    // Partial text of the stalled attempt is streamed and then discarded by the Retry.
+    assert!(events.iter().position(|e| matches!(e, AssistantEvent::TextDelta { .. })).unwrap() < events.iter().position(|e| matches!(e, AssistantEvent::Retry { .. })).unwrap());
+    assert_eq!(AnthropicProvider::new(crate::Secret::new("k"), None).stream_idle_timeout, Duration::from_secs(crate::DEFAULT_STREAM_IDLE_TIMEOUT_SECS));
 }
 
 #[tokio::test]

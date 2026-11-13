@@ -104,6 +104,19 @@ pub(crate) struct SessionDynamic {
     pub(crate) prompted: AtomicBool,
     /// 最近一次 warn 过的推理强度调整 (模型, 请求值)，避免同一调整重复 warn
     effort_warned: Mutex<Option<(String, Option<ThinkingLevel>)>>,
+    /// 本会话的 LLM 流参数（主调用、路由分类、压缩摘要共用）
+    pub(crate) llm: LlmSettings,
+}
+
+/// 会话的流空闲超时与重试次数（创建时解析一次）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LlmSettings {
+    /// 实际生效的流空闲超时（秒）：请求 > profile > 账号 > provider > 全局
+    pub(crate) stream_idle_timeout_secs: u64,
+    /// 请求 / profile 级覆盖（作为 `Request.stream_idle_timeout` 发送）；None ⇒ 每个账号实例用自己的默认值（failover 账号也一样）
+    pub(crate) stream_idle_timeout_override: Option<Duration>,
+    /// 实际生效的重试次数：请求 > profile > 全局
+    pub(crate) llm_max_retries: u32,
 }
 
 impl SessionDynamic {
@@ -207,7 +220,7 @@ impl SessionDynamic {
                         })
                         .collect::<Vec<_>>()
                         .join("\n\n");
-                    let (result, router_usage) = crate::routing::classify(&*self.provider, &self.router_model, &task).await;
+                    let (result, router_usage) = crate::routing::classify(&*self.provider, &self.router_model, &task, self.llm.stream_idle_timeout_override).await;
                     usage = router_usage;
                     match result {
                         Ok(c) if c.deep => match self.deep_model().await {
@@ -440,13 +453,19 @@ impl SessionHandle {
 
     fn report_event(&self, event: &AgentEvent) {
         match event {
-            AgentEvent::MessageRetry { attempt, reason } => match crate::accounts::parse_failover(reason) {
+            AgentEvent::MessageRetry { attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls } => match crate::accounts::parse_failover(reason) {
                 Some((from, to, class)) => {
                     self.dynamic.issue_scope.lock().unwrap().account = Some(to.to_string());
                     let message = format!("Switched account {from} -> {to} ({class})");
                     self.report_issue(Severity::Warn, "account_failover", "llm", &message, serde_json::json!({"from": from, "to": to, "reason": class, "attempt": attempt}));
                 }
-                None => self.report_issue(Severity::Warn, "llm_retry", "llm", "Retrying LLM call; partial message discarded", serde_json::json!({"attempt": attempt})),
+                None => self.report_issue(
+                    Severity::Warn,
+                    "llm_retry",
+                    "llm",
+                    "Retrying LLM call; partial message discarded",
+                    serde_json::json!({"attempt": attempt, "maxRetries": max_retries, "kind": kind, "delayMs": delay_ms, "discardedToolCalls": discarded_tool_calls}),
+                ),
             },
             AgentEvent::MessageEnd { message: Message::Assistant(a) }
                 if a.stop_reason == agent_ai::StopReason::Error || (a.error_message.is_some() && a.stop_reason != agent_ai::StopReason::Aborted) =>
@@ -534,6 +553,10 @@ pub struct SessionRequest {
     pub on_max_turns: Option<agent_core::OnMaxTurns>,
     /// 覆盖 profile.maxTurnsAskTimeoutSecs（>= 1）
     pub max_turns_ask_timeout_secs: Option<u64>,
+    /// 覆盖流空闲超时（秒，1..=7200）：请求 > profile > 账号 > provider > 全局；随会话持久化
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// 覆盖 profile / 全局 llmMaxRetries（0..=20）；随会话持久化
+    pub llm_max_retries: Option<u32>,
 }
 
 /// 第一次 prompt 之后不能再修改 depth（路由不会重新进行）。
@@ -812,7 +835,8 @@ pub(crate) fn account_base_url(config: &Config, id: &str, name: &str, account: &
 /// 按账号构造 provider 实例（openai：账号级 baseUrl + organization/project 请求头）。
 pub(crate) fn build_provider(config: &Config, id: &str, name: &str, account: &AccountConfig, key: agent_ai::Secret, getenv: impl Fn(&str) -> Option<String>) -> Arc<dyn Provider> {
     let base_url = account_base_url(config, id, name, account, getenv);
-    let timeout = Duration::from_secs(config.stream_idle_timeout_secs);
+    // 实例默认：账号 > provider > 全局；profile / 会话级覆盖通过 Request.stream_idle_timeout 传入
+    let timeout = Duration::from_secs(config.account_stream_idle_timeout_secs(id, account));
     match id {
         "openai" => {
             Arc::new(OpenAiProvider::with_options(key, OpenAiOptions { base_url, organization: account.organization.clone(), project: account.project.clone(), stream_idle_timeout: Some(timeout) }))
@@ -1137,6 +1161,10 @@ impl Hub {
         let p: &Profile = self.config.profiles.get(&profile_name).ok_or_else(|| anyhow::anyhow!("unknown profile '{profile_name}'"))?;
         anyhow::ensure!(req.max_turns.is_none_or(|n| n >= 1), "maxTurns must be >= 1");
         anyhow::ensure!(req.max_turns_ask_timeout_secs.is_none_or(|n| n >= 1), "maxTurnsAskTimeoutSecs must be >= 1");
+        if let Some(secs) = req.stream_idle_timeout_secs {
+            crate::config::check_stream_idle_timeout("streamIdleTimeoutSecs", secs)?;
+        }
+        anyhow::ensure!(req.llm_max_retries.is_none_or(|n| n <= agent_ai::MAX_LLM_MAX_RETRIES), "llmMaxRetries must be between 0 and {}", agent_ai::MAX_LLM_MAX_RETRIES);
 
         let allowed = expand_tools(&p.tools)?;
         let selected = match req.tools {
@@ -1202,6 +1230,7 @@ impl Hub {
         }
         let requested_effort = req.reasoning_effort.or(p.reasoning_effort).or(self.config.default_reasoning_effort);
         let deep_spec = self.deep_model_spec(p, provider_id);
+        let llm = self.llm_settings(p, provider_id, &account, req.stream_idle_timeout_secs, req.llm_max_retries);
         let depth = req.depth.unwrap_or(if p.auto_route { Depth::Auto } else { Depth::Standard });
         let dynamic = Arc::new(SessionDynamic {
             session_id: id.clone(),
@@ -1238,6 +1267,7 @@ impl Hub {
             last_call: Mutex::new(None),
             prompted: AtomicBool::new(false),
             effort_warned: Mutex::new(None),
+            llm,
         });
         match restore.as_ref().and_then(|r| r.routing.clone()) {
             // 恢复：路由已在原会话里确定，不再重新路由
@@ -1293,6 +1323,8 @@ impl Hub {
                             max_turns: req.max_turns,
                             on_max_turns: req.on_max_turns.map(|m| m.as_str().to_string()),
                             max_turns_ask_timeout_secs: req.max_turns_ask_timeout_secs,
+                            stream_idle_timeout_secs: req.stream_idle_timeout_secs,
+                            llm_max_retries: req.llm_max_retries,
                             title: None,
                         };
                         Some(Session::create_with_id(&dir.join(&client.name), &id, &profile_name, meta)?)
@@ -1310,7 +1342,7 @@ impl Hub {
             context_window: p.context_window,
             overhead_tokens: crate::sessions::overhead_tokens(&system_prompt, &tools),
             api,
-            llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
+            llm_max_retries: Some(llm.llm_max_retries),
             created_at,
             usage_floor: if compacted { history.len() } else { 0 },
             title: history.iter().find_map(crate::sessions::title_of),
@@ -1333,13 +1365,15 @@ impl Hub {
             turn_gate: Arc::new(agent_core::TurnGate::new(on_max_turns, Duration::from_secs(ask_timeout_secs))),
             max_tokens: p.max_output_tokens,
             token_budget: p.token_budget,
-            llm_max_retries: Some(p.llm_max_retries.unwrap_or(self.config.llm_max_retries)),
+            llm_max_retries: Some(llm.llm_max_retries),
+            stream_idle_timeout: llm.stream_idle_timeout_override,
             run_timeout: p.run_timeout_secs.map(std::time::Duration::from_secs),
             before_run: Some(Arc::new(move |messages, emit| Box::pin(hook.clone().route_first_run(messages, emit)))),
             approval,
             hooks: Some(hooks.clone()),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), max_turns, on_max_turns = on_max_turns.as_str(), max_turns_ask_timeout_secs = ask_timeout_secs, persisted = ?persisted_path, restored = !history.is_empty(), "session created");
+        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), max_turns, on_max_turns = on_max_turns.as_str(), max_turns_ask_timeout_secs = ask_timeout_secs, stream_idle_timeout_secs = llm.stream_idle_timeout_secs, llm_max_retries = llm.llm_max_retries, persisted = ?persisted_path, restored = !history.is_empty(), "session created");
+        self.warn_short_timeouts(&id, &profile_name, p, llm.stream_idle_timeout_secs);
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
             issue_targets: client.resolved_webhooks.iter().filter(|t| t.wants("issues")).cloned().collect(),
@@ -1616,6 +1650,41 @@ impl Hub {
         p.model.clone().unwrap_or_else(|| self.default_model_for(self.profile_provider(p)))
     }
 
+    /// 会话的 LLM 流参数。超时：请求 > profile > 账号 > provider > 全局（后三者是 provider 实例默认值，不作为请求覆盖发送，
+    /// 这样 failover 账号仍用各自的配置）；重试：请求 > profile > 全局。
+    pub(crate) fn llm_settings(&self, p: &Profile, provider_id: &str, account: &str, req_timeout: Option<u64>, req_retries: Option<u32>) -> LlmSettings {
+        let override_secs = req_timeout.or(p.stream_idle_timeout_secs);
+        let instance_secs = || self.config.account_config(provider_id, account).map_or(self.config.stream_idle_timeout_secs, |a| self.config.account_stream_idle_timeout_secs(provider_id, &a));
+        LlmSettings {
+            stream_idle_timeout_secs: override_secs.unwrap_or_else(instance_secs),
+            stream_idle_timeout_override: override_secs.map(Duration::from_secs),
+            llm_max_retries: req_retries.or(p.llm_max_retries).unwrap_or(self.config.llm_max_retries),
+        }
+    }
+
+    /// 运行 / 非流式 chat 的总超时比流空闲超时还短时，空闲超时实际上不可能触发：创建会话时提示一次。
+    fn warn_short_timeouts(&self, session_id: &str, profile: &str, p: &Profile, idle_secs: u64) {
+        if let Some(run) = p.run_timeout_secs.filter(|run| *run < idle_secs) {
+            tracing::warn!(
+                issue = "none",
+                session_id,
+                profile,
+                run_timeout_secs = run,
+                stream_idle_timeout_secs = idle_secs,
+                "runTimeoutSecs is shorter than streamIdleTimeoutSecs; long silent model calls end with run_timeout first"
+            );
+        }
+        if self.config.chat_timeout_secs < idle_secs {
+            tracing::debug!(
+                session_id,
+                profile,
+                chat_timeout_secs = self.config.chat_timeout_secs,
+                stream_idle_timeout_secs = idle_secs,
+                "chatTimeoutSecs is shorter than streamIdleTimeoutSecs; /v1/chat (sync and async) without timeoutSecs ends after chatTimeoutSecs, before a long silent stream would hit its idle timeout (pass timeoutSecs or raise chatTimeoutSecs)"
+            );
+        }
+    }
+
     /// profile 配置的深度模型；anthropic profile 默认固定为 claude-fable-5-1。
     pub fn deep_model_spec(&self, p: &Profile, provider_id: &str) -> Option<String> {
         p.deep_model.clone().or_else(|| (provider_id == "anthropic").then(|| crate::config::DEFAULT_CLAUDE_DEEP_MODEL.into()))
@@ -1632,6 +1701,8 @@ impl Hub {
             "maxTurns": h.max_turns(),
             "turnBudget": h.turn_budget(),
             "persisted": h.hooks.path().is_some(),
+            "streamIdleTimeoutSecs": h.dynamic.llm.stream_idle_timeout_secs,
+            "llmMaxRetries": h.dynamic.llm.llm_max_retries,
         });
         view.as_object_mut().unwrap().extend(h.effort_fields());
         view
@@ -2516,11 +2587,15 @@ pub(crate) mod tests {
             assert_eq!(events[0].kind, kind);
             assert!(!serde_json::to_string(&events).unwrap().contains("PRIVATE_OUTPUT"));
         }
-        h.report_event(&AgentEvent::MessageRetry { attempt: 1, reason: "Anthropic HTTP 529: overloaded".into() });
+        h.report_event(&AgentEvent::MessageRetry { attempt: 1, reason: "Anthropic HTTP 529: overloaded".into(), max_retries: 3, delay_ms: 1200, kind: "http_status".into(), discarded_tool_calls: 2 });
         hub.issues.flush(Duration::from_secs(2)).await;
         let events = hub.issues.recent(Some("default"), 0, 1);
         assert_eq!(events[0].kind, "llm_retry");
         assert_eq!(events[0].details["attempt"], 1);
+        assert_eq!(events[0].details["maxRetries"], 3);
+        assert_eq!(events[0].details["kind"], "http_status");
+        assert_eq!(events[0].details["delayMs"], 1200);
+        assert_eq!(events[0].details["discardedToolCalls"], 2);
         assert_eq!(events[0].scope.provider.as_deref(), Some("faux"));
         h.report_lag(42);
         hub.issues.flush(Duration::from_secs(2)).await;

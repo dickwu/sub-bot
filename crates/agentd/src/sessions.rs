@@ -280,7 +280,14 @@ impl SessionHooks {
         emit(compaction_event(reason, "start", tokens_before));
         let model = self.settings.model.clone().unwrap_or_else(|| self.dynamic.model.get());
         tracing::info!(session_id = %session_id, reason, tokens_before, summarize_messages = cut.cut - cut.start, keep_messages = context.len() - cut.cut, split_turn = cut.split_turn, cumulative = cut.start == 1, model = %model, "compaction started");
-        let call = SummaryCall { provider: &*self.dynamic.provider, model: &model, api: self.api, max_tokens: self.settings.max_summary_tokens, llm_max_retries: self.llm_max_retries };
+        let call = SummaryCall {
+            provider: &*self.dynamic.provider,
+            model: &model,
+            api: self.api,
+            max_tokens: self.settings.max_summary_tokens,
+            llm_max_retries: self.llm_max_retries,
+            stream_idle_timeout: self.dynamic.llm.stream_idle_timeout_override,
+        };
         let result = tokio::select! {
             biased;
             _ = cancel.cancelled() => Err(SummaryError { message: "aborted".into(), usage: None }),
@@ -529,6 +536,8 @@ impl Hub {
             max_turns: meta.max_turns,
             on_max_turns: meta.on_max_turns.as_deref().map(str::parse).transpose().map_err(|e: String| ResumeFailed(format!("invalid onMaxTurns in session file: {e}")))?,
             max_turns_ask_timeout_secs: meta.max_turns_ask_timeout_secs,
+            stream_idle_timeout_secs: meta.stream_idle_timeout_secs,
+            llm_max_retries: meta.llm_max_retries,
         };
         if let Some(names) = meta.caller_tools.as_ref().filter(|n| !n.is_empty()) {
             tracing::warn!(issue = "typed", session_id = %id, caller_tools = ?names, "caller tools are not restored (callback URLs and tokens are not persisted)");

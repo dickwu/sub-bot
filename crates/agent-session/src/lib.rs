@@ -72,6 +72,12 @@ pub struct SessionMeta {
     /// 会话级 maxTurnsAskTimeoutSecs
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_turns_ask_timeout_secs: Option<u64>,
+    /// 会话级 streamIdleTimeoutSecs（请求覆盖；恢复后沿用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream_idle_timeout_secs: Option<u64>,
+    /// 会话级 llmMaxRetries（请求覆盖；恢复后沿用）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_max_retries: Option<u32>,
     /// 第一条用户消息的预览
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -104,6 +110,8 @@ impl SessionMeta {
             max_turns,
             on_max_turns,
             max_turns_ask_timeout_secs,
+            stream_idle_timeout_secs,
+            llm_max_retries,
             title
         );
     }

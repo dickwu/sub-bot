@@ -36,6 +36,9 @@ pub struct Profile {
     /// 覆盖全局 LLM 瞬时错误重试次数；0 禁用。
     #[serde(default)]
     pub llm_max_retries: Option<u32>,
+    /// 覆盖流空闲超时（秒，1..=7200）；优先级：请求 > profile > 账号 > provider > 全局。
+    #[serde(default)]
+    pub stream_idle_timeout_secs: Option<u64>,
     /// 单次运行（一个 prompt）的总 token 预算；达到后让模型不带工具给出最终答复
     #[serde(default)]
     pub token_budget: Option<u64>,
@@ -288,7 +291,7 @@ pub struct Config {
     pub task_ttl_secs: u64,
     #[serde(default = "default_webhook_attempts")]
     pub webhook_max_attempts: u32,
-    /// LLM 流连续无字节的超时（秒）。
+    /// LLM 流连续无字节的超时（秒，1..=7200，默认 1800）；provider / 账号 / profile / 请求可逐级覆盖。
     #[serde(default = "default_stream_idle_timeout_secs")]
     pub stream_idle_timeout_secs: u64,
     #[serde(default = "default_llm_max_retries")]
@@ -360,6 +363,9 @@ pub struct ProviderConfig {
     /// failover 后主账号的冷却时间（秒），默认 60
     #[serde(default)]
     pub failover_cooldown_secs: Option<u64>,
+    /// 该 provider 所有账号的流空闲超时（秒，1..=7200）；覆盖全局，账号级优先
+    #[serde(default)]
+    pub stream_idle_timeout_secs: Option<u64>,
 }
 
 /// 同一 provider 下的一个账号：一份凭据 + 可选连接参数。key 来源三选一，都省略时使用受管存储（`sub-bot keys set`）。
@@ -379,6 +385,8 @@ pub struct AccountConfig {
     /// 本账号 429 / 额度耗尽时依次切换的账号
     #[serde(default)]
     pub fallback_accounts: Vec<String>,
+    /// 本账号的流空闲超时（秒，1..=7200）；覆盖 provider 级与全局
+    pub stream_idle_timeout_secs: Option<u64>,
 }
 
 pub const DEFAULT_FAILOVER_COOLDOWN_SECS: u64 = 60;
@@ -455,7 +463,12 @@ fn default_llm_max_retries() -> u32 {
 }
 
 fn default_stream_idle_timeout_secs() -> u64 {
-    300
+    agent_ai::DEFAULT_STREAM_IDLE_TIMEOUT_SECS
+}
+
+/// `key` 是完整配置路径（如 `providers.openai.accounts.work.streamIdleTimeoutSecs`），出错时原样出现在错误里。
+pub fn check_stream_idle_timeout(key: &str, secs: u64) -> anyhow::Result<()> {
+    agent_ai::validate_stream_idle_timeout_secs(secs).map(drop).map_err(|e| anyhow::anyhow!("{}", e.replacen("streamIdleTimeoutSecs", key, 1)))
 }
 fn default_chat_timeout_secs() -> u64 {
     900
@@ -651,6 +664,7 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         self.socket_mode()?;
         anyhow::ensure!(self.keychain_timeout_secs >= 1, "keychainTimeoutSecs must be >= 1");
+        check_stream_idle_timeout("streamIdleTimeoutSecs", self.stream_idle_timeout_secs)?;
         for id in self.default_provider.iter().chain(self.providers.keys()).chain(self.profiles.values().filter_map(|p| p.provider.as_ref())) {
             validate_provider(id)?;
         }
@@ -659,6 +673,9 @@ impl Config {
         }
         for (id, provider) in &self.providers {
             let at = format!("providers.{id}");
+            if let Some(secs) = provider.stream_idle_timeout_secs {
+                check_stream_idle_timeout(&format!("{at}.streamIdleTimeoutSecs"), secs)?;
+            }
             if let Some(keychain) = &provider.api_key_keychain {
                 anyhow::ensure!(id != "faux", "{at}: apiKeyKeychain is not supported for faux");
                 let file = provider.api_key_file.is_some() || (id == "openai" && self.api_key_file.is_some());
@@ -686,6 +703,9 @@ impl Config {
             anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
             anyhow::ensure!(profile.max_turns >= 1, "profile '{name}': maxTurns must be >= 1");
             anyhow::ensure!(profile.max_turns_ask_timeout_secs >= 1, "profile '{name}': maxTurnsAskTimeoutSecs must be >= 1");
+            if let Some(secs) = profile.stream_idle_timeout_secs {
+                check_stream_idle_timeout(&format!("profiles.{name}.streamIdleTimeoutSecs"), secs)?;
+            }
             if let Some(policy) = &profile.tool_approval {
                 policy.validate().map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?;
             }
@@ -739,6 +759,11 @@ impl Config {
         self.provider_accounts(id).remove(account)
     }
 
+    /// provider 实例的流空闲超时（秒）：账号 > provider > 全局。profile / 请求级覆盖由会话按请求传入。
+    pub fn account_stream_idle_timeout_secs(&self, id: &str, account: &AccountConfig) -> u64 {
+        account.stream_idle_timeout_secs.or_else(|| self.providers.get(id).and_then(|p| p.stream_idle_timeout_secs)).unwrap_or(self.stream_idle_timeout_secs)
+    }
+
     /// provider 的默认账号名（未配置时 "default"）。
     pub fn default_account_of(&self, id: &str) -> &str {
         self.providers.get(id).map_or(agent_ai::secrets::DEFAULT_ACCOUNT, |p| p.default_account())
@@ -760,6 +785,9 @@ impl Config {
         for (name, account) in &provider.accounts {
             anyhow::ensure!(agent_ai::secrets::valid_account_name(name), "{at}: invalid account name '{name}' (allowed: [A-Za-z0-9_.-]{{1,64}})");
             let at = format!("{at}.accounts.{name}");
+            if let Some(secs) = account.stream_idle_timeout_secs {
+                check_stream_idle_timeout(&format!("{at}.streamIdleTimeoutSecs"), secs)?;
+            }
             let sources = [account.api_key_file.is_some(), account.api_key_keychain.is_some(), account.api_key_env.is_some()];
             anyhow::ensure!(sources.iter().filter(|s| **s).count() <= 1, "{at}: set only one of apiKeyFile / apiKeyKeychain / apiKeyEnv");
             if let Some(keychain) = &account.api_key_keychain {
@@ -849,6 +877,7 @@ impl Config {
                 api: None,
                 max_output_tokens: None,
                 llm_max_retries: None,
+                stream_idle_timeout_secs: None,
                 token_budget: None,
                 run_timeout_secs: None,
                 tools: default_tools(),
@@ -1190,7 +1219,7 @@ mod tests {
     fn fallback_preserves_session_limits_and_timeouts() {
         let cfg = Config::fallback("faux".into(), "test-token", PathBuf::from("."));
         assert_eq!((cfg.session_idle_ttl_secs, cfg.chat_session_ttl_secs, cfg.max_sessions_per_client), (3600, 600, 64));
-        assert_eq!((cfg.stream_idle_timeout_secs, cfg.chat_timeout_secs), (300, 900));
+        assert_eq!((cfg.stream_idle_timeout_secs, cfg.chat_timeout_secs), (1800, 900));
         cfg.validate().unwrap();
         assert_eq!(cfg.profiles["default"].run_timeout_secs, None);
     }
@@ -1330,7 +1359,7 @@ mod tests {
         std::fs::write(&path, r#"{"apiKeyFile":"keys/openai","profiles":{"p":{"workspaceRoots":["."],"shellEnv":{"mode":"allowlist","allow":["CARGO_*"]}}}}"#).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.api_key_file.as_deref(), Some(dir.join("keys/openai").as_path()));
-        assert_eq!(cfg.stream_idle_timeout_secs, 300);
+        assert_eq!(cfg.stream_idle_timeout_secs, 1800);
         assert_eq!(cfg.chat_timeout_secs, 900);
         assert_eq!(cfg.profiles["p"].run_timeout_secs, None);
         let custom: Config = serde_json::from_str(r#"{"streamIdleTimeoutSecs":42,"chatTimeoutSecs":17,"profiles":{"p":{"workspaceRoots":["."],"runTimeoutSecs":3}}}"#).unwrap();
@@ -1601,5 +1630,46 @@ mod tests {
         // 示例配置里的策略同样有效
         let example: Config = serde_json::from_str(include_str!("../../../sub-bot.example.json")).unwrap();
         assert!(example.tool_approval_of(&example.profiles["coder"]).is_active());
+    }
+
+    #[test]
+    fn stream_idle_timeout_levels_validate_and_resolve() {
+        let base = serde_json::json!({
+            "streamIdleTimeoutSecs": 600,
+            "providers": {
+                "openai": {"streamIdleTimeoutSecs": 1200, "accounts": {"default": {}, "work": {"apiKeyEnv": "WORK_KEY", "streamIdleTimeoutSecs": 3600}}},
+                "anthropic": {}
+            },
+            "profiles": {"p": {"workspaceRoots": ["."], "streamIdleTimeoutSecs": 7200}},
+            "clients": []
+        });
+        let cfg: Config = serde_json::from_value(base.clone()).unwrap();
+        cfg.validate().unwrap();
+        let account = |id: &str, name: &str| cfg.account_config(id, name).unwrap();
+        // account > provider > global
+        assert_eq!(cfg.account_stream_idle_timeout_secs("openai", &account("openai", "work")), 3600);
+        assert_eq!(cfg.account_stream_idle_timeout_secs("openai", &account("openai", "default")), 1200);
+        assert_eq!(cfg.account_stream_idle_timeout_secs("anthropic", &account("anthropic", "default")), 600);
+        assert_eq!(cfg.profiles["p"].stream_idle_timeout_secs, Some(7200));
+        for (pointer, value) in [
+            ("/streamIdleTimeoutSecs", 0),
+            ("/providers/openai/streamIdleTimeoutSecs", 7201),
+            ("/providers/openai/accounts/work/streamIdleTimeoutSecs", 0),
+            ("/profiles/p/streamIdleTimeoutSecs", 86400),
+        ] {
+            let mut json = base.clone();
+            *json.pointer_mut(pointer).unwrap() = serde_json::json!(value);
+            let cfg: Config = serde_json::from_value(json).unwrap();
+            let key = pointer.trim_start_matches('/').replace('/', ".");
+            assert_eq!(cfg.validate().unwrap_err().to_string(), format!("{key} must be between 1 and 7200 (2 hours), got {value}"));
+        }
+        // Config::load reports the same key path.
+        let dir = std::env::temp_dir().join(format!("sub-bot-idle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sub-bot.json");
+        std::fs::write(&path, r#"{"providers":{"anthropic":{"accounts":{"default":{"streamIdleTimeoutSecs":0}}}},"profiles":{"p":{"workspaceRoots":["."]}}}"#).unwrap();
+        let error = format!("{:#}", Config::load(&path).unwrap_err());
+        assert!(error.contains("providers.anthropic.accounts.default.streamIdleTimeoutSecs must be between 1 and 7200 (2 hours)"), "{error}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

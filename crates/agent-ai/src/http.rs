@@ -36,6 +36,13 @@ pub fn client() -> reqwest::Client {
     client_builder().build().expect("HTTP client setup failed")
 }
 
+/// LLM provider 客户端：在 [`client_builder`] 基础上加 30s 连接超时与 TCP keepalive（30s 后开始探测，每 10s 一次，
+/// 最多 5 次），让长时间无输出的流（推理模型思考中）不被 NAT / 防火墙静默断开，也能更快发现死连接。
+/// 只协商 HTTP/1.1，因此没有 HTTP/2 PING。
+pub fn llm_client_builder() -> reqwest::ClientBuilder {
+    client_builder().connect_timeout(std::time::Duration::from_secs(30)).tcp_keepalive(crate::LLM_TCP_KEEPALIVE).tcp_keepalive_interval(std::time::Duration::from_secs(10)).tcp_keepalive_retries(5u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +51,7 @@ mod tests {
     fn builds_without_a_process_default_crypto_provider() {
         assert!(rustls::crypto::CryptoProvider::get_default().is_none());
         client_builder().connect_timeout(std::time::Duration::from_secs(1)).build().unwrap();
+        llm_client_builder().build().unwrap();
         let _ = client();
         let config = tls_config();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);

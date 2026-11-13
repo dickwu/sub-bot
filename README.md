@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.10.4（回合预算：默认 `maxTurns` 改为 150；调用方可按会话 / 请求设置 `maxTurns` / `onMaxTurns`，运行中通过 `POST /v1/sessions/{id}/turns` 或 `sub-bot turns` 提高 / 降低 / 停止，没有封顶，模型不能自己延长；达到上限时 stop / ask / summarize，见「回合预算（maxTurns）」）。v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
+> 状态：v0.10.5（长流稳健性：`streamIdleTimeoutSecs` 默认改为 1800 秒、最大 7200 秒，可在全局 / provider / 账号 / profile / 请求级设置；LLM 连接启用 TCP keepalive；已流出工具调用事件后遇到瞬时故障也会丢弃部分消息并重放，`message_retry` 增加 `maxRetries` / `delayMs` / `kind` / `discardedToolCalls`；请求级 `session.llmMaxRetries`，见「LLM 重试与进度」「流空闲超时」）。v0.10.4（回合预算：默认 `maxTurns` 改为 150；调用方可按会话 / 请求设置 `maxTurns` / `onMaxTurns`，运行中通过 `POST /v1/sessions/{id}/turns` 或 `sub-bot turns` 提高 / 降低 / 停止，没有封顶，模型不能自己延长；达到上限时 stop / ask / summarize，见「回合预算（maxTurns）」）。v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
 
 ## Claude (Anthropic)
 
@@ -192,9 +192,34 @@ SSE、RPC、`ask --json` 的事件流上：
 
 ## LLM 重试与进度
 
-OpenAI Responses / Chat Completions 遇到连接失败、超时、流中断、HTTP 408/429/5xx 时自动重试。
-全局或 profile 可设置 `llmMaxRetries`（默认 3 次额外尝试，0 禁用；profile 优先）。退避从 1 秒指数增长，加入 jitter，上限 30 秒；服务端 `Retry-After`（秒或 HTTP-date）作为最短等待时间（先限制到最多 60 秒）。abort 会立即取消请求或等待。
-仅文本/思考的部分输出可以丢弃后重试；一旦发出工具调用事件就不重试，避免重复工具操作。SSE/JSONL 消费者收到 `message_retry {attempt, reason}` 时应清空当前未完成的助手消息；最终历史只含成功尝试。每次重试产生 warn `llm_retry` issue，最终失败仍产生 `llm_*` issue。
+OpenAI Responses / Chat Completions 与 Anthropic Messages 遇到**瞬时**故障时自动重试：连接 / 请求错误、读取响应体出错、流空闲超时、响应头超时（120 秒）、流提前结束（没有 `finish_reason` / `response.completed` / `message_stop`）、HTTP 408/429/5xx，以及 Anthropic 流内的 `overloaded_error` / `api_error`（及 `rate_limit_error`）。其它 4xx（400/401/403/404 …）从不重试；`probe-efforts` 的原样探测也不重试。
+重试次数 `llmMaxRetries`：请求（`session.llmMaxRetries`，0..=20）> profile > 全局（默认 3 次额外尝试，0 禁用）。CLI：`run` / `ask` / `rpc` 的 `--llm-max-retries N`。退避从 1 秒指数增长，加 0–250ms jitter，上限 30 秒；服务端 `Retry-After`（秒或 HTTP-date，先限制到最多 60 秒）作为最短等待时间。abort 会立即取消请求或等待。
+
+**已流出工具调用后也会重试（v0.10.5）**：工具只在整条助手消息成功结束（`Done`）后才执行，所以重放是安全的——被丢弃尝试里流出的文本、thinking（及其签名）、工具调用 delta 都不会执行、不会持久化，重试也不消耗回合（`maxTurns`），压缩检查（`before_call`）每次模型调用只做一次。以前只要发出过工具调用事件就不再重试，长时间推理后的断流会直接失败。
+
+SSE / JSONL / RPC 消费者收到 `message_retry` 时必须丢弃当前未完成的助手消息（文本、thinking、工具调用），然后等待重放；最终历史只含成功的那次尝试：
+
+```json
+{"type":"message_retry","attempt":1,"maxRetries":3,"delayMs":1137,"kind":"idle_timeout","reason":"stream idle timeout after 1800s","discardedToolCalls":2}
+```
+
+- `attempt` 从 1 开始，`maxRetries` 是本次调用允许的重试次数；`delayMs` 是重放前的等待；`reason` 已脱敏。
+- `kind`：`idle_timeout` | `stream_error` | `incomplete` | `headers_timeout` | `http_status` | `connect` | `overloaded` | `rate_limit` | `account_failover`（账号 failover 也用这个事件，`delayMs: 0`）。
+- `discardedToolCalls`：被丢弃尝试里已经流出的工具调用数（从未执行）。
+- 内置消费者都会重置：`/v1/chat` 非流式超时返回的部分文本只去掉被重试的那条消息，`sub-bot ask` 文本模式在终端里换行并在 stderr 提示 `[retry n/m] kind: reason; partial output above is discarded, replaying`，输出到管道 / 文件时按消息缓冲，stdout 里不会出现重复文本。
+
+日志：每次重试一条 WARN（`provider`、`model`、`attempt`/`max_retries`、`kind`、`delay_ms`、`bytes_received`、`secs_since_last_byte`、`discarded_tool_calls`，会话 span 带 `session_id`）；重试后成功一条 INFO（`attempts`）；重试用尽一条 ERROR。每次重试产生 warn `llm_retry` issue（details：`attempt`、`maxRetries`、`kind`、`delayMs`、`discardedToolCalls`），最终失败仍产生 `llm_*` issue。
+
+### 流空闲超时（streamIdleTimeoutSecs）
+
+流空闲超时是“连续多久没有收到任何字节”就判定连接已死并按瞬时错误重试（推理模型思考时可能长时间不输出）。每收到一个字节重新计时。
+
+- 取值 1..=7200（2 小时），默认 **1800** 秒（v0.10.5 之前是 300）。超出范围：配置加载报错并指出具体键路径（如 `providers.openai.accounts.work.streamIdleTimeoutSecs must be between 1 and 7200 (2 hours), got 0`）、HTTP 400、CLI 参数校验失败。
+- 可设置位置与优先级：请求 `session.streamIdleTimeoutSecs` > `profiles.<name>.streamIdleTimeoutSecs` > `providers.<id>.accounts.<name>.streamIdleTimeoutSecs` > `providers.<id>.streamIdleTimeoutSecs` > 全局 `streamIdleTimeoutSecs`。账号 / provider / 全局决定 provider 实例的默认值（failover 到别的账号时用该账号自己的值）；profile / 请求级的值随每次请求发送，覆盖所有账号，也用于路由分类和压缩摘要调用。
+- CLI：`run` / `ask` / `rpc` 的 `--stream-idle-timeout-secs N`（新会话）；`serve --stream-idle-timeout-secs N` 覆盖配置里的全局值。
+- 请求级 `streamIdleTimeoutSecs` / `llmMaxRetries` 与 `maxTurns` 一样写进会话文件，恢复后的会话沿用创建时的值（`run --resume` / `rpc --resume` / `ask --session` 再传这两个参数会报错）。会话视图（`POST/GET /v1/sessions`）和 `GET /v1/profiles` 显示实际生效的 `streamIdleTimeoutSecs` / `llmMaxRetries`。
+- 其它上限：LLM 流式请求本身没有总超时（只有 30 秒连接超时、120 秒等响应头和空闲超时）。profile 的 `runTimeoutSecs` 比空闲超时短时，创建会话记 WARN。`/v1/chat` 的 `chatTimeoutSecs`（默认仍为 900 秒）限制的是**整次运行**，同步和 `async:true` 都受它约束（`stream:true` 不受）；长时间的编码任务请在请求里传更大的 `timeoutSecs`（不设上限）或调大 `chatTimeoutSecs`。`sub-bot ask --timeout` 默认仍为 3600 秒，可按需加大。
+- 连接保活：LLM 客户端开启 TCP keepalive（空闲 30 秒后开始探测，每 10 秒一次，最多 5 次），避免 NAT / 防火墙静默断开长时间无输出的连接，也更快发现死连接。TLS ALPN 只协商 http/1.1，因此没有 HTTP/2 PING。
 
 `task.progress` 不发送空白助手文本（工具执行进度仍保留）。Webhook 的 `Retry-After` 同时支持秒和 HTTP-date，过去日期按 0 秒处理，最长等待 60 秒。
 
@@ -382,7 +407,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   "webhookMaxAttempts": 6,                   // webhook 最大投递次数（含首次）
   "defaultReasoningEffort": "high",           // 可选：全局默认推理强度
   "defaultApi": "auto",                       // 可选：auto|chat|responses，默认 auto
-  "streamIdleTimeoutSecs": 300,               // LLM 流连续无字节的超时；推理模型可能长时间静默
+  "streamIdleTimeoutSecs": 1800,              // LLM 流连续无字节的超时（1..=7200，默认 1800）；provider / 账号 / profile / 请求可覆盖
   "chatTimeoutSecs": 900,                     // /v1/chat 非流式默认等待上限
   "keychainTimeoutSecs": 30,                  // 每次 macOS Keychain 读取的等待上限（>= 1），见「Keychain 读取超时」
   "apiKeyFile": "/etc/sub-bot/openai.key",    // 可选：OpenAI key 文件，相对路径相对配置文件目录
@@ -401,6 +426,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
       "tokenBudget": 300000,                   // 可选：整次运行的 token 预算，用完后禁止再调工具、要求直接给结论
       "runTimeoutSecs": null,                 // 可选：整次运行的秒数上限，默认不限时；超时等同 abort
+      "streamIdleTimeoutSecs": 3600,           // 可选：本 profile 的流空闲超时（1..=7200），优先于账号 / provider / 全局，见「流空闲超时」
+      "llmMaxRetries": 3,                      // 可选：瞬时 LLM 错误重试次数（覆盖全局，0 禁用）
       "systemPrompt": null,                    // 替换默认编码前言
       "appendSystemPrompt": "...",             // 追加内容
       "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
@@ -600,12 +627,12 @@ sub-bot ask --effort high "解释这个仓库"
 
 `/v1/chat` 请求体校验（v0.9.2）：
 - 顶层 `profile` / `model` 等价于 `session.profile` / `session.model`（新会话使用；带 `sessionId` 时与 `session` 一样被忽略）。两处都给且值不同 ⇒ 400 `profile given both at top level and in session; put it in session.profile`（`model` 同理）；相同则接受。以前顶层 `profile` 会被静默忽略并落到默认 profile。
-- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`、`toolApproval`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
+- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`、`toolApproval`、`maxTurns`、`onMaxTurns`、`maxTurnsAskTimeoutSecs`、`streamIdleTimeoutSecs`、`llmMaxRetries`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
 - `session` 对象（以及 `POST /v1/sessions` 请求体）里的未知字段同样返回 400（serde 报 ``unknown field `profiel`, expected one of ...``），拼写错误不再被静默忽略。
 - 顶层 `reasoningEffort` / `depth` / `account` 的语义不变（`account` 顶层优先于 `session.account`）。
 
 超时行为：
-- `streamIdleTimeoutSecs`（全局，默认 300 秒）适用于 OpenAI Chat Completions 和 Responses；每次收到字节重置计时。超时产生 `stopReason: "error"`、`errorMessage: "stream idle timeout after Ns"`。连接超时为 30 秒，初始响应头等待上限为 120 秒。
+- `streamIdleTimeoutSecs`（默认 1800 秒，1..=7200，可按 provider / 账号 / profile / 请求覆盖，见「流空闲超时」）适用于 OpenAI Chat Completions、Responses 和 Anthropic；每次收到字节重置计时。超时按瞬时错误重试（`message_retry` 的 `kind: "idle_timeout"`），重试用尽后产生 `stopReason: "error"`、`errorMessage: "stream idle timeout after Ns"`。连接超时为 30 秒，初始响应头等待上限为 120 秒。
 - `runTimeoutSecs`（profile，默认 `null`）限制整次运行（含工具和排队消息），对 HTTP、RPC、CLI 都生效。超时取消运行、记录 `run timed out` 警告，并发送 `agent_settled{aborted:true}`。
 - 非流式 `/v1/chat` 的 `timeoutSecs` 覆盖全局 `chatTimeoutSecs`（默认 900 秒）。超时 abort 后最多再等 5 秒收尾，返回 HTTP **504**：`{sessionId, error: "timeout", text, messages}`，保留已收到的部分文本和消息。`stream:true` 不使用此等待上限（仍受流空闲和运行超时限制）。
 

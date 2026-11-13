@@ -11,6 +11,14 @@
 
 ---
 
+## 长流稳健性（v0.10.5）
+
+- **流空闲超时**：`agent_ai::{DEFAULT_STREAM_IDLE_TIMEOUT_SECS = 1800, MAX_STREAM_IDLE_TIMEOUT_SECS = 7200}` 与 `validate_stream_idle_timeout_secs` 是唯一的取值来源（配置 `config::check_stream_idle_timeout` 把键路径带进错误、HTTP 400、clap `main::parse_stream_idle_timeout` 共用同一文案）。provider 实例默认值在 `hub::build_provider` 里按 账号 > provider > 全局（`Config::account_stream_idle_timeout_secs`）构造；profile / 请求级覆盖放进 `Request.stream_idle_timeout`，provider 取 `req.stream_idle_timeout.unwrap_or(实例默认)`（请求优先）——这样 failover 账号在没有覆盖时仍用各自的实例默认。`LoopConfig.stream_idle_timeout`、压缩摘要（`SummaryCall`）、路由分类（`routing::classify`）都传同一个会话值。
+- **会话解析**：`Hub::llm_settings` ⇒ `LlmSettings{stream_idle_timeout_secs（生效值）, stream_idle_timeout_override, llm_max_retries}`，保存在 `SessionDynamic.llm`；`SessionRequest.{streamIdleTimeoutSecs, llmMaxRetries}` 校验后写入 `SessionMeta`（与 `maxTurns` 一样），恢复时读回。会话视图与 `GET /v1/profiles` 报告生效值。创建会话时 `runTimeoutSecs < idle` 记 WARN（`issue="none"`），`chatTimeoutSecs < idle` 记 INFO；`ask --timeout` 默认 7200，不会比最大空闲超时更早截断。
+- **连接**：`agent_ai::http::llm_client_builder()`：30s connect timeout + TCP keepalive（30s / 每 10s / 5 次）。ALPN 只有 http/1.1，所以没有 h2 PING。响应头等待仍为 120s，分类用前缀 `response headers timeout`。
+- **重试**（`agent_ai::retry`）：`CallError{reason, transient, retry_after, kind}`；瞬时 = 连接/请求错误、body 读取错误、空闲超时、响应头超时、提前 EOF、HTTP 408/429/5xx、Anthropic 流内 overloaded/api/rate_limit error；其它 4xx 永不重试，`raw_effort`（probe）为 0 次。退避 `1s·2^n + ≤250ms jitter`，上限 30s，`Retry-After`（≤60s）为下限。已流出工具调用事件之后也重放：工具只在 `Done` 之后执行，`AssistantEvent::Retry{attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls}` 通知消费者丢弃部分消息；每次尝试用全新的解析器 / 消息，所以被丢弃尝试的 thinking 签名不会进入最终消息。task-local `AttemptStats` 记录收到的字节和最后一个字节的时间，用于 WARN 日志（`bytes_received`、`secs_since_last_byte`）；成功后 INFO（`attempts`），用尽后 ERROR。
+- **消费者**：`agent_loop::stream_assistant` 把 `Retry` 转成 `AgentEvent::MessageRetry`（同样的结构化字段），不消耗回合、不重新执行 `before_call`；`http::collect_chat` 只截掉当前助手消息的部分文本（`MessageStart` 记录起点）；`ask::TextPrinter` 终端里换行 + stderr 提示，管道里按消息缓冲；hub `llm_retry` issue 带 `attempt/maxRetries/kind/delayMs/discardedToolCalls`；持久化只写最终消息（`on_message`）。账号 failover 复用 `Retry`（`kind: account_failover`，`delay_ms: 0`）。
+
 ## 回合预算（maxTurns，v0.10.4）
 
 - **原则**：只有调用方（主 agent）能调整预算；没有封顶，也不给模型任何“延长回合”的工具。默认 `maxTurns` 150（profile 与 `Config::fallback` 一致），`onMaxTurns` 默认 stop，ask 默认等待 600 秒。

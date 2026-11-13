@@ -393,7 +393,7 @@ async fn compaction_strips_kept_thinking_and_keeps_tool_pairs() {
     // 预算落在最后的工具结果上 ⇒ 切在发出调用的助手消息前（拆开回合），工具配对完整保留
     let cut = cp::find_cut_point(&messages, 50).unwrap();
     assert_eq!((cut.cut, cut.split_turn), (5, true));
-    let call = crate::compaction::SummaryCall { provider: &script, model: "m", api: agent_ai::Api::Auto, max_tokens: 1000, llm_max_retries: None };
+    let call = crate::compaction::SummaryCall { provider: &script, model: "m", api: agent_ai::Api::Auto, max_tokens: 1000, llm_max_retries: None, stream_idle_timeout: None };
     let outcome = crate::compaction::compact(&call, &messages, cut, 0, Some("keep file names"), Default::default()).await.unwrap();
     // 保留的助手消息去掉了签名 thinking（Anthropic 的签名绑定到已被摘要改写的前缀），tool_use / tool_result 配对完整
     let mut a3_kept = a3.clone();
@@ -808,4 +808,86 @@ async fn turn_budget_options_survive_rehydration() {
     let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().expect("rehydrated");
     let budget = h.turn_budget();
     assert_eq!((budget.max_turns, budget.on_max_turns, budget.ask_timeout_secs), (7, agent_core::OnMaxTurns::Ask, 30));
+}
+
+#[tokio::test]
+async fn llm_stream_settings_precedence_persist_and_reach_every_call() {
+    let dir = TempDir::new();
+    let edit = |cfg: &mut Config| {
+        eager_compaction(cfg);
+        cfg.providers.entry("faux".into()).or_default().stream_idle_timeout_secs = Some(1000);
+        cfg.llm_max_retries = 2;
+    };
+    let (hub1, script) = hub(&dir, edit);
+    let me = client(&hub1, "default");
+    // No request/profile override: the provider-level value is the instance default and is not sent per request.
+    let plain = hub1.create_session(&me, SessionRequest::default()).unwrap();
+    let view = hub1.session_view(&plain);
+    assert_eq!((view["streamIdleTimeoutSecs"].clone(), view["llmMaxRetries"].clone()), (json!(1000), json!(2)));
+    prompt(&plain, &long("plain")).await;
+    assert!(script.seen.lock().unwrap().iter().all(|r| r.stream_idle_timeout.is_none() && r.llm_max_retries == Some(2)));
+    script.seen.lock().unwrap().clear();
+
+    // Request > profile: both main and compaction summary calls carry the session override.
+    let req = SessionRequest { stream_idle_timeout_secs: Some(120), llm_max_retries: Some(5), ..Default::default() };
+    let h = hub1.create_session(&me, req).unwrap();
+    prompt(&h, &long("first")).await;
+    prompt(&h, &long("second")).await;
+    assert!(!script.summary_requests().is_empty(), "compaction ran");
+    assert!(script.seen.lock().unwrap().iter().all(|r| r.stream_idle_timeout == Some(Duration::from_secs(120)) && r.llm_max_retries == Some(5)));
+    let meta = Session::open(&h.hooks.path().unwrap()).unwrap().meta().clone();
+    assert_eq!((meta.stream_idle_timeout_secs, meta.llm_max_retries), (Some(120), Some(5)));
+    let id = h.id.clone();
+    hub1.abort_all().await;
+    drop((h, plain, hub1));
+
+    // The resumed session keeps the values even though the profile changed meanwhile.
+    let (hub2, script) = hub(&dir, |cfg| {
+        edit(cfg);
+        let p = cfg.profiles.get_mut("default").unwrap();
+        (p.stream_idle_timeout_secs, p.llm_max_retries) = (Some(900), Some(1));
+    });
+    let h = hub2.get_or_load(&client(&hub2, "default"), &id).await.unwrap().expect("rehydrated");
+    let view = hub2.session_view(&h);
+    assert_eq!((view["streamIdleTimeoutSecs"].clone(), view["llmMaxRetries"].clone()), (json!(120), json!(5)));
+    prompt(&h, "after resume").await;
+    assert_eq!(script.main_requests().last().unwrap().stream_idle_timeout, Some(Duration::from_secs(120)));
+    // New sessions use the profile override (profile > provider).
+    let fresh = hub2.create_session(&client(&hub2, "default"), SessionRequest::default()).unwrap();
+    assert_eq!(hub2.session_view(&fresh)["streamIdleTimeoutSecs"], 900);
+    assert_eq!(hub2.session_view(&fresh)["llmMaxRetries"], 1);
+
+    // The routing classifier call carries the override too.
+    let classifier = Script::default();
+    let _ = crate::routing::classify(&classifier, "m", "task", Some(Duration::from_secs(77))).await;
+    let seen = classifier.seen.lock().unwrap();
+    assert_eq!((seen.len(), seen[0].stream_idle_timeout), (1, Some(Duration::from_secs(77))));
+    assert_eq!(seen[0].system_prompt.as_deref(), Some(crate::routing::ROUTER_SYSTEM_PROMPT));
+}
+
+#[tokio::test]
+async fn http_validates_and_reports_llm_stream_settings() {
+    let dir = TempDir::new();
+    let (hub, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().stream_idle_timeout_secs = Some(2400));
+    let app = crate::http::test_router(hub.clone());
+    for body in [json!({"streamIdleTimeoutSecs": 0}), json!({"streamIdleTimeoutSecs": 7201})] {
+        let (status, error) = request(&app, "POST", "/v1/sessions", "test-token", Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error["error"].as_str().unwrap().contains("streamIdleTimeoutSecs must be between 1 and 7200 (2 hours)"), "{error}");
+    }
+    let (status, error) = request(&app, "POST", "/v1/chat", "test-token", Some(json!({"message": "hi", "session": {"streamIdleTimeoutSecs": 0}}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    let (status, error) = request(&app, "POST", "/v1/sessions", "test-token", Some(json!({"llmMaxRetries": 21}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error["error"].as_str().unwrap().contains("llmMaxRetries must be between 0 and 20"), "{error}");
+    // Top-level session options get the "put it under session" hint.
+    let (status, error) = request(&app, "POST", "/v1/chat", "test-token", Some(json!({"message": "hi", "streamIdleTimeoutSecs": 60}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error["error"].as_str().unwrap().contains(r#"session options go under "session""#), "{error}");
+    let (status, view) = request(&app, "POST", "/v1/sessions", "test-token", Some(json!({"streamIdleTimeoutSecs": 7200, "llmMaxRetries": 0}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!((view["streamIdleTimeoutSecs"].clone(), view["llmMaxRetries"].clone()), (json!(7200), json!(0)));
+    let (_, profiles) = request(&app, "GET", "/v1/profiles", "test-token", None).await;
+    let default = profiles["profiles"].as_array().unwrap().iter().find(|p| p["name"] == "default").unwrap().clone();
+    assert_eq!((default["streamIdleTimeoutSecs"].clone(), default["llmMaxRetries"].clone()), (json!(2400), json!(3)));
 }

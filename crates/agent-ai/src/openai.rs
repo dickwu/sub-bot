@@ -92,7 +92,7 @@ pub struct OpenAiOptions {
     pub organization: Option<String>,
     /// → `OpenAI-Project` 请求头
     pub project: Option<String>,
-    /// 默认 300 秒
+    /// 默认 [`crate::DEFAULT_STREAM_IDLE_TIMEOUT_SECS`]（1800 秒）；请求级 `Request.stream_idle_timeout` 优先
     pub stream_idle_timeout: Option<Duration>,
 }
 
@@ -126,8 +126,8 @@ impl OpenAiProvider {
             api_key,
             extra_headers: account_headers(&opts),
             base_url: opts.base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            http: crate::http::client_builder().connect_timeout(Duration::from_secs(30)).build().expect("http client"),
-            stream_idle_timeout: opts.stream_idle_timeout.unwrap_or(Duration::from_secs(300)),
+            http: crate::http::llm_client_builder().build().expect("http client"),
+            stream_idle_timeout: opts.stream_idle_timeout.unwrap_or(Duration::from_secs(crate::DEFAULT_STREAM_IDLE_TIMEOUT_SECS)),
             effort_cache: Default::default(),
             api_cache: Default::default(),
         }
@@ -232,7 +232,7 @@ impl Provider for OpenAiProvider {
             key: self.api_key.clone(),
             effort_cache: self.effort_cache.clone(),
             api_cache: self.api_cache.clone(),
-            stream_idle_timeout: self.stream_idle_timeout,
+            stream_idle_timeout: req.stream_idle_timeout.unwrap_or(self.stream_idle_timeout),
         };
         let api = self.resolve_api(&req);
         let span = tracing::info_span!("llm", provider = "openai", model = %req.model, api = tracing::field::Empty, reasoning_effort = tracing::field::Empty);
@@ -240,7 +240,7 @@ impl Provider for OpenAiProvider {
             async move {
                 let model = req.model.clone();
                 let started = std::time::Instant::now();
-                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), api = %api, "request sent");
+                tracing::debug!(messages = req.messages.len(), tools = req.tools.len(), api = %api, idle_timeout_secs = ctx.stream_idle_timeout.as_secs(), "request sent");
                 let mut attempt = (api, req.reasoning);
                 let fut = run_with_retries(&ctx, req, api, &tx, &mut attempt);
                 let r = tokio::select! {
@@ -299,8 +299,10 @@ struct CallCtx {
 
 async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
     let max_retries = if req.raw_effort { 0 } else { req.llm_max_retries.unwrap_or(3) };
+    let model = req.model.clone();
     let mut state = (ctx, req, api, attempt);
-    crate::retry::run_with_retries(&mut state, max_retries, tx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3)))
+    let retry_ctx = crate::retry::RetryCtx { provider: "openai", model: &model };
+    crate::retry::run_with_retries(&mut state, max_retries, tx, retry_ctx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3)))
         .await
         .map_err(|error| redact(&if ctx.key.expose().is_empty() { error } else { error.replace(ctx.key.expose(), "[redacted]") }))
 }
@@ -341,7 +343,7 @@ async fn run(ctx: &CallCtx, mut req: Request, mut api: Api, tx: mpsc::Sender<Ass
         let err_msg = redact(&format!("OpenAI HTTP {status} ({} API): {safe_text}", api.as_str()));
         if req.raw_effort || status != reqwest::StatusCode::BAD_REQUEST || retries >= 2 {
             record(api, req.reasoning);
-            return Err(CallError { reason: err_msg, transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after });
+            return Err(CallError::http(err_msg, status, retry_after));
         }
         let Some(kind) = parse_effort_error(&text) else {
             record(api, req.reasoning);
@@ -419,7 +421,9 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
     let mut buf: Vec<u8> = Vec::new();
     let mut bytes = resp.bytes_stream();
     'stream: while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| idle_timeout_error(idle_timeout))? {
-        buf.extend_from_slice(&chunk.map_err(|_| "stream body read error".to_string())?);
+        let chunk = chunk.map_err(|_| "stream body read error".to_string())?;
+        crate::retry::record_bytes(chunk.len());
+        buf.extend_from_slice(&chunk);
         // 按字节切分 LF，避免多字节 UTF-8 字符跨 chunk 被截断
         while let Some(pos) = buf.iter().position(|b| *b == b'\n') {
             let line = String::from_utf8_lossy(&buf[..pos]).trim_end_matches('\r').to_string();
@@ -534,8 +538,19 @@ mod tests {
             std::future::pending::<()>().await;
         });
         let provider = OpenAiProvider::with_stream_idle_timeout(crate::Secret::new("test"), Some(format!("http://{addr}")), Duration::from_millis(200));
-        let req =
-            Request { model: "test".into(), system_prompt: None, messages: vec![], tools: vec![], reasoning: None, api, max_tokens: None, raw_effort: false, thinking: None, llm_max_retries: Some(0) };
+        let req = Request {
+            model: "test".into(),
+            system_prompt: None,
+            messages: vec![],
+            tools: vec![],
+            reasoning: None,
+            api,
+            max_tokens: None,
+            raw_effort: false,
+            thinking: None,
+            llm_max_retries: Some(0),
+            stream_idle_timeout: None,
+        };
         let started = std::time::Instant::now();
         let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.expect("stream hung");
         server.abort();
@@ -594,6 +609,7 @@ mod tests {
                 raw_effort: false,
                 thinking: None,
                 llm_max_retries: Some(0),
+                stream_idle_timeout: None,
             };
             let events = tokio::time::timeout(Duration::from_secs(2), provider.stream(req, CancellationToken::new()).collect::<Vec<_>>()).await.unwrap();
             server.await.unwrap();
@@ -656,6 +672,7 @@ mod tests {
                 tools: vec![],
                 max_tokens: Some(1024),
                 llm_max_retries: Some(3),
+                stream_idle_timeout: None,
             };
             for _ in 0..2 {
                 let events = provider.stream(req.clone(), CancellationToken::new()).collect::<Vec<_>>().await;
@@ -726,6 +743,7 @@ mod tests {
                     raw_effort: false,
                     thinking: None,
                     llm_max_retries: Some(0),
+                    stream_idle_timeout: None,
                 };
                 let events = provider.stream(req, CancellationToken::new()).collect::<Vec<_>>().await;
                 assert!(matches!(events.last(), Some(AssistantEvent::Done { .. })), "{events:?}");

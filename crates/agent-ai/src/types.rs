@@ -349,10 +349,22 @@ mod effort_tests {
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum AssistantEvent {
     Start,
-    /// Discard all text/thinking from the previous attempt of this call.
+    /// Discard all text/thinking/tool-call deltas from the previous attempt of this call.
+    /// `attempt` is the 1-based retry number; `kind` classifies the failure (`idle_timeout`, `stream_error`,
+    /// `incomplete`, `headers_timeout`, `http_status`, `connect`, `overloaded`, `rate_limit`, `account_failover`).
     Retry {
         attempt: u32,
+        /// Redacted failure reason.
         reason: String,
+        #[serde(default)]
+        max_retries: u32,
+        #[serde(default)]
+        delay_ms: u64,
+        #[serde(default)]
+        kind: String,
+        /// Tool calls streamed by the discarded attempt (never executed).
+        #[serde(default)]
+        discarded_tool_calls: u32,
     },
     TextDelta {
         content_index: usize,

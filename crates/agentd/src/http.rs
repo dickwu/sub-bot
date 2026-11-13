@@ -33,8 +33,8 @@ impl axum::extract::FromRef<AppState> for Arc<Hub> {
 }
 
 pub fn random_token() -> String {
-    use rand::Rng;
-    let bytes: [u8; 24] = rand::thread_rng().gen();
+    use rand::RngExt;
+    let bytes: [u8; 24] = rand::rng().random();
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

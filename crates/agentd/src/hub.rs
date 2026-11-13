@@ -993,7 +993,7 @@ impl Hub {
             session_dir,
             sessions: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),
-            http: reqwest::Client::new(),
+            http: agent_ai::http::client(),
             #[cfg(test)]
             callback_timeout: None,
             models_cache: Default::default(),

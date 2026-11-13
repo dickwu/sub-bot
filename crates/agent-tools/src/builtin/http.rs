@@ -66,7 +66,7 @@ mod tests {
     #[tokio::test]
     async fn http_fetch_caps_body() {
         let (url, _, server) = server(Some(vec![b'x'; MAX_BODY_BYTES + 1])).await;
-        let tool = HttpFetchTool { allow_hosts: vec!["127.0.0.1".into()], http: reqwest::Client::new() };
+        let tool = HttpFetchTool { allow_hosts: vec!["127.0.0.1".into()], http: agent_ai::http::client() };
         let result = tool.execute("1", json!({"url": url}), CancellationToken::new(), Arc::new(|_| {})).await.unwrap();
         assert!(!result.is_error);
         let agent_ai::Content::Text { text } = &result.content[0] else { panic!("expected text") };
@@ -78,7 +78,7 @@ mod tests {
     #[tokio::test]
     async fn http_fetch_body_read_is_cancellable() {
         let (url, headers, server) = server(None).await;
-        let tool = HttpFetchTool { allow_hosts: vec!["127.0.0.1".into()], http: reqwest::Client::new() };
+        let tool = HttpFetchTool { allow_hosts: vec!["127.0.0.1".into()], http: agent_ai::http::client() };
         let cancel = CancellationToken::new();
         let token = cancel.clone();
         let call = tokio::spawn(async move { tool.execute("1", json!({"url": url}), token, Arc::new(|_| {})).await });

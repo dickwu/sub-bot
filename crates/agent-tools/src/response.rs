@@ -46,7 +46,7 @@ pub(crate) mod tests {
     async fn body_cap_handles_exact_size_and_overflow() {
         for size in [1024, 1025] {
             let (url, _, server) = server(Some(vec![b'x'; size])).await;
-            let response = reqwest::get(url).await.unwrap();
+            let response = agent_ai::http::client().get(url).send().await.unwrap();
             let (body, truncated) = super::read_body(response, 1024).await.unwrap();
             assert_eq!(body.len(), 1024);
             assert_eq!(truncated, size > 1024);

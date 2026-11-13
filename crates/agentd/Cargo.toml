@@ -47,11 +47,8 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 # MCP 客户端（官方 Rust SDK）。stdio 子进程由 mcp.rs 自己 spawn（进程组 + 退出状态），经 transport-async-rw 接入；
-# streamable HTTP 用 rmcp 的 reqwest 0.13 客户端，TLS 为 rustls + ring + webpki-roots（不引入 openssl / aws-lc）
+# streamable HTTP 用 rmcp 的 reqwest 客户端（与工作区同为 reqwest 0.13，经 agent_ai::http::client_builder() 构建：rustls + ring + webpki-roots，不引入 openssl / aws-lc）
 rmcp = { version = "3.8", default-features = false, features = ["client", "transport-async-rw", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"] }
-reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -89,7 +89,7 @@ mod tests {
     use std::sync::Arc;
 
     fn tool(url: String) -> CallbackTool {
-        CallbackTool::new(CallerToolSpec { name: "test".into(), description: String::new(), parameters: json!({}), callback_url: url, callback_token: None }, "test".into(), reqwest::Client::new())
+        CallbackTool::new(CallerToolSpec { name: "test".into(), description: String::new(), parameters: json!({}), callback_url: url, callback_token: None }, "test".into(), agent_ai::http::client())
     }
 
     #[tokio::test]

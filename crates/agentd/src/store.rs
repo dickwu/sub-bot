@@ -272,7 +272,7 @@ impl Store {
                 }
             };
             let status = if let Some(target) = &target {
-                Deliverer::new(reqwest::Client::new(), policy).resume(target, &delivery.payload, delivery.status.clone(), &update).await
+                Deliverer::new(agent_ai::http::client(), policy).resume(target, &delivery.payload, delivery.status.clone(), &update).await
             } else {
                 let mut status = delivery.status.clone();
                 status.state = DeliveryState::Failed;

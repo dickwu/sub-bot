@@ -940,6 +940,13 @@ mod tests {
         assert_ne!(resolve_default_data_dir(None, None, tmp.clone(), 42), resolve_default_data_dir(None, None, tmp, 43));
     }
 
+    #[test]
+    fn sha256_hex_matches_known_vectors() {
+        // FIPS 180-2 test vectors: stored tokenSha256 values must stay stable across sha2 upgrades.
+        assert_eq!(sha256_hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(sha256_hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
     #[cfg(unix)]
     #[test]
     fn temporary_data_dir_rejects_unsafe_existing_directories() {

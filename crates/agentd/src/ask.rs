@@ -97,7 +97,7 @@ impl Client {
             "invalid server URL"
         );
         // No redirects or proxies: do not leak local credentials to another endpoint.
-        let http = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
+        let http = agent_ai::http::client_builder().no_proxy().redirect(reqwest::redirect::Policy::none()).build()?;
         Ok(Self { socket, url, token, http, provider: None, effort: None, depth: None, account: None, approval: ApprovalMode::Ignore })
     }
 

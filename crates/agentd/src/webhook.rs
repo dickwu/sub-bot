@@ -1,8 +1,7 @@
 //! Signed webhook delivery. Dropping `deliver` cancels its request/backoff; no background task is spawned.
 //! Receivers should verify the raw request bytes and deduplicate by `X-SubBot-Delivery`.
 
-use hmac::{Hmac, Mac};
-use rand::Rng;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::{
@@ -64,7 +63,7 @@ pub struct Deliverer {
 impl Deliverer {
     pub fn new(_http: reqwest::Client, policy: RetryPolicy) -> Self {
         // A supplied client may follow redirects (and leak signed payloads to another origin).
-        Self { http: reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build(), policy }
+        Self { http: agent_ai::http::client_builder().redirect(reqwest::redirect::Policy::none()).build(), policy }
     }
 
     /// Delivers one event, with a stable UUID and body across retries. Calls `on_update` after
@@ -184,7 +183,7 @@ impl Deliverer {
             if status.state != DeliveryState::Pending {
                 break;
             }
-            let jitter = (backoff / 1000).saturating_mul(rand::thread_rng().gen_range(0..=100));
+            let jitter = (backoff / 1000).saturating_mul(rand::random_range(0..=100));
             let delay = retry_after.unwrap_or_else(|| backoff.saturating_add(jitter).min(self.policy.max_backoff));
             if let Some(deadline) = tokio::time::Instant::now().checked_add(delay) {
                 tokio::time::sleep_until(deadline).await;
@@ -395,7 +394,7 @@ mod tests {
     async fn deliver(receiver: Receiver, policy: RetryPolicy) -> (DeliveryStatus, Vec<DeliveryStatus>) {
         let (target, _server) = server(receiver).await;
         let updates = Mutex::new(Vec::new());
-        let deliverer = Deliverer::new(reqwest::Client::new(), policy);
+        let deliverer = Deliverer::new(agent_ai::http::client(), policy);
         let status = deliverer.deliver(&target, "task.done", &serde_json::json!({"ok": true}), &|status| updates.lock().unwrap().push(status.clone())).await;
         (status, updates.into_inner().unwrap())
     }
@@ -473,7 +472,7 @@ mod tests {
                 receiver.retry_after = Some("Wed, 21 Oct 2015 07:28:00 GMT");
                 let (target, _server) = server(receiver.clone()).await;
                 let policy = RetryPolicy { initial_backoff: Duration::from_secs(30), max_backoff: Duration::from_secs(60), ..policy() };
-                let deliverer = Deliverer::new(reqwest::Client::new(), policy);
+                let deliverer = Deliverer::new(agent_ai::http::client(), policy);
                 let updates = Mutex::new(Vec::new());
                 let on_update = |status: &DeliveryStatus| updates.lock().unwrap().push(status.clone());
                 let payload = serde_json::json!({"ok": true});
@@ -530,7 +529,7 @@ mod tests {
         let mut receiver = Receiver::new(vec![500]);
         receiver.delay = Duration::from_millis(100);
         let (target, _server) = server(receiver.clone()).await;
-        let task = tokio::spawn(async move { Deliverer::new(reqwest::Client::new(), policy()).deliver(&target, "task.done", &serde_json::json!({"ok": true}), &|_| {}).await });
+        let task = tokio::spawn(async move { Deliverer::new(agent_ai::http::client(), policy()).deliver(&target, "task.done", &serde_json::json!({"ok": true}), &|_| {}).await });
         tokio::time::timeout(Duration::from_secs(2), async {
             while receiver.seen.lock().unwrap().is_empty() {
                 tokio::time::sleep(Duration::from_millis(1)).await;

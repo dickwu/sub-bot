@@ -126,7 +126,7 @@ impl OpenAiProvider {
             api_key,
             extra_headers: account_headers(&opts),
             base_url: opts.base_url.unwrap_or_else(|| "https://api.openai.com/v1".into()),
-            http: reqwest::Client::builder().connect_timeout(Duration::from_secs(30)).build().expect("http client"),
+            http: crate::http::client_builder().connect_timeout(Duration::from_secs(30)).build().expect("http client"),
             stream_idle_timeout: opts.stream_idle_timeout.unwrap_or(Duration::from_secs(300)),
             effort_cache: Default::default(),
             api_cache: Default::default(),

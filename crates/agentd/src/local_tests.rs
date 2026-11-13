@@ -115,7 +115,7 @@ async fn tcp_loopback_trust_is_opt_in_and_header_cannot_bypass_auth() {
                 assert_eq!(body["client"], if token.is_some() { "other" } else { "default" });
             }
         }
-        let response = reqwest::Client::new().get(format!("http://{address}/v1/profiles")).header("authorization", "Basic invalid").send().await.unwrap();
+        let response = agent_ai::http::client().get(format!("http://{address}/v1/profiles")).header("authorization", "Basic invalid").send().await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         hub.abort_all().await;
     }

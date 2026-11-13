@@ -1,7 +1,6 @@
 //! Shared transient retry policy. Never replay a request after a tool event escapes.
 use crate::types::{AssistantEvent, AssistantMessage};
 use futures::future::BoxFuture;
-use rand::Rng;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -74,7 +73,7 @@ where
             Ok(message) => return Ok(message),
             Err(error) if error.transient && !tool_started && retry < max_retries => {
                 let base = Duration::from_secs(1u64 << retry.min(5));
-                let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=250));
+                let jitter = Duration::from_millis(rand::random_range(0..=250));
                 let delay = (base + jitter).min(Duration::from_secs(30)).max(error.retry_after.unwrap_or_default());
                 tracing::warn!(issue = "typed", attempt = retry + 1, delay_ms = delay.as_millis() as u64, "retrying transient LLM failure; discarding partial message");
                 if tx.send(AssistantEvent::Retry { attempt: retry + 1, reason: error.reason }).await.is_err() {

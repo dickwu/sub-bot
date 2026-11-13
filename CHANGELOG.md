@@ -1,6 +1,8 @@
 # Changelog
 
-## [0.10.5] - 2026-11-13
+## [0.10.6] - 2026-11-13
+
+First release containing the long-stream robustness work. The `v0.10.5` tag exists but was never released: its release workflow stopped on a CI-only race in the test `restart_resumes_same_delivery_and_interrupts_running_task`, which now retries reopening the data directory while a concurrently forked test child still holds the lock file descriptor.
 
 ### Added
 - **Configurable stream idle timeout**: `streamIdleTimeoutSecs` (seconds without any streamed byte before the connection is considered dead) accepts **1..=7200** (2 hours) and can be set globally, per provider (`providers.<id>.streamIdleTimeoutSecs`), per account (`providers.<id>.accounts.<name>.streamIdleTimeoutSecs`), per profile (`profiles.<name>.streamIdleTimeoutSecs`) and per request (`session.streamIdleTimeoutSecs` in `POST /v1/sessions` / `/v1/chat`). Precedence: request > profile > account > provider > global. Account/provider/global values are the provider instance default (failover accounts keep their own); profile/request values travel with every request (`Request.stream_idle_timeout`), including compaction summary and routing classifier calls. Out-of-range values: config load error naming the exact key path, HTTP 400, or a clap error — all `streamIdleTimeoutSecs must be between 1 and 7200 (2 hours)`.

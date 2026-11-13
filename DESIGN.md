@@ -11,7 +11,7 @@
 
 ---
 
-## 长流稳健性（v0.10.5）
+## 长流稳健性（v0.10.6）
 
 - **流空闲超时**：`agent_ai::{DEFAULT_STREAM_IDLE_TIMEOUT_SECS = 1800, MAX_STREAM_IDLE_TIMEOUT_SECS = 7200}` 与 `validate_stream_idle_timeout_secs` 是唯一的取值来源（配置 `config::check_stream_idle_timeout` 把键路径带进错误、HTTP 400、clap `main::parse_stream_idle_timeout` 共用同一文案）。provider 实例默认值在 `hub::build_provider` 里按 账号 > provider > 全局（`Config::account_stream_idle_timeout_secs`）构造；profile / 请求级覆盖放进 `Request.stream_idle_timeout`，provider 取 `req.stream_idle_timeout.unwrap_or(实例默认)`（请求优先）——这样 failover 账号在没有覆盖时仍用各自的实例默认。`LoopConfig.stream_idle_timeout`、压缩摘要（`SummaryCall`）、路由分类（`routing::classify`）都传同一个会话值。
 - **会话解析**：`Hub::llm_settings` ⇒ `LlmSettings{stream_idle_timeout_secs（生效值）, stream_idle_timeout_override, llm_max_retries}`，保存在 `SessionDynamic.llm`；`SessionRequest.{streamIdleTimeoutSecs, llmMaxRetries}` 校验后写入 `SessionMeta`（与 `maxTurns` 一样），恢复时读回。会话视图与 `GET /v1/profiles` 报告生效值。创建会话时 `runTimeoutSecs < idle` 记 WARN（`issue="none"`），`chatTimeoutSecs < idle` 记 INFO；`ask --timeout` 默认 7200，不会比最大空闲超时更早截断。

@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.10.4] - 2026-11-04
+## [0.10.4] - 2026-11-13
 
 ### Added
 - **Turn budget controls (caller-only)**: the calling ("main") agent controls the per-run turn budget (`maxTurns` = model calls per run). There is no cap on the value or on extensions, and the model has no tool to extend its own turns.
@@ -17,6 +17,11 @@
 ### Changed
 - Default `maxTurns` raised from 50 (profiles) / 30 (built-in fallback config) to **150**.
 - `max_turns` issue reporting is unchanged.
+
+### Dependencies
+- `reqwest` 0.12 → **0.13** for the whole workspace (one reqwest version; the `reqwest13` alias used by the MCP client is gone). TLS stays rustls + ring + webpki-roots (no aws-lc, no OpenSSL): reqwest is built with `rustls-no-provider` and every client is created through the new shared `agent_ai::http::client_builder()` (preconfigured ring TLS, HTTP/1.1 ALPN).
+- `rand` 0.8 → **0.10**, `sha2` 0.10 → **0.11**, `hmac` 0.12 → **0.13**, `directories` 5 → **6**; `rmcp` 3.8 → 3.10 and other semver-compatible updates via `cargo update`.
+- Token SHA-256 values and webhook HMAC signatures are unchanged (covered by tests). Duplicate crates removed: reqwest 0.12, rand 0.8 / rand_core 0.6, sha2/digest 0.10 and related. No new license types.
 
 ## [0.10.3] - 2026-11-03
 

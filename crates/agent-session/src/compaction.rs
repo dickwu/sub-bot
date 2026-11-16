@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn estimate_uses_last_valid_usage_after_floor() {
         let mut a = AssistantMessage::empty("m");
-        a.usage = Usage { input: 1000, output: 50, cache_read: 200, cache_write: 0, total_tokens: 1250, reasoning: 0 };
+        a.usage = Usage { input: 1000, output: 50, cache_read: 200, cache_write: 0, total_tokens: 1250, reasoning: 0, ..Default::default() };
         let messages = vec![user("hi"), Message::Assistant(a), user(&big(10))];
         assert_eq!(estimate_context_tokens(&messages, 0, 999), ContextEstimate { tokens: 1260, from_usage: true });
         // floor 之后没有用量 ⇒ 启发式 + overhead

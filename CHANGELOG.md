@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.12.0] - 2026-11-16
+
+Estimated usage cost that prices cached tokens separately from ordinary input, plus a cache hit rate. Still not a bill, and still no Admin key.
+
+### Added
+- Anthropic cache writes are stored split by TTL (`cacheWrite5m` / `cacheWrite1h` from `cache_creation.ephemeral_*_input_tokens`). Records that only have a combined `cacheWrite` are counted as 5-minute writes.
+- OpenAI cached input is kept separate from uncached input. `prompt_tokens` / `input_tokens` already include cached tokens and cache writes, so those are not added again into `total`. Optional `cacheWrite30m` / `cacheWrite12h` when the API returns a TTL breakdown.
+- Built-in official USD/MTok price table for the models in use, fetched 2026-11-16 from [Anthropic API pricing](https://platform.claude.com/docs/en/about-claude/pricing) and [OpenAI API pricing](https://developers.openai.com/api/docs/pricing). Includes long-context tiers listed on those pages (Haiku 5.5 over 100k tokens; GPT-6.1 Sol / GPT-6 Astra over 272k input tokens). Unknown models show `-`; rates are never invented.
+- `sub-bot usage` and `GET /v1/usage` add a `cacheHit` column (`cacheRead / (uncached input + cacheRead + cacheWrite)`) and an `estCost` (USD) column, clearly labeled as an estimate (估测). `--json` includes `inputCost`, `outputCost`, `cacheReadCost`, and `cacheWriteCost`. Config `pricing.models` overrides the table; `pricing.enabled: false` hides cost columns.
+
+### Changed
+- The optional v0.11.0 `usageEstimate` block (default off, user-supplied prices) is replaced by the official table, which is on by default. `usageEstimate.pricesUsdPerMillion` is still accepted as an override; `usageEstimate.enabled` is ignored.
+
 ## [0.11.0] - 2026-11-16
 
 Local usage statistics from the token counts providers already return. No Anthropic or OpenAI Admin key is required; this is not a billing report.

@@ -1,6 +1,7 @@
 //! 用量日志、聚合、估测费用与 RecordingProvider 的测试。
 use super::{
-    report::{aggregate, build, Filters, GroupBy, ModelPrice, Query, RangeSpec, UsageEstimateConfig},
+    prices::{self, ModelPrice, PricingConfig, UsageEstimateConfig},
+    report::{aggregate, build, Filters, GroupBy, Query, RangeSpec},
     Journal, RecordingProvider, Tokens, UsageMeta, UsageRecord, RECORD_VERSION, USAGE_DIR,
 };
 use crate::accounts::AccountKey;
@@ -59,7 +60,24 @@ fn rec(
 }
 
 fn toks(input: u64, output: u64, cache_read: u64, cache_write: u64, reasoning: u64) -> Tokens {
-    Tokens { input, output, cache_read, cache_write, reasoning, total_tokens: input + output + cache_read + cache_write }
+    let mut t = Tokens { input, output, cache_read, cache_write, cache_write_5m: cache_write, reasoning, total_tokens: input + output + cache_read + cache_write, ..Default::default() };
+    t.normalize(true);
+    t
+}
+
+fn toks_openai(input: u64, output: u64, cached: u64, write_30m: u64, write_12h: u64, reasoning: u64) -> Tokens {
+    Tokens {
+        input,
+        output,
+        cache_read: cached,
+        cache_write: write_30m + write_12h,
+        cache_write_30m: write_30m,
+        cache_write_12h: write_12h,
+        reasoning,
+        // OpenAI total is prompt + completion; prompt already includes cache read/write.
+        total_tokens: input + output,
+        ..Default::default()
+    }
 }
 
 fn offset_hours(h: i32) -> FixedOffset {
@@ -71,7 +89,7 @@ fn journal_appends_survives_reopen_and_ignores_torn_and_corrupt_lines() {
     let dir = tmp();
     let journal = Journal::new(dir.join(USAGE_DIR));
     let a = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", toks(10, 2, 0, 0, 0));
-    let b = record(2, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks(3, 4, 1, 0, 2));
+    let b = record(2, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks_openai(3, 4, 1, 0, 0, 2));
     journal.append(&a).unwrap();
     journal.append(&b).unwrap();
 
@@ -207,56 +225,144 @@ fn aggregation_groups_filters_and_empty_range() {
     let records = vec![
         rec(t1, day, "anthropic", "work", "claude-opus-5-5", toks(10, 5, 20, 3, 0), 1, false, false, Some("coder"), Some("s1"), "bot-a"),
         rec(t2, day, "anthropic", "my", "claude-opus-5-5", toks(2, 1, 0, 0, 0), 2, true, false, Some("coder"), Some("s2"), "bot-a"),
-        rec(t2 + 1, day, "openai", "default", "gpt-6.1-sol", toks(8, 8, 4, 0, 3), 1, false, true, Some("reviewer"), Some("s3"), "bot-b"),
+        rec(t2 + 1, day, "openai", "default", "gpt-6.1-sol", toks_openai(8, 8, 4, 0, 0, 3), 1, false, true, Some("reviewer"), Some("s3"), "bot-b"),
         rec(t3, "2026-11-15", "anthropic", "work", "claude-opus-5-5", toks(100, 0, 0, 0, 0), 1, false, false, Some("coder"), Some("s1"), "bot-a"),
     ];
     let range = RangeSpec::Today.resolve(&now).unwrap();
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Account], filters: Filters::default() };
-    let (groups, total) = aggregate(&records, &range, &query, &tz, &UsageEstimateConfig::default());
+    let (groups, total) = aggregate(&records, &range, &query, &tz, &PricingConfig::default().merge_legacy(&UsageEstimateConfig::default()));
     assert_eq!(total.requests, 3);
     assert_eq!(total.tokens.input, 20);
     assert_eq!(total.retried, 1);
     assert_eq!(total.failed, 1);
     assert_eq!(groups.len(), 3);
-    assert_eq!(total.estimated_cost_usd, None);
+    assert!(total.est_cost.is_some(), "official table should price opus-5-5 and gpt-6.1-sol");
+    assert_eq!(total.unpriced_requests, Some(0));
+    // uncached: anthro 10+2, openai 8-4=4 → 16; cacheRead 20+0+4=24; cacheWrite 3; hit = 24/43
+    assert!((total.cache_hit_rate.unwrap() - 24.0 / 43.0).abs() < 1e-12);
 
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Account, GroupBy::Model], filters: Filters { account: Some("anthropic/work".into()), ..Default::default() } };
     let range = query.range.resolve(&now).unwrap();
-    let (groups, total) = aggregate(&records, &range, &query, &tz, &UsageEstimateConfig::default());
+    let (groups, total) = aggregate(&records, &range, &query, &tz, &PricingConfig::default().merge_legacy(&UsageEstimateConfig::default()));
     assert_eq!(total.requests, 1);
     assert_eq!(groups[0].key.get("account").unwrap(), "anthropic/work");
     assert_eq!(total.tokens.input, 10);
 
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Day], filters: Filters::default() };
-    let report = build(&query, &now, "Asia/Shanghai", None, &UsageEstimateConfig::default()).unwrap();
+    let report = build(&query, &now, "Asia/Shanghai", None, &PricingConfig::default()).unwrap();
     assert_eq!(report.total.requests, 0);
     assert_eq!(report.timezone, "Asia/Shanghai");
     assert_eq!(report.groups.len(), 0);
 }
 
 #[test]
-fn estimate_costs_and_config_validation() {
-    let mut prices = std::collections::BTreeMap::new();
-    prices.insert("anthropic/claude-opus-5-5".into(), ModelPrice { input: 5.0, output: 25.0, cache_read: Some(0.5), cache_write: Some(6.25), reasoning: None });
-    prices.insert("openai/gpt-6.1-sol".into(), ModelPrice { input: 2.0, output: 10.0, cache_read: Some(0.2), cache_write: None, reasoning: Some(10.0) });
-    let estimate = UsageEstimateConfig { enabled: true, prices_usd_per_million: prices };
-    estimate.validate("usageEstimate").unwrap();
+fn estimate_costs_official_table_overrides_and_validation() {
+    let pricing = PricingConfig::default().merge_legacy(&UsageEstimateConfig::default());
+    pricing.validate("pricing.models").unwrap();
 
-    // Anthropic: input excludes cache; 100 uncached * 5 + 50 cacheRead * 0.5 + 20 cacheWrite * 6.25 + 10 output * 25
-    // = 500 + 25 + 125 + 250 = 900 / 1e6
-    let anthro = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", toks(100, 10, 50, 20, 0));
-    assert!((estimate.cost(&anthro).unwrap() - 0.0009).abs() < 1e-12);
+    // Official Opus 5.5 (2026-11-16): input $4, output $20, cacheRead $0.20, 5m write $5.
+    // 100*4 + 50*0.20 + 20*5 + 10*20 = 400 + 10 + 100 + 200 = 710 / 1e6
+    let anthro_toks = toks(100, 10, 50, 20, 0);
+    assert_eq!(anthro_toks.cache_write_5m, 20);
+    let anthro = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", anthro_toks);
+    let cost = pricing.cost(&anthro).unwrap();
+    assert!((cost.input_cost - 0.0004).abs() < 1e-12);
+    assert!((cost.cache_read_cost - 0.000010).abs() < 1e-12);
+    assert!((cost.cache_write_cost - 0.0001).abs() < 1e-12);
+    assert!((cost.output_cost - 0.0002).abs() < 1e-12);
+    assert!((cost.total() - 0.00071).abs() < 1e-12);
 
-    // OpenAI: input includes cache; uncached = 100-40=60 * 2 + 40*0.2 + (80-30)*10 + 30*10
-    // = 120 + 8 + 500 + 300 = 928 / 1e6
-    let openai = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks(100, 80, 40, 0, 30));
-    assert!((estimate.cost(&openai).unwrap() - 0.000928).abs() < 1e-12);
+    // 1h writes use the 1h rate ($8 / MTok on opus 5.5).
+    let split = Tokens { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 20, cache_write: 20, total_tokens: 20, ..Default::default() };
+    let anthro_1h = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", split);
+    assert!((pricing.cost(&anthro_1h).unwrap().cache_write_cost - 0.00016).abs() < 1e-12);
 
-    let disabled = UsageEstimateConfig { enabled: false, prices_usd_per_million: estimate.prices_usd_per_million.clone() };
+    // Official gpt-6.1-sol: input $2, cached $0.10, output $10. prompt=100 includes 40 cached, 0 writes.
+    // uncached 60*2 + 40*0.10 + 80*10 = 120 + 4 + 800 = 924 / 1e6
+    let openai = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks_openai(100, 80, 40, 0, 0, 30));
+    let cost = pricing.cost(&openai).unwrap();
+    assert!((cost.input_cost - 0.00012).abs() < 1e-12);
+    assert!((cost.cache_read_cost - 0.000004).abs() < 1e-12);
+    assert!((cost.output_cost - 0.0008).abs() < 1e-12);
+    assert!((cost.total() - 0.000924).abs() < 1e-12);
+    // reasoning is already in output and is billed at the output rate (not added again).
+    assert_eq!(cost.output_cost, 80.0 * 10.0 / 1e6);
+
+    // OpenAI writes without a 30m/12h split cannot be priced (would invent a TTL).
+    let unsplit = Tokens { input: 100, output: 0, cache_write: 10, total_tokens: 100, ..Default::default() };
+    let openai_unsplit = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", unsplit);
+    assert!(pricing.cost(&openai_unsplit).is_none());
+
+    // OpenAI 30m writes at $2.50 / MTok (gpt-6.1-sol short context).
+    let with_write = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks_openai(100, 0, 0, 20, 0, 0));
+    // uncached = 100-20=80 * 2, write 20*2.50 → 160 + 50 = 210 / 1e6
+    assert!((pricing.cost(&with_write).unwrap().total() - 0.000210).abs() < 1e-12);
+
+    // Haiku 5.5 long-context tier: prompt over 100,000 tokens uses the higher rates.
+    let short = record(1, "2026-11-16", "anthropic", "my", "claude-haiku-5-5", toks(100_000, 0, 0, 0, 0));
+    assert!((pricing.cost(&short).unwrap().input_cost - 0.01).abs() < 1e-12); // 100k * 0.10 / 1e6
+    let long = record(1, "2026-11-16", "anthropic", "my", "claude-haiku-5-5", toks(100_001, 0, 0, 0, 0));
+    assert!((pricing.cost(&long).unwrap().input_cost - 0.0500005).abs() < 1e-12); // 100001 * 0.50 / 1e6
+
+    // Snapshot suffix still matches the official row.
+    let snap = record(1, "2026-11-16", "anthropic", "my", "claude-opus-5-5-20261101", toks(1_000_000, 0, 0, 0, 0));
+    assert!((pricing.cost(&snap).unwrap().input_cost - 4.0).abs() < 1e-12);
+
+    // Unknown model is unpriced (never invent a rate).
+    let unknown = record(1, "2026-11-16", "anthropic", "my", "claude-secret-model", toks(10, 0, 0, 0, 0));
+    assert!(pricing.cost(&unknown).is_none());
+
+    // User override replaces the official row.
+    let mut models = std::collections::BTreeMap::new();
+    models.insert(
+        "anthropic/claude-opus-5-5".into(),
+        ModelPrice {
+            input: 1.0,
+            output: 2.0,
+            cache_read: Some(0.1),
+            cache_write_5m: Some(1.25),
+            cache_write_1h: None,
+            cache_write_30m: None,
+            cache_write_12h: None,
+            reasoning: None,
+            long_context: None,
+        },
+    );
+    let overridden = PricingConfig { enabled: true, models: models.clone() }.merge_legacy(&UsageEstimateConfig::default());
+    // merge_legacy applies official first then models, so override wins.
+    let cost = overridden.cost(&anthro).unwrap();
+    // 100*1 + 50*0.1 + 20*1.25 + 10*2 = 100 + 5 + 25 + 20 = 150 / 1e6
+    assert!((cost.total() - 0.00015).abs() < 1e-12);
+
+    let disabled = PricingConfig { enabled: false, models: Default::default() };
     assert!(disabled.cost(&anthro).is_none());
 
-    let bad = UsageEstimateConfig { enabled: false, prices_usd_per_million: [("opus".into(), ModelPrice { input: 1.0, output: 1.0, ..Default::default() })].into() };
-    assert!(bad.validate("usageEstimate").unwrap_err().to_string().contains("provider/model"));
+    let bad = UsageEstimateConfig {
+        enabled: None,
+        prices_usd_per_million: [(
+            "opus".into(),
+            ModelPrice { input: 1.0, output: 1.0, cache_read: None, cache_write_5m: None, cache_write_1h: None, cache_write_30m: None, cache_write_12h: None, reasoning: None, long_context: None },
+        )]
+        .into(),
+    };
+    assert!(PricingConfig::validate_legacy(&bad, "usageEstimate.pricesUsdPerMillion").unwrap_err().to_string().contains("provider/model"));
+
+    // cache hit rate: Anthropic 50 / (100+50+20) = 50/170; OpenAI 40 / (60+40+0) = 40/100
+    assert!((prices::cache_hit_rate("anthropic", &anthro.tokens).unwrap() - 50.0 / 170.0).abs() < 1e-12);
+    assert!((prices::cache_hit_rate("openai", &openai.tokens).unwrap() - 0.4).abs() < 1e-12);
+}
+
+#[test]
+fn old_records_without_cache_write_split_count_as_5m() {
+    let dir = tmp();
+    let path = dir.join(USAGE_DIR);
+    std::fs::create_dir_all(&path).unwrap();
+    // Pre-0.12.0 line: cacheWrite only.
+    std::fs::write(path.join("2026-11-16.jsonl"), concat!(r#"{"v":1,"ts":1,"time":"","day":"2026-11-16","provider":"anthropic","account":"my","model":"claude-opus-5-5","caller":"local","attempt":1,"retry":false,"discarded":false,"failed":false,"tokens":{"input":0,"output":0,"cacheRead":0,"cacheWrite":15,"reasoning":0,"totalTokens":15}}"#, "\n")).unwrap();
+    let loaded = super::load(&path, None, None).unwrap();
+    assert_eq!(loaded.records[0].tokens.cache_write, 15);
+    assert_eq!(loaded.records[0].tokens.cache_write_5m, 15);
+    assert_eq!(loaded.records[0].tokens.cache_write_1h, 0);
 }
 
 struct Scripted {
@@ -276,7 +382,7 @@ impl Provider for Scripted {
 }
 
 fn usage(input: u64, output: u64, cache_read: u64, cache_write: u64) -> Usage {
-    Usage { input, output, cache_read, cache_write, total_tokens: input + output + cache_read + cache_write, reasoning: 0 }
+    Usage { input, output, cache_read, cache_write, cache_write_5m: cache_write, total_tokens: input + output + cache_read + cache_write, reasoning: 0, ..Default::default() }
 }
 
 fn done(model: &str, u: Usage, failed: bool) -> AssistantEvent {
@@ -366,7 +472,7 @@ fn missing_usage_dir_builds_empty_report() {
     let tz = offset_hours(-6);
     let now = tz.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
     let query = Query { range: RangeSpec::Today, by: GroupBy::parse_list(&["account"]).unwrap(), filters: Filters::default() };
-    let report = build(&query, &now, "America/Winnipeg", None, &UsageEstimateConfig::default()).unwrap();
+    let report = build(&query, &now, "America/Winnipeg", None, &PricingConfig::default()).unwrap();
     assert_eq!(report.total.requests, 0);
     assert_eq!(report.groups.len(), 0);
 }

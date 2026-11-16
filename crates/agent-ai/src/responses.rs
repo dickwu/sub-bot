@@ -95,11 +95,7 @@ impl StreamState {
 
     fn read_usage(&mut self, u: &Value) {
         if u.is_object() {
-            self.msg.usage.input = u["input_tokens"].as_u64().unwrap_or(0);
-            self.msg.usage.output = u["output_tokens"].as_u64().unwrap_or(0);
-            self.msg.usage.cache_read = u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-            self.msg.usage.reasoning = u["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
-            self.msg.usage.total_tokens = u["total_tokens"].as_u64().unwrap_or(self.msg.usage.input + self.msg.usage.output);
+            self.msg.usage.apply_openai_responses(u);
         }
     }
 

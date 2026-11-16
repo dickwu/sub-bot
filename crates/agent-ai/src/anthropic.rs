@@ -319,21 +319,7 @@ impl StreamState {
     }
 
     fn usage(&mut self, usage: &Value) {
-        let u = &mut self.message.usage;
-        if let Some(n) = usage["input_tokens"].as_u64() {
-            u.input = n;
-        }
-        if let Some(n) = usage["output_tokens"].as_u64() {
-            u.output = n;
-        }
-        if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
-            u.cache_read = n;
-        }
-        if let Some(n) = usage["cache_creation_input_tokens"].as_u64() {
-            u.cache_write = n;
-        }
-        // Anthropic's input_tokens excludes cache reads/writes, unlike OpenAI's prompt_tokens.
-        u.total_tokens = u.input.saturating_add(u.output).saturating_add(u.cache_read).saturating_add(u.cache_write);
+        self.message.usage.apply_anthropic(usage);
     }
 
     fn on_event(&mut self, value: &Value, out: &mut Vec<AssistantEvent>) -> Result<(), CallError> {

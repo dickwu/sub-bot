@@ -1,11 +1,8 @@
 {
   "dataDir": "/var/lib/sub-bot",
-  "usageEstimate": {
-    "enabled": false,
-    "pricesUsdPerMillion": {
-      "anthropic/claude-opus-5-5": {"input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25},
-      "openai/gpt-6.1-sol": {"input": 1.75, "output": 14.0, "cached": 0.175, "reasoning": 14.0}
-    }
+  "pricing": {
+    "enabled": true,
+    "models": {}
   },
   "shutdownGraceSecs": 10,
   "defaultProvider": "openai",

@@ -1,4 +1,4 @@
-//! 本地用量统计（v0.11.0）：每次 LLM 调用 provider 返回的 `Usage` 追加写入 `<dataDir>/usage/YYYY-MM-DD.jsonl`。
+//! 本地用量统计（v0.12.0）：每次 LLM 调用 provider 返回的 `Usage` 追加写入 `<dataDir>/usage/YYYY-MM-DD.jsonl`。
 //!
 //! - 记录点：会话的每个账号 provider 外面包一层 [`RecordingProvider`]（在 `FailoverProvider` 链内，账号归属准确），
 //!   观察 `Done` / `Error` / `Retry` 事件；覆盖 run / ask / rpc / serve 的回合调用、压缩摘要调用和路由分类调用。
@@ -8,6 +8,7 @@
 //!   独占锁里，`run` / `ask` 可与 `serve` 同时写。历史从不压缩改写。
 //! - 读取（[`load`]）：缺文件 = 空；最后一行被截断（崩溃）则忽略；损坏的完整行跳过并计数，其余照常统计。
 pub mod cli;
+pub mod prices;
 pub mod report;
 #[cfg(test)]
 mod tests;
@@ -41,14 +42,50 @@ pub struct Tokens {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_5m: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_30m: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_12h: u64,
     /// 推理 token（OpenAI 计入 output）
     pub reasoning: u64,
     pub total_tokens: u64,
 }
 
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+/// Cache-write tokens split by TTL. `unsplit` is a write total with no TTL breakdown
+/// (must not be priced by guessing a lifetime).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteBuckets {
+    pub t5m: u64,
+    pub t1h: u64,
+    pub t30m: u64,
+    pub t12h: u64,
+    pub unsplit: u64,
+}
+
 impl From<&Usage> for Tokens {
     fn from(u: &Usage) -> Self {
-        Self { input: u.input, output: u.output, cache_read: u.cache_read, cache_write: u.cache_write, reasoning: u.reasoning, total_tokens: u.total_tokens }
+        let mut t = Self {
+            input: u.input,
+            output: u.output,
+            cache_read: u.cache_read,
+            cache_write: u.cache_write,
+            cache_write_5m: u.cache_write_5m,
+            cache_write_1h: u.cache_write_1h,
+            cache_write_30m: u.cache_write_30m,
+            cache_write_12h: u.cache_write_12h,
+            reasoning: u.reasoning,
+            total_tokens: u.total_tokens,
+        };
+        t.normalize(false);
+        t
     }
 }
 
@@ -58,8 +95,38 @@ impl Tokens {
         self.output = self.output.saturating_add(other.output);
         self.cache_read = self.cache_read.saturating_add(other.cache_read);
         self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.cache_write_5m = self.cache_write_5m.saturating_add(other.cache_write_5m);
+        self.cache_write_1h = self.cache_write_1h.saturating_add(other.cache_write_1h);
+        self.cache_write_30m = self.cache_write_30m.saturating_add(other.cache_write_30m);
+        self.cache_write_12h = self.cache_write_12h.saturating_add(other.cache_write_12h);
         self.reasoning = self.reasoning.saturating_add(other.reasoning);
         self.total_tokens = self.total_tokens.saturating_add(other.total_tokens);
+    }
+
+    pub fn cache_write_total(&self) -> u64 {
+        let split = self.cache_write_5m.saturating_add(self.cache_write_1h).saturating_add(self.cache_write_30m).saturating_add(self.cache_write_12h);
+        if split > 0 {
+            split
+        } else {
+            self.cache_write
+        }
+    }
+
+    pub fn write_buckets(&self) -> WriteBuckets {
+        let split = self.cache_write_5m.saturating_add(self.cache_write_1h).saturating_add(self.cache_write_30m).saturating_add(self.cache_write_12h);
+        WriteBuckets { t5m: self.cache_write_5m, t1h: self.cache_write_1h, t30m: self.cache_write_30m, t12h: self.cache_write_12h, unsplit: self.cache_write.saturating_sub(split) }
+    }
+
+    /// Fill missing TTL buckets. Anthropic records whose only write field is `cacheWrite`
+    /// are counted as 5-minute writes (the historical default). OpenAI unsplit writes are
+    /// left in `unsplit` so cost estimates do not invent a 30m vs 12h rate.
+    pub fn normalize(&mut self, unsplit_is_5m: bool) {
+        let split = self.cache_write_5m.saturating_add(self.cache_write_1h).saturating_add(self.cache_write_30m).saturating_add(self.cache_write_12h);
+        if split > 0 {
+            self.cache_write = split;
+        } else if unsplit_is_5m && self.cache_write > 0 {
+            self.cache_write_5m = self.cache_write;
+        }
     }
 }
 
@@ -110,6 +177,10 @@ impl UsageRecord {
     /// `provider/account`：聚合键。
     pub fn account_label(&self) -> String {
         format!("{}/{}", self.provider, self.account)
+    }
+
+    pub fn normalize(&mut self) {
+        self.tokens.normalize(self.provider == "anthropic");
     }
 }
 
@@ -373,7 +444,10 @@ fn parse_lines(bytes: &[u8], records: &mut Vec<UsageRecord>) -> (usize, usize) {
             continue;
         }
         match serde_json::from_slice::<UsageRecord>(line) {
-            Ok(record) => records.push(record),
+            Ok(mut record) => {
+                record.normalize();
+                records.push(record);
+            }
             Err(_) => corrupt += 1,
         }
     }

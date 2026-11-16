@@ -451,11 +451,7 @@ async fn parse_chat_into(resp: reqwest::Response, msg: &mut AssistantMessage, tx
                 return Err(redact(&format!("OpenAI stream error: {e}")));
             }
             if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-                msg.usage.cache_read = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-                msg.usage.input = u["prompt_tokens"].as_u64().unwrap_or(0);
-                msg.usage.output = u["completion_tokens"].as_u64().unwrap_or(0);
-                msg.usage.total_tokens = u["total_tokens"].as_u64().unwrap_or(0);
-                msg.usage.reasoning = u["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
+                msg.usage.apply_openai_chat(u);
             }
             let Some(choice) = v["choices"].get(0) else {
                 continue;

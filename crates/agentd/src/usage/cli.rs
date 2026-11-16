@@ -1,6 +1,6 @@
 //! CLI `sub-bot usage` 与 HTTP `GET /v1/usage`：解析时间范围 / 分组 / 过滤，生成同一份 [`super::report::Report`]。
-//! CLI 不构造 Hub、不加载 provider 或 webhook 的密钥文件，只读 dataDir 与可选的 `usageEstimate`。
-use super::report::{build_local, Filters, GroupBy, Query, RangeSpec, Report, Totals, UsageEstimateConfig, MAX_DAYS};
+//! CLI 不构造 Hub、不加载 provider 或 webhook 的密钥文件，只读 dataDir 与 `pricing`（及已弃用的 `usageEstimate` 覆盖）。
+use super::report::{build_local, Filters, GroupBy, PricingConfig, Query, RangeSpec, Report, Totals, UsageEstimateConfig, MAX_DAYS};
 use anyhow::{Context, Result};
 use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
@@ -68,28 +68,31 @@ fn query(today: bool, month: bool, days: Option<u32>, since: Option<String>, unt
     Ok(Query { range: RangeSpec::from_flags(today, month, days, since, until)?, by: GroupBy::parse_list(by)?, filters })
 }
 
-/// 只读配置里的 dataDir 与 usageEstimate，不解析密钥文件、不校验整个配置。
+/// 只读配置里的 dataDir 与 pricing，不解析密钥文件、不校验整个配置。
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UsageFile {
     data_dir: Option<PathBuf>,
     #[serde(default)]
+    pricing: PricingConfig,
+    #[serde(default)]
     usage_estimate: UsageEstimateConfig,
 }
 
 /// 解析 dataDir（`--data-dir` > 配置 `dataDir` > 默认数据目录）与估测配置。
-pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<(PathBuf, UsageEstimateConfig)> {
+pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<(PathBuf, PricingConfig)> {
     let file = match config_path {
         Some(path) => {
             let text = std::fs::read_to_string(path).with_context(|| format!("cannot read configuration {}", path.display()))?;
             let file: UsageFile = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
-            file.usage_estimate.validate("usageEstimate")?;
+            file.pricing.validate("pricing.models")?;
+            PricingConfig::validate_legacy(&file.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
             file
         }
         None => UsageFile::default(),
     };
     let dir = data_dir.or(file.data_dir).unwrap_or_else(crate::config::Config::default_data_dir);
-    Ok((dir, file.usage_estimate))
+    Ok((dir, file.pricing.merge_legacy(&file.usage_estimate)))
 }
 
 pub fn run(args: &Usage, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
@@ -165,7 +168,7 @@ impl UsageParams {
     }
 }
 
-/// 已运行的服务：用配置的 dataDir 与 usageEstimate 出报表。
+/// 已运行的服务：用配置的 dataDir 与 pricing 出报表。
 pub fn report_for_hub(hub: &crate::hub::Hub, params: &UsageParams) -> Result<Report> {
     let query = params.query()?;
     let dir = hub.config.data_dir().join(super::USAGE_DIR);
@@ -177,29 +180,32 @@ pub fn report_for_hub(hub: &crate::hub::Hub, params: &UsageParams) -> Result<Rep
         model = query.filters.model.as_deref().unwrap_or("-"),
         "usage report requested"
     );
-    build_local(&query, dir.is_dir().then_some(dir.as_path()), &hub.config.usage_estimate)
+    build_local(&query, dir.is_dir().then_some(dir.as_path()), &hub.config.effective_pricing())
 }
 
 fn print_table(report: &Report) {
     let estimate = report.estimate.is_some();
+    let show_unpriced = estimate && report.total.unpriced_requests.unwrap_or(0) > 0;
     let mut cols: Vec<String> = report.by.iter().map(|b| b.as_str().to_string()).collect();
-    cols.extend(["requests", "input", "output", "cacheRead", "cacheWrite", "reasoning", "total", "retried", "failed"].iter().map(|s| (*s).to_string()));
+    cols.extend(["requests", "input", "output", "cacheRead", "cacheWrite", "cacheHit", "reasoning", "total", "retried", "failed"].iter().map(|s| (*s).to_string()));
     if estimate {
-        cols.push("estimatedCostUsd".into());
-        cols.push("unpriced".into());
+        cols.push("estCost".into());
+        if show_unpriced {
+            cols.push("unpriced".into());
+        }
     }
 
     let mut rows: Vec<Vec<String>> = vec![];
     for group in &report.groups {
         let mut row: Vec<String> = report.by.iter().map(|b| group.key.get(b.as_str()).cloned().unwrap_or_else(|| "-".into())).collect();
-        row.extend(totals_cells(&group.totals, estimate));
+        row.extend(totals_cells(&group.totals, estimate, show_unpriced));
         rows.push(row);
     }
     let mut total_row: Vec<String> = report.by.iter().enumerate().map(|(i, _)| if i == 0 { "total".into() } else { "".into() }).collect();
     if report.by.is_empty() {
         total_row.push("total".into());
     }
-    total_row.extend(totals_cells(&report.total, estimate));
+    total_row.extend(totals_cells(&report.total, estimate, show_unpriced));
 
     let mut widths: Vec<usize> = cols.iter().map(|c| c.len()).collect();
     for row in rows.iter().chain(std::iter::once(&total_row)) {
@@ -223,25 +229,32 @@ fn print_table(report: &Report) {
     }
     print_row(&total_row, &widths);
     if let Some(note) = &report.estimate {
-        println!("estimatedCostUsd is an estimate (估测) in {}; {}", note.currency, note.note);
+        println!("estCost is an estimate (估测) in {}, not a bill. {}", note.currency, note.note);
     }
 }
 
-fn totals_cells(t: &Totals, estimate: bool) -> Vec<String> {
+fn format_hit_rate(rate: Option<f64>) -> String {
+    rate.map(|r| format!("{:.1}%", r * 100.0)).unwrap_or_else(|| "-".into())
+}
+
+fn totals_cells(t: &Totals, estimate: bool, show_unpriced: bool) -> Vec<String> {
     let mut cells = vec![
         t.requests.to_string(),
         t.tokens.input.to_string(),
         t.tokens.output.to_string(),
         t.tokens.cache_read.to_string(),
         t.tokens.cache_write.to_string(),
+        format_hit_rate(t.cache_hit_rate),
         t.tokens.reasoning.to_string(),
         t.tokens.total_tokens.to_string(),
         t.retried.to_string(),
         t.failed.to_string(),
     ];
     if estimate {
-        cells.push(t.estimated_cost_usd.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".into()));
-        cells.push(t.unpriced_requests.map(|n| n.to_string()).unwrap_or_else(|| "0".into()));
+        cells.push(t.est_cost.map(|c| format!("{c:.6}")).unwrap_or_else(|| "-".into()));
+        if show_unpriced {
+            cells.push(t.unpriced_requests.map(|n| n.to_string()).unwrap_or_else(|| "0".into()));
+        }
     }
     cells
 }
@@ -250,7 +263,7 @@ fn print_row(cells: &[String], widths: &[usize]) {
     let mut out = Vec::new();
     for (cell, width) in cells.iter().zip(widths) {
         // 分组名（含 total）左对齐；纯数字 / 估测费用右对齐
-        let numeric = !cell.is_empty() && cell != "total" && cell.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-');
+        let numeric = !cell.is_empty() && cell != "total" && cell.chars().all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c == '%');
         if numeric {
             out.push(format!("{cell:>width$}"));
         } else {

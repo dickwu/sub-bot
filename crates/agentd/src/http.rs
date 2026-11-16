@@ -1798,7 +1798,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["total"]["requests"], 0);
         assert_eq!(body["range"]["kind"], "today");
-        assert!(body["estimate"].is_null());
+        assert_eq!(body["estimate"]["currency"], "USD");
+        assert!(body["estimate"]["note"].as_str().unwrap().contains("not a bill"));
 
         let now = chrono::Local::now();
         let day = now.format("%Y-%m-%d").to_string();
@@ -1819,7 +1820,7 @@ mod tests {
             retry: false,
             discarded,
             failed,
-            tokens: crate::usage::Tokens { input, output: 2, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: input + 2 },
+            tokens: crate::usage::Tokens { input, output: 2, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: input + 2, ..Default::default() },
         };
         journal.append(&rec("work", "claude-opus-5-5", 10, false, false)).unwrap();
         journal.append(&rec("my", "claude-sonnet-5-5", 3, false, true)).unwrap();
@@ -1830,6 +1831,12 @@ mod tests {
         assert_eq!(body["total"]["input"], 13);
         assert_eq!(body["total"]["failed"], 1);
         assert_eq!(body["groups"].as_array().unwrap().len(), 2);
+        assert!(body["total"]["estCost"].is_number(), "official prices should cover opus-5-5 and sonnet-5-5");
+        assert!(body["total"]["inputCost"].is_number());
+        assert!(body["total"]["outputCost"].is_number());
+        assert!(body["total"]["cacheReadCost"].is_number());
+        assert!(body["total"]["cacheWriteCost"].is_number());
+        assert!(body["total"]["cacheHitRate"].is_number() || body["total"].get("cacheHitRate").is_none());
 
         let (status, body) = request(&app, "GET", "/v1/usage?account=anthropic/work", Some("other-token"), json!({})).await;
         assert_eq!(status, StatusCode::OK);

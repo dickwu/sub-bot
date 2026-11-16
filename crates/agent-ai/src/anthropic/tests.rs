@@ -119,7 +119,10 @@ async fn text_stream_and_cache_usage() {
     let message = done(&events);
     assert_eq!(message.text(), "你好 world");
     assert_eq!(message.stop_reason, StopReason::Stop);
-    assert_eq!((message.usage.input, message.usage.output, message.usage.cache_read, message.usage.cache_write, message.usage.total_tokens), (10, 5, 20, 30, 65));
+    assert_eq!(
+        (message.usage.input, message.usage.output, message.usage.cache_read, message.usage.cache_write, message.usage.cache_write_5m, message.usage.cache_write_1h, message.usage.total_tokens),
+        (10, 5, 20, 30, 30, 0, 65)
+    );
     assert!(message.api.is_none());
 }
 

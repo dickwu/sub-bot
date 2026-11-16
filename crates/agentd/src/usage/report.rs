@@ -1,10 +1,13 @@
-//! 用量报表：时间范围、过滤、分组聚合与可选的估测费用。CLI `sub-bot usage` 与 HTTP `GET /v1/usage` 共用，
+//! 用量报表：时间范围、过滤、分组聚合与估测费用。CLI `sub-bot usage` 与 HTTP `GET /v1/usage` 共用，
 //! 输出同一个 JSON 结构（[`Report`]）。时间计算对时区泛型（生产用 `chrono::Local`，测试用固定偏移）。
+use super::prices::{self, cache_hit_rate_from_parts, CostBreakdown};
 use super::{Tokens, UsageRecord};
 use anyhow::{bail, ensure, Result};
 use chrono::{DateTime, Datelike, Days, Months, NaiveDate, TimeZone};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::BTreeMap;
+
+pub use super::prices::{PricingConfig, UsageEstimateConfig};
 
 /// `--days` / `days` 的上限（约 100 年）。
 pub const MAX_DAYS: u32 = 36_600;
@@ -248,62 +251,13 @@ impl Filters {
     }
 }
 
-/// 配置 `usageEstimate`：按 `provider/model` 的单价（美元 / 百万 token）估测费用。默认关闭。只是估测，
-/// 不代表账单（不含批量/区域/阶梯定价、长上下文加价等）。
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UsageEstimateConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub prices_usd_per_million: BTreeMap<String, ModelPrice>,
-}
-
-/// 单价（美元 / 百万 token）。`input` / `output` 必填；`cacheRead`（别名 `cached`）与 `cacheWrite` 默认按 `input`，
-/// `reasoning` 默认按 `output`（推理 token 包含在 output 里，设置后这部分改按该价计）。
-#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ModelPrice {
-    pub input: f64,
-    pub output: f64,
-    #[serde(default, alias = "cached")]
-    pub cache_read: Option<f64>,
-    #[serde(default)]
-    pub cache_write: Option<f64>,
-    #[serde(default)]
-    pub reasoning: Option<f64>,
-}
-
-impl UsageEstimateConfig {
-    pub fn validate(&self, at: &str) -> Result<()> {
-        for (key, price) in &self.prices_usd_per_million {
-            let valid_key = key.split_once('/').is_some_and(|(p, m)| !p.trim().is_empty() && !m.trim().is_empty());
-            ensure!(valid_key, "{at}.pricesUsdPerMillion: key '{key}' must be 'provider/model'");
-            for (name, value) in [("input", Some(price.input)), ("output", Some(price.output)), ("cacheRead", price.cache_read), ("cacheWrite", price.cache_write), ("reasoning", price.reasoning)] {
-                if let Some(v) = value {
-                    ensure!(v.is_finite() && v >= 0.0, "{at}.pricesUsdPerMillion.{key}.{name} must be a non-negative number");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// 一条记录的估测费用（美元）；关闭或该模型没有单价 ⇒ None。
-    pub fn cost(&self, r: &UsageRecord) -> Option<f64> {
+impl PricingConfig {
+    /// 一条记录的估测费用；关闭、没有单价、或无法在不猜 TTL 的情况下定价 ⇒ None。
+    pub fn cost(&self, r: &UsageRecord) -> Option<CostBreakdown> {
         if !self.enabled {
             return None;
         }
-        let price = self.prices_usd_per_million.get(&format!("{}/{}", r.provider, r.model))?;
-        let t = &r.tokens;
-        // OpenAI 的 input（prompt_tokens）包含缓存命中部分；Anthropic 的 input_tokens 不含缓存读写。
-        let uncached = if r.provider == "anthropic" { t.input } else { t.input.saturating_sub(t.cache_read) };
-        let reasoning = t.reasoning.min(t.output);
-        let cost = uncached as f64 * price.input
-            + t.cache_read as f64 * price.cache_read.unwrap_or(price.input)
-            + t.cache_write as f64 * price.cache_write.unwrap_or(price.input)
-            + (t.output - reasoning) as f64 * price.output
-            + reasoning as f64 * price.reasoning.unwrap_or(price.output);
-        Some(cost / 1_000_000.0)
+        prices::estimate_record(&self.resolved(), &r.provider, &r.model, &r.tokens)
     }
 }
 
@@ -317,34 +271,56 @@ pub struct Totals {
     pub tokens: Tokens,
     pub retried: u64,
     pub failed: u64,
-    /// 估测费用（美元）；只在 usageEstimate 开启且本组每条记录的模型都有单价时出现
+    /// cacheRead / (uncached input + cacheRead + cacheWrite); None when the denominator is 0.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_cost_usd: Option<f64>,
-    /// usageEstimate 开启时：本组没有单价的记录数
+    pub cache_hit_rate: Option<f64>,
+    /// Estimated USD cost; present only when every request in the group has a price.
+    #[serde(rename = "estCost", skip_serializing_if = "Option::is_none")]
+    pub est_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write_cost: Option<f64>,
+    /// Requests that could not be priced (unknown model, or OpenAI writes without a TTL split).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unpriced_requests: Option<u64>,
     #[serde(skip)]
-    cost: f64,
+    breakdown: CostBreakdown,
     #[serde(skip)]
     unpriced: u64,
+    #[serde(skip)]
+    uncached_input: u64,
 }
 
 impl Totals {
-    fn add(&mut self, r: &UsageRecord, cost: Option<f64>) {
+    fn add(&mut self, r: &UsageRecord, cost: Option<CostBreakdown>) {
         self.requests += 1;
         self.tokens.add(&r.tokens);
+        self.uncached_input = self.uncached_input.saturating_add(prices::uncached_input(&r.provider, &r.tokens));
         self.retried += u64::from(r.discarded);
         self.failed += u64::from(r.failed);
         match cost {
-            Some(c) => self.cost += c,
+            Some(c) => self.breakdown.add(c),
             None => self.unpriced += 1,
         }
     }
 
     fn finish(&mut self, estimate: bool) {
+        self.cache_hit_rate = cache_hit_rate_from_parts(self.uncached_input, self.tokens.cache_read, self.tokens.cache_write_total());
         if estimate {
             self.unpriced_requests = Some(self.unpriced);
-            self.estimated_cost_usd = (self.unpriced == 0).then(|| (self.cost * 1e6).round() / 1e6);
+            if self.unpriced == 0 && self.requests > 0 {
+                let b = self.breakdown.rounded();
+                self.est_cost = Some((b.total() * 1e6).round() / 1e6);
+                self.input_cost = Some(b.input_cost);
+                self.output_cost = Some(b.output_cost);
+                self.cache_read_cost = Some(b.cache_read_cost);
+                self.cache_write_cost = Some(b.cache_write_cost);
+            }
         }
     }
 }
@@ -388,7 +364,7 @@ pub struct Report {
     pub total: Totals,
     /// 跳过的损坏行数
     pub skipped_lines: usize,
-    /// 估测费用说明（usageEstimate 开启时）
+    /// 估测费用说明（标明不是账单，并记录价格表来源）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimate: Option<EstimateNote>,
 }
@@ -402,23 +378,23 @@ pub struct Query {
 }
 
 /// 聚合内存中的记录（范围、过滤已在此完成）。
-pub fn aggregate<Tz: TimeZone>(records: &[UsageRecord], range: &Range, query: &Query, tz: &Tz, estimate: &UsageEstimateConfig) -> (Vec<Group>, Totals)
+pub fn aggregate<Tz: TimeZone>(records: &[UsageRecord], range: &Range, query: &Query, tz: &Tz, pricing: &PricingConfig) -> (Vec<Group>, Totals)
 where
     Tz::Offset: std::fmt::Display,
 {
     let mut groups: BTreeMap<Vec<String>, Totals> = BTreeMap::new();
     let mut total = Totals::default();
     for r in records.iter().filter(|r| range.contains(r.ts) && query.filters.matches(r)) {
-        let cost = estimate.cost(r);
+        let cost = pricing.cost(r);
         let key: Vec<String> = query.by.iter().map(|b| b.key(r, tz)).collect();
         groups.entry(key).or_default().add(r, cost);
         total.add(r, cost);
     }
-    total.finish(estimate.enabled);
+    total.finish(pricing.enabled);
     let groups = groups
         .into_iter()
         .map(|(values, mut totals)| {
-            totals.finish(estimate.enabled);
+            totals.finish(pricing.enabled);
             Group { key: query.by.iter().map(|b| b.as_str()).zip(values).collect(), totals }
         })
         .collect();
@@ -426,7 +402,7 @@ where
 }
 
 /// 解析范围、读取日文件（`dir` 为 None ⇒ 没有记录）、聚合。
-pub fn build<Tz: TimeZone>(query: &Query, now: &DateTime<Tz>, timezone: &str, dir: Option<&std::path::Path>, estimate: &UsageEstimateConfig) -> Result<Report>
+pub fn build<Tz: TimeZone>(query: &Query, now: &DateTime<Tz>, timezone: &str, dir: Option<&std::path::Path>, pricing: &PricingConfig) -> Result<Report>
 where
     Tz::Offset: std::fmt::Display,
 {
@@ -440,7 +416,7 @@ where
         }
         None => super::Loaded::default(),
     };
-    let (groups, total) = aggregate(&loaded.records, &range, query, &tz, estimate);
+    let (groups, total) = aggregate(&loaded.records, &range, query, &tz, pricing);
     Ok(Report {
         range: RangeOut { kind: range.kind, days: range.days, since: range.since.clone(), until: range.until.clone() },
         timezone: timezone.to_string(),
@@ -450,7 +426,10 @@ where
         groups,
         total,
         skipped_lines: loaded.corrupt_lines,
-        estimate: estimate.enabled.then_some(EstimateNote { currency: "USD", note: "estimate (估测) from usageEstimate.pricesUsdPerMillion; not a bill" }),
+        estimate: pricing.enabled.then_some(EstimateNote {
+            currency: "USD",
+            note: "estimate (估测), not a bill. Built-in prices from official API pages fetched 2026-11-16 (https://platform.claude.com/docs/en/about-claude/pricing, https://developers.openai.com/api/docs/pricing); override with config pricing.models",
+        }),
     })
 }
 
@@ -460,6 +439,6 @@ pub fn local_timezone_name() -> String {
 }
 
 /// 用本机时区生成报表。
-pub fn build_local(query: &Query, dir: Option<&std::path::Path>, estimate: &UsageEstimateConfig) -> Result<Report> {
-    build(query, &chrono::Local::now(), &local_timezone_name(), dir, estimate)
+pub fn build_local(query: &Query, dir: Option<&std::path::Path>, pricing: &PricingConfig) -> Result<Report> {
+    build(query, &chrono::Local::now(), &local_timezone_name(), dir, pricing)
 }

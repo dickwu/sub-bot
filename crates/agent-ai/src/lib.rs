@@ -6,6 +6,8 @@
 //! - `http`：共享 reqwest 客户端构建器（rustls + ring + webpki-roots），所有出站客户端都经它构建
 //! - `keychain`：macOS Keychain key 来源（其它平台为 stub）
 //! - `faux`：离线假 provider，用于测试（对应 `providers/faux.ts`）
+#![allow(clippy::result_large_err)] // Usage carries cache-TTL splits; CallError includes Usage by value.
+
 pub mod anthropic;
 pub mod faux;
 pub mod http;

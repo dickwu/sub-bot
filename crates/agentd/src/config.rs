@@ -337,7 +337,10 @@ pub struct Config {
     /// MCP 服务器定义（名字 → stdio `command` / HTTP `url`）；profile 通过 `mcpServers` 引用，见 mcp/config.rs
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
-    /// 用量统计的估测费用（默认关闭）：`{enabled, pricesUsdPerMillion: {"provider/model": {input, output, cacheRead, cacheWrite, reasoning}}}`
+    /// 用量估测价格表：官方默认表 + 可选 `models` 覆盖。`pricing.enabled` 默认 true。
+    #[serde(default)]
+    pub pricing: crate::usage::report::PricingConfig,
+    /// 已弃用：v0.11.0 的 `usageEstimate`。其中的单价并入 `pricing.models`；`enabled` 忽略。
     #[serde(default)]
     pub usage_estimate: crate::usage::report::UsageEstimateConfig,
     pub profiles: BTreeMap<String, Profile>,
@@ -607,6 +610,11 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
+    /// Official price table plus config overrides (`pricing.models` and legacy `usageEstimate`).
+    pub fn effective_pricing(&self) -> crate::usage::report::PricingConfig {
+        self.pricing.merge_legacy(&self.usage_estimate)
+    }
+
     /// 会话持久化目录：`persistSessions: false` ⇒ None；否则 `sessionDir` 或 `<dataDir>/sessions`。
     pub fn sessions_dir(&self) -> Option<PathBuf> {
         if self.persist_sessions == Some(false) {
@@ -698,7 +706,8 @@ impl Config {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
         self.compaction.validate("compaction")?;
-        self.usage_estimate.validate("usageEstimate")?;
+        self.pricing.validate("pricing.models")?;
+        crate::usage::report::PricingConfig::validate_legacy(&self.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
         let registry = agent_tools::ToolRegistry::with_builtins();
         if let Some(policy) = &self.tool_approval {
             policy.validate().map_err(anyhow::Error::msg)?;
@@ -943,6 +952,7 @@ impl Config {
             persist_sessions: None,
             compaction: Default::default(),
             mcp_servers: BTreeMap::new(),
+            pricing: Default::default(),
             usage_estimate: Default::default(),
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],

@@ -54,6 +54,18 @@ pub struct Usage {
     pub cache_read: u64,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub cache_write: u64,
+    /// Anthropic 5-minute cache writes (`cache_creation.ephemeral_5m_input_tokens`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_5m: u64,
+    /// Anthropic 1-hour cache writes (`cache_creation.ephemeral_1h_input_tokens`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_1h: u64,
+    /// OpenAI 30-minute cache writes (`cache_write_tokens_details.ttl_30m_tokens`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_30m: u64,
+    /// OpenAI 12-hour cache writes (`cache_write_tokens_details.ttl_12h_tokens`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_write_12h: u64,
     pub total_tokens: u64,
     /// 推理 token（包含在 output 里）
     #[serde(default)]
@@ -67,7 +79,78 @@ fn is_zero(value: &u64) -> bool {
 impl Usage {
     /// 所有计数都为 0：provider 没有报告用量（失败/中断的调用默认如此）。用量统计据此跳过，不记录虚构的 0。
     pub fn is_empty(&self) -> bool {
-        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0 && self.total_tokens == 0 && self.reasoning == 0
+        self.input == 0
+            && self.output == 0
+            && self.cache_read == 0
+            && self.cache_write == 0
+            && self.cache_write_5m == 0
+            && self.cache_write_1h == 0
+            && self.cache_write_30m == 0
+            && self.cache_write_12h == 0
+            && self.total_tokens == 0
+            && self.reasoning == 0
+    }
+
+    /// Parse Anthropic `usage` (message_start / message_delta). `input_tokens` excludes cache
+    /// reads and writes. When `cache_creation` is absent, `cache_creation_input_tokens` is stored
+    /// as a 5-minute write (the historical default TTL).
+    pub fn apply_anthropic(&mut self, usage: &serde_json::Value) {
+        if let Some(n) = usage["input_tokens"].as_u64() {
+            self.input = n;
+        }
+        if let Some(n) = usage["output_tokens"].as_u64() {
+            self.output = n;
+        }
+        if let Some(n) = usage["cache_read_input_tokens"].as_u64() {
+            self.cache_read = n;
+        }
+        let creation = &usage["cache_creation"];
+        let t5 = creation["ephemeral_5m_input_tokens"].as_u64();
+        let t1 = creation["ephemeral_1h_input_tokens"].as_u64();
+        if t5.is_some() || t1.is_some() {
+            self.cache_write_5m = t5.unwrap_or(0);
+            self.cache_write_1h = t1.unwrap_or(0);
+            self.cache_write = self.cache_write_5m.saturating_add(self.cache_write_1h);
+        } else if let Some(n) = usage["cache_creation_input_tokens"].as_u64() {
+            self.cache_write = n;
+            self.cache_write_5m = n;
+            self.cache_write_1h = 0;
+        }
+        // Anthropic's input_tokens excludes cache reads/writes, unlike OpenAI's prompt_tokens.
+        self.total_tokens = self.input.saturating_add(self.output).saturating_add(self.cache_read).saturating_add(self.cache_write);
+    }
+
+    /// Parse OpenAI Chat Completions `usage`. `prompt_tokens` includes cached tokens and cache writes.
+    pub fn apply_openai_chat(&mut self, usage: &serde_json::Value) {
+        self.apply_openai(usage, "prompt_tokens", "completion_tokens", "prompt_tokens_details", "completion_tokens_details");
+    }
+
+    /// Parse OpenAI Responses API `usage`. `input_tokens` includes cached tokens and cache writes.
+    pub fn apply_openai_responses(&mut self, usage: &serde_json::Value) {
+        self.apply_openai(usage, "input_tokens", "output_tokens", "input_tokens_details", "output_tokens_details");
+    }
+
+    fn apply_openai(&mut self, usage: &serde_json::Value, input_key: &str, output_key: &str, input_details: &str, output_details: &str) {
+        self.input = usage[input_key].as_u64().unwrap_or(0);
+        self.output = usage[output_key].as_u64().unwrap_or(0);
+        self.reasoning = usage[output_details]["reasoning_tokens"].as_u64().unwrap_or(0);
+        let details = &usage[input_details];
+        self.cache_read = details["cached_tokens"].as_u64().unwrap_or(0);
+        let write = details["cache_write_tokens"].as_u64().unwrap_or(0);
+        let split = &details["cache_write_tokens_details"];
+        let t30 = split["ttl_30m_tokens"].as_u64();
+        let t12 = split["ttl_12h_tokens"].as_u64();
+        if t30.is_some() || t12.is_some() {
+            self.cache_write_30m = t30.unwrap_or(0);
+            self.cache_write_12h = t12.unwrap_or(0);
+            self.cache_write = self.cache_write_30m.saturating_add(self.cache_write_12h);
+        } else {
+            self.cache_write = write;
+            self.cache_write_30m = 0;
+            self.cache_write_12h = 0;
+        }
+        // prompt/input already includes cached tokens and cache writes; do not add them again.
+        self.total_tokens = usage["total_tokens"].as_u64().unwrap_or(self.input.saturating_add(self.output));
     }
 }
 
@@ -404,4 +487,60 @@ pub enum AssistantEvent {
     Error {
         message: AssistantMessage,
     },
+}
+
+#[cfg(test)]
+mod usage_parse_tests {
+    use super::Usage;
+    use serde_json::json;
+
+    #[test]
+    fn anthropic_cache_creation_split_and_legacy_unsplit() {
+        let mut split = Usage::default();
+        split.apply_anthropic(&json!({
+            "input_tokens": 2048,
+            "cache_read_input_tokens": 1800,
+            "cache_creation_input_tokens": 248,
+            "output_tokens": 503,
+            "cache_creation": {"ephemeral_5m_input_tokens": 148, "ephemeral_1h_input_tokens": 100}
+        }));
+        assert_eq!(
+            (split.input, split.output, split.cache_read, split.cache_write, split.cache_write_5m, split.cache_write_1h, split.total_tokens),
+            (2048, 503, 1800, 248, 148, 100, 2048 + 503 + 1800 + 248)
+        );
+
+        let mut legacy = Usage::default();
+        legacy.apply_anthropic(&json!({"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 20, "cache_creation_input_tokens": 30}));
+        assert_eq!((legacy.cache_write, legacy.cache_write_5m, legacy.cache_write_1h, legacy.total_tokens), (30, 30, 0, 65));
+    }
+
+    #[test]
+    fn openai_cached_and_writes_are_not_added_to_total() {
+        let mut chat = Usage::default();
+        chat.apply_openai_chat(&json!({
+            "prompt_tokens": 12000,
+            "completion_tokens": 80,
+            "total_tokens": 12080,
+            "prompt_tokens_details": {
+                "cached_tokens": 4000,
+                "cache_write_tokens": 7000,
+                "cache_write_tokens_details": {"ttl_30m_tokens": 3000, "ttl_12h_tokens": 4000}
+            },
+            "completion_tokens_details": {"reasoning_tokens": 20}
+        }));
+        assert_eq!(
+            (chat.input, chat.output, chat.cache_read, chat.cache_write, chat.cache_write_30m, chat.cache_write_12h, chat.reasoning, chat.total_tokens),
+            (12000, 80, 4000, 7000, 3000, 4000, 20, 12080)
+        );
+
+        let mut resp = Usage::default();
+        resp.apply_openai_responses(&json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 40},
+            "output_tokens": 60,
+            "output_tokens_details": {"reasoning_tokens": 32},
+            "total_tokens": 160
+        }));
+        assert_eq!((resp.input, resp.output, resp.cache_read, resp.reasoning, resp.total_tokens, resp.cache_write), (100, 60, 40, 32, 160, 0));
+    }
 }

@@ -1245,9 +1245,11 @@ RPC：`{"id":"9","type":"set_max_turns","maxTurns":300}`（或 `"addTurns":50` /
 - 异步任务 `webhookEvents` 新增 `turn_budget`（`all` 也包含），投递 `task.turn_budget_low` 与 `task.turn_budget_exhausted`，`data` 为事件字段加 `{taskId, sessionId, turnsUrl}`；回调目标对象的 `events` 也可写这两个名字。
 - 日志：INFO `turn budget changed`（session_id、max_turns、previous、turns_used、by）、`turn budget low`、`turn budget exhausted`、`turn budget wait resolved`；ask 超时为 WARN `turn budget wait timed out; stopping the run`。
 
-## 用量统计（v0.11.0）
+## 用量统计（v0.12.0）
 
-sub-bot 把每次 LLM 调用里 **provider 已经返回的 token 数** 记在本机，不需要 Anthropic / OpenAI 的 Admin key，也不是账单。能记的才会记：input、output、缓存读写（Anthropic 的 cache read / cache write；OpenAI 的 cached tokens）、推理 token，以及时间、`provider/account`、模型、profile、会话 id、调用方 client 名（只有名字，没有 token）、重试次数。被丢弃的重试尝试和失败调用只要当时返回了用量，也会记下来并打上标记。压缩摘要和路由分类调用同样计入。provider 没有返回用量的调用会被跳过，不会写成全 0。
+sub-bot 把每次 LLM 调用里 **provider 已经返回的 token 数** 记在本机，不需要 Anthropic / OpenAI 的 Admin key，也不是账单。能记的才会记：input、output、缓存读写、推理 token，以及时间、`provider/account`、模型、profile、会话 id、调用方 client 名（只有名字，没有 token）、重试次数。被丢弃的重试尝试和失败调用只要当时返回了用量，也会记下来并打上标记。压缩摘要和路由分类调用同样计入。provider 没有返回用量的调用会被跳过，不会写成全 0。
+
+Anthropic 的 `input_tokens` **不含** 缓存读写，所以 `total` = input + output + cacheRead + cacheWrite；cache write 再按 TTL 拆成 `cacheWrite5m` / `cacheWrite1h`（响应里的 `cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`）。旧记录只有合计 `cacheWrite`、没有拆分时，按 5 分钟写入计。OpenAI 的 `prompt_tokens` / `input_tokens` **已经包含** cached tokens 和 cache writes，所以 `total` 不再把 cacheRead / cacheWrite 加进去；uncached input = input − cacheRead − cacheWrite。OpenAI 的写入若带 TTL，记为 `cacheWrite30m` / `cacheWrite12h`（官方定价页的 30 分钟 / 12 小时档，不是 Anthropic 的 5 分钟 / 1 小时）。
 
 记录在 `<dataDir>/usage/YYYY-MM-DD.jsonl`，日期按 **本机时区** 切分。追加写入，不经过 `state/` 的独占锁，所以 `serve` 在跑时 `run` / `ask` 也能记。目录权限 0700，文件 0600。
 
@@ -1269,21 +1271,36 @@ curl -sS http://127.0.0.1:7878/v1/usage?by=account -H "Authorization: Bearer <to
 
 stdio RPC 没有对应方法（它只服务于一个会话，并不镜像这类查询接口）。
 
-可选的 **估测费用** 默认关闭。打开后按配置里的静态单价表估算，表格会多一列 `estimatedCostUsd`，并标明这是估测（estimate），不是账单：
+`sub-bot usage` 和 `GET /v1/usage` 会显示 **cache hit rate** 和 **estCost**（美元估测，不是账单）。命中率 = `cacheRead / (uncached input + cacheRead + cacheWrite)`。`--json` 里还有分项：`inputCost`、`outputCost`、`cacheReadCost`、`cacheWriteCost`。没有官方或配置单价的模型显示 `-`，不会编造价格。
+
+内置单价表来自官方 API 定价页，**2026-11-16** 抓取，单位都是美元 / 百万 token（MTok）：
+
+- Anthropic：<https://platform.claude.com/docs/en/about-claude/pricing>（`https://www.anthropic.com/pricing` 是 Claude 订阅，不是 API token 价）
+  - `claude-fable-5-2`：input 8，5m write 10，1h write 16，cache read 0.20，output 40
+  - `claude-fable-5-1`：input 10，5m write 12.50，1h write 20，cache read 0.25，output 50
+  - `claude-opus-5-5`：input 4，5m write 5，1h write 8，cache read 0.20，output 20
+  - `claude-sonnet-5-5`：input 2，5m write 2.50，1h write 4，cache read 0.10，output 10
+  - `claude-haiku-5-5`：prompt ≤100,000 时 input 0.10，5m 0.125，1h 0.20，cache read 0.01，output 0.50；**超过** 100,000 时 input 0.50，5m 0.625，1h 1，cache read 0.05，output 2.50（整次请求用高档）
+- OpenAI：<https://developers.openai.com/api/docs/pricing>（`https://openai.com/api/pricing` 是商务席位价，不是 API token 价）
+  - `gpt-6.1-sol`：短上下文 input 2，cached input 0.10，output 10，30m write 2.50，12h write 5；**超过** 272,000 input tokens 时 input 4，cached 0.20，output 15，30m 5，12h 10
+  - `gpt-6-astra`：短上下文 input 10，cached input 1，output 50，30m write 12.50，12h write 25；超过 272,000 时 input 20，cached 2，output 75，30m 25，12h 50
+
+可以用配置覆盖或补行（完全替换该 `provider/model` 一行）。`pricing.enabled: false` 可关掉费用列。v0.11.0 的 `usageEstimate.pricesUsdPerMillion` 仍会当作覆盖并入，但其 `enabled: false` 不再隐藏官方表。
 
 ```json
 {
-  "usageEstimate": {
-    "enabled": false,
-    "pricesUsdPerMillion": {
-      "anthropic/claude-opus-5-5": { "input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25 },
-      "openai/gpt-6.1-sol": { "input": 1.75, "output": 14.0, "cached": 0.175, "reasoning": 14.0 }
+  "pricing": {
+    "enabled": true,
+    "models": {
+      "anthropic/claude-opus-5-5": {
+        "input": 4.0, "output": 20.0, "cacheRead": 0.20, "cacheWrite5m": 5.0, "cacheWrite1h": 8.0
+      }
     }
   }
 }
 ```
 
-单价按 `provider/model` 计，单位是美元 / 百万 token。`cacheRead`（OpenAI 也可写 `cached`）和 `cacheWrite` 默认按 `input`，`reasoning` 默认按 `output`。没有单价的模型不会出现费用数字。价格会变，这张表需要你自己维护。
+带日期后缀的模型 id（如 `claude-opus-5-5-20261101`）会回退到去掉 `-YYYYMMDD` 后的官方行。OpenAI 只报告了 cache write 总数、没有 30m/12h 拆分时，整行费用显示 `-`（不能靠猜测 TTL 定价）。
 
 ## 工具调用审批（toolApproval）
 

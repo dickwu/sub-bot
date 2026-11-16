@@ -19,6 +19,10 @@
 - **重试**（`agent_ai::retry`）：`CallError{reason, transient, retry_after, kind}`；瞬时 = 连接/请求错误、body 读取错误、空闲超时、响应头超时、提前 EOF、HTTP 408/429/5xx、Anthropic 流内 overloaded/api/rate_limit error；其它 4xx 永不重试，`raw_effort`（probe）为 0 次。退避 `1s·2^n + ≤250ms jitter`，上限 30s，`Retry-After`（≤60s）为下限。已流出工具调用事件之后也重放：工具只在 `Done` 之后执行，`AssistantEvent::Retry{attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls}` 通知消费者丢弃部分消息；每次尝试用全新的解析器 / 消息，所以被丢弃尝试的 thinking 签名不会进入最终消息。task-local `AttemptStats` 记录收到的字节和最后一个字节的时间，用于 WARN 日志（`bytes_received`、`secs_since_last_byte`）；成功后 INFO（`attempts`），用尽后 ERROR。
 - **消费者**：`agent_loop::stream_assistant` 把 `Retry` 转成 `AgentEvent::MessageRetry`（同样的结构化字段），不消耗回合、不重新执行 `before_call`；`http::collect_chat` 只截掉当前助手消息的部分文本（`MessageStart` 记录起点）；`ask::TextPrinter` 终端里换行 + stderr 提示，管道里按消息缓冲；hub `llm_retry` issue 带 `attempt/maxRetries/kind/delayMs/discardedToolCalls`；持久化只写最终消息（`on_message`）。账号 failover 复用 `Retry`（`kind: account_failover`，`delay_ms: 0`）。
 
+## 本地用量统计（v0.11.0）
+
+每次 LLM 调用（含压缩摘要、路由分类，以及仍返回了 `Usage` 的失败 / 被丢弃重试尝试）由包在账号 provider 外的 `RecordingProvider` 观察 `Done` / `Error` / `Retry` 事件，追加写入 `<dataDir>/usage/YYYY-MM-DD.jsonl`（本机时区日期）。`agent-ai` 的 `CallError` 携带该次尝试已报告的用量；没有用量则不写记录。日志不进 `state/` 的 flock，`Journal` 自己对当天文件 `flock` + `O_APPEND` + `sync_data`。`sub-bot usage` 与 `GET /v1/usage` 共用 `usage::report` 的聚合（默认按 `provider/account`）。stdio RPC 不镜像该查询。可选的 `usageEstimate` 只是静态单价估测。
+
 ## 回合预算（maxTurns，v0.10.4）
 
 - **原则**：只有调用方（主 agent）能调整预算；没有封顶，也不给模型任何“延长回合”的工具。默认 `maxTurns` 150（profile 与 `Config::fallback` 一致），`onMaxTurns` 默认 stop，ask 默认等待 600 秒。
@@ -214,6 +218,7 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 |---|---|
 | `GET /health` | 无需鉴权 |
 | `GET /profiles` | 当前 bot 可用的 profile，包括 model、allowedModels、reasoningEffort、tools 和 workspaceRoots |
+| `GET /usage` | 本地用量汇总（与 `sub-bot usage --json` 相同）；query：`today` / `month` / `days` / `since` / `until` / `by` / 过滤字段；需 Bearer token |
 | `GET /models?profile=&all=` | 调用 provider 的 `/v1/models` 实时取模型列表（Hub 缓存 10 分钟），默认过滤掉非对话模型（embedding/tts/image/realtime/codex/-pro 等）和日期快照；每项带 `reasoning`、`reasoningEfforts` |
 | `POST /sessions` | 请求体为 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, model, reasoningEffort, tools}`；model 不在 profile 的 `allowedModels` 内返回 400 |
 | `GET /sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |

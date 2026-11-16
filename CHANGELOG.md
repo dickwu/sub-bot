@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.11.0] - 2026-11-16
+
+Local usage statistics from the token counts providers already return. No Anthropic or OpenAI Admin key is required; this is not a billing report.
+
+### Added
+- Every LLM call that reports usage is appended to `<dataDir>/usage/YYYY-MM-DD.jsonl` (local calendar day): input, output, cache-read, cache-write, reasoning, and total tokens, plus timestamp, `provider/account`, model, profile, session id, caller (client name only), retry attempt, and flags for discarded retries and failed attempts. Compaction summaries and routing classifier calls are included. Attempts that report no usage are skipped (no invented zeros).
+- The journal is append-only (0600 files, 0700 directory), process- and machine-safe (`O_APPEND` + `flock`), and independent of the `state/` lock so `run` / `ask` can record while `serve` is running. A torn last line is ignored; a corrupt complete line is skipped and the rest of the file is still counted.
+- CLI: `sub-bot usage` (default `--today`; also `--month`, `--days N`, `--since` / `--until` as RFC 3339 or `YYYY-MM-DD`). `--by account|model|profile|session|day|caller` is combinable (repeated flags or commas). Optional filters `--account`, `--provider`, `--model`, `--profile`, `--session`, `--caller`. `--json` prints the same object as the HTTP API. Does not start a Hub or load provider secrets. An empty range exits 0 with zero totals.
+- HTTP: `GET /v1/usage` with the same query parameters, behind the existing bearer-token auth (any valid client). No RPC method: stdio RPC is session-scoped and does not mirror this query API.
+- Optional **estimated** cost (`usageEstimate.enabled`, default off) from a static `pricesUsdPerMillion` table keyed by `provider/model`. Labeled 估测 / estimate, never presented as a bill; the column is omitted when disabled or when a group has unpriced models.
+
+### Changed
+- Dependencies: `rand` 0.10.4, `mio` 1.2.5, `bumpalo` 3.20.4 (`cargo update`).
+
+### Notes
+- Account labels in reports are `provider/account` (for example `anthropic/work`, `anthropic/my`, `openai/default`).
+- Retries that still returned usage are counted separately (`retried`) and do not replace the successful attempt.
+
 ## [0.10.6] - 2026-11-13
 
 First release containing the long-stream robustness work. The `v0.10.5` tag exists but was never released: its release workflow stopped on a CI-only race in the test `restart_resumes_same_delivery_and_interrupts_running_task`, which now retries reopening the data directory while a concurrently forked test child still holds the lock file descriptor.

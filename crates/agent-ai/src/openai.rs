@@ -250,8 +250,9 @@ impl Provider for OpenAiProvider {
                 let final_ev = match r {
                     Some(Ok(msg)) => AssistantEvent::Done { message: msg },
                     Some(Err(e)) => {
-                        // 失败的消息也带上最后一次尝试的 API / 推理强度，便于上层如实报告
-                        let mut m = AssistantMessage::failed(&model, StopReason::Error, e);
+                        // 失败的消息也带上最后一次尝试的 API / 推理强度与已报告的用量，便于上层如实报告
+                        let mut m = AssistantMessage::failed(&model, StopReason::Error, e.reason);
+                        m.usage = e.usage.unwrap_or_default();
                         m.api = Some(attempt.0);
                         m.reasoning_effort = attempt.1;
                         AssistantEvent::Error { message: m }
@@ -297,14 +298,15 @@ struct CallCtx {
     api_cache: Arc<Mutex<HashMap<String, Api>>>,
 }
 
-async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, String> {
+async fn run_with_retries(ctx: &CallCtx, req: Request, api: Api, tx: &mpsc::Sender<AssistantEvent>, attempt: &mut (Api, Option<ThinkingLevel>)) -> Result<AssistantMessage, CallError> {
     let max_retries = if req.raw_effort { 0 } else { req.llm_max_retries.unwrap_or(3) };
     let model = req.model.clone();
     let mut state = (ctx, req, api, attempt);
     let retry_ctx = crate::retry::RetryCtx { provider: "openai", model: &model };
-    crate::retry::run_with_retries(&mut state, max_retries, tx, retry_ctx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3)))
-        .await
-        .map_err(|error| redact(&if ctx.key.expose().is_empty() { error } else { error.replace(ctx.key.expose(), "[redacted]") }))
+    crate::retry::run_with_retries(&mut state, max_retries, tx, retry_ctx, |state, tx| Box::pin(run(state.0, state.1.clone(), state.2, tx, state.3))).await.map_err(|mut error| {
+        error.reason = redact(&if ctx.key.expose().is_empty() { error.reason } else { error.reason.replace(ctx.key.expose(), "[redacted]") });
+        error
+    })
 }
 
 /// 发请求；遇到推理强度相关的 400 时按错误类型调整（最多重试 2 次，且同样的请求不会重发），然后解析流。
@@ -412,9 +414,17 @@ pub(crate) fn idle_timeout_error(timeout: Duration) -> String {
     format!("stream idle timeout after {}s", timeout.as_secs_f64())
 }
 
-async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: Duration) -> Result<AssistantMessage, String> {
-    let _ = tx.send(AssistantEvent::Start).await;
+/// Failures keep the usage chunk if it already arrived (billed even though the attempt is discarded or fails).
+async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: Duration) -> Result<AssistantMessage, CallError> {
     let mut msg = AssistantMessage::empty(model);
+    match parse_chat_into(resp, &mut msg, tx, idle_timeout).await {
+        Ok(()) => Ok(msg),
+        Err(error) => Err(CallError::from(error).with_usage(&msg.usage)),
+    }
+}
+
+async fn parse_chat_into(resp: reqwest::Response, msg: &mut AssistantMessage, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: Duration) -> Result<(), String> {
+    let _ = tx.send(AssistantEvent::Start).await;
     let mut text = String::new();
     let mut calls: BTreeMap<u64, PartialCall> = BTreeMap::new();
     let mut finish: Option<String> = None;
@@ -500,7 +510,7 @@ async fn parse_chat(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<Assi
         _ if !msg.tool_calls().is_empty() => StopReason::ToolUse,
         _ => StopReason::Stop,
     };
-    Ok(msg)
+    Ok(())
 }
 
 /// 去掉错误信息里任何形似 API key 的片段（OpenAI 401 会回显部分 key）。

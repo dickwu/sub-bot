@@ -133,7 +133,9 @@ impl Provider for AnthropicProvider {
                 let event = match result {
                     Some(Ok(message)) => AssistantEvent::Done { message },
                     Some(Err(error)) => {
-                        let mut message = AssistantMessage::failed(&model, StopReason::Error, error);
+                        let mut message = AssistantMessage::failed(&model, StopReason::Error, error.reason);
+                        // Usage reported before the final attempt failed (billed); zeros when none.
+                        message.usage = error.usage.unwrap_or_default();
                         message.reasoning_effort = state.1.reasoning;
                         AssistantEvent::Error { message }
                     }
@@ -435,7 +437,7 @@ impl StreamState {
                     Some("rate_limit_error") => (true, "rate_limit"),
                     _ => (false, "other"),
                 };
-                return Err(CallError { reason: format!("Anthropic stream error: {}", value["error"]), transient, retry_after: None, kind });
+                return Err(CallError { reason: format!("Anthropic stream error: {}", value["error"]), transient, retry_after: None, kind, usage: None });
             }
             _ => {} // ping and future informational events
         }
@@ -454,9 +456,22 @@ impl StreamState {
     }
 }
 
+/// Failures keep the usage already reported by `message_start` / `message_delta` (it is billed even though the
+/// attempt is discarded or fails).
 async fn parse_stream(response: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, provider: &AnthropicProvider, idle_timeout: Duration) -> Result<AssistantMessage, CallError> {
     let _ = tx.send(AssistantEvent::Start).await;
     let mut state = StreamState::new(model);
+    match read_stream(response, tx, provider, idle_timeout, &mut state).await {
+        Ok(()) => {
+            let usage = state.message.usage.clone();
+            state.finish().map_err(|error| error.with_usage(&usage))
+        }
+        Err(error) => Err(error.with_usage(&state.message.usage)),
+    }
+}
+
+/// Feed SSE events into `state` until `message_stop` or EOF.
+async fn read_stream(response: reqwest::Response, tx: &mpsc::Sender<AssistantEvent>, provider: &AnthropicProvider, idle_timeout: Duration, state: &mut StreamState) -> Result<(), CallError> {
     let mut bytes = response.bytes_stream();
     let mut buffer = vec![];
     while let Some(chunk) = tokio::time::timeout(idle_timeout, bytes.next()).await.map_err(|_| idle_timeout_error(idle_timeout))? {
@@ -477,9 +492,9 @@ async fn parse_stream(response: reqwest::Response, model: &str, tx: &mpsc::Sende
                 tx.send(event).await.map_err(|_| "consumer closed".to_string())?;
             }
             if state.completed {
-                return state.finish();
+                return Ok(());
             }
         }
     }
-    state.finish()
+    Ok(())
 }

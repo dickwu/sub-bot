@@ -118,6 +118,7 @@ fn router(st: AppState) -> Router {
         .route("/v1/profiles", get(profiles))
         .route("/v1/mcp", get(crate::mcp::http_status))
         .route("/v1/models", get(models))
+        .route("/v1/usage", get(usage))
         .layer(middleware::from_fn_with_state(st.clone(), auth));
     Router::new().route("/v1/health", get(|| async { Json(json!({"ok": true})) })).merge(api).layer(middleware::from_fn(trace_request)).with_state(st)
 }
@@ -436,6 +437,14 @@ async fn issues(State(st): State<AppState>, Extension(c): Caller, Query(q): Quer
         return Err(bad_request("limit must be <= 500"));
     }
     Ok(Json(json!({"issues": st.hub.issues.recent(Some(&c.name), q.since, limit)})).into_response())
+}
+
+/// `GET /v1/usage`：与 `sub-bot usage` 相同的过滤与 JSON 形状。任何有效 token 均可查询本机用量（不含密钥）。
+async fn usage(State(st): State<AppState>, Extension(_c): Caller, Query(q): Query<crate::usage::cli::UsageParams>) -> ApiResult {
+    match crate::usage::cli::report_for_hub(&st.hub, &q) {
+        Ok(report) => Ok(Json(report).into_response()),
+        Err(error) => Err(bad_request(error)),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1608,7 +1617,7 @@ mod tests {
                 message.stop_reason = agent_ai::StopReason::ToolUse;
                 return Box::pin(futures::stream::iter(vec![delta("kept "), E::Done { message }]));
             }
-            let retry = E::Retry { attempt: 1, reason: "stream idle timeout after 1s".into(), max_retries: 3, delay_ms: 0, kind: "idle_timeout".into(), discarded_tool_calls: 0 };
+            let retry = E::Retry { attempt: 1, reason: "stream idle timeout after 1s".into(), max_retries: 3, delay_ms: 0, kind: "idle_timeout".into(), discarded_tool_calls: 0, usage: None };
             Box::pin(futures::stream::iter(vec![delta("discarded "), retry, delta("final")]).chain(futures::stream::pending()))
         }
     }
@@ -1778,5 +1787,57 @@ mod tests {
             let (status, body) = request(&app, "GET", &format!("/v1/models?provider=openai&account={name}"), Some("test-token"), json!({})).await;
             assert_eq!((status, body), (StatusCode::FORBIDDEN, json!({"error": format!("account '{name}' is not allowed for this client")})));
         }
+    }
+
+    #[tokio::test]
+    async fn usage_endpoint_requires_token_and_applies_filters() {
+        let (app, hub) = app(10);
+        assert_eq!(request(&app, "GET", "/v1/usage", None, json!({})).await.0, StatusCode::UNAUTHORIZED);
+
+        let (status, body) = request(&app, "GET", "/v1/usage", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"]["requests"], 0);
+        assert_eq!(body["range"]["kind"], "today");
+        assert!(body["estimate"].is_null());
+
+        let now = chrono::Local::now();
+        let day = now.format("%Y-%m-%d").to_string();
+        let ts = now.timestamp_millis();
+        let journal = crate::usage::Journal::for_data_dir(&hub.config.data_dir());
+        let rec = |account: &str, model: &str, input: u64, discarded: bool, failed: bool| crate::usage::UsageRecord {
+            v: crate::usage::RECORD_VERSION,
+            ts,
+            time: now.to_rfc3339(),
+            day: day.clone(),
+            provider: "anthropic".into(),
+            account: account.into(),
+            model: model.into(),
+            profile: Some("coder".into()),
+            session_id: Some("sess-a".into()),
+            caller: "default".into(),
+            attempt: 1,
+            retry: false,
+            discarded,
+            failed,
+            tokens: crate::usage::Tokens { input, output: 2, cache_read: 0, cache_write: 0, reasoning: 0, total_tokens: input + 2 },
+        };
+        journal.append(&rec("work", "claude-opus-5-5", 10, false, false)).unwrap();
+        journal.append(&rec("my", "claude-sonnet-5-5", 3, false, true)).unwrap();
+
+        let (status, body) = request(&app, "GET", "/v1/usage?by=account", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"]["requests"], 2);
+        assert_eq!(body["total"]["input"], 13);
+        assert_eq!(body["total"]["failed"], 1);
+        assert_eq!(body["groups"].as_array().unwrap().len(), 2);
+
+        let (status, body) = request(&app, "GET", "/v1/usage?account=anthropic/work", Some("other-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["total"]["requests"], 1);
+        assert_eq!(body["total"]["input"], 10);
+
+        assert_eq!(request(&app, "GET", "/v1/usage?today=true&month=true", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "GET", "/v1/usage?days=0", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "GET", "/v1/usage?by=nope", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);
     }
 }

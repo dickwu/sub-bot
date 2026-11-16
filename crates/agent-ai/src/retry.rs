@@ -4,7 +4,7 @@
 //! HTTP 408/429/5xx, Anthropic in-stream overloaded/api/rate-limit errors) is replayed with exponential backoff
 //! plus jitter (max 30s, `Retry-After` as a floor). Replay is safe even after tool-call events were streamed:
 //! tools only run after the final `Done`, and every consumer discards the partial message on `Retry`.
-use crate::types::{AssistantEvent, AssistantMessage};
+use crate::types::{AssistantEvent, AssistantMessage, Usage};
 use futures::future::BoxFuture;
 use std::{
     sync::{
@@ -21,17 +21,27 @@ pub(crate) struct CallError {
     pub retry_after: Option<Duration>,
     /// `idle_timeout` | `stream_error` | `incomplete` | `headers_timeout` | `http_status` | `connect` | `overloaded` | `rate_limit` | `other`
     pub kind: &'static str,
+    /// Usage the provider reported before the attempt failed (e.g. Anthropic `message_start` input tokens).
+    pub usage: Option<Usage>,
 }
 
 impl CallError {
+    /// Attach the attempt's partial usage unless the provider reported none (never invent zeros).
+    pub(crate) fn with_usage(mut self, usage: &Usage) -> Self {
+        if self.usage.is_none() && !usage.is_empty() {
+            self.usage = Some(usage.clone());
+        }
+        self
+    }
+
     pub(crate) fn transport(error: reqwest::Error) -> Self {
         let kind = if error.is_body() || error.is_decode() { "stream_error" } else { "connect" };
-        Self { transient: error.is_connect() || error.is_timeout() || error.is_request() || error.is_body(), reason: crate::openai::redact(&error.to_string()), retry_after: None, kind }
+        Self { transient: error.is_connect() || error.is_timeout() || error.is_request() || error.is_body(), reason: crate::openai::redact(&error.to_string()), retry_after: None, kind, usage: None }
     }
 
     /// Non-2xx HTTP response: only 408 / 429 / 5xx are transient; other 4xx are never retried.
     pub(crate) fn http(reason: String, status: reqwest::StatusCode, retry_after: Option<Duration>) -> Self {
-        Self { reason, transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after, kind: "http_status" }
+        Self { reason, transient: matches!(status.as_u16(), 408 | 429 | 500..=599), retry_after, kind: "http_status", usage: None }
     }
 }
 
@@ -57,7 +67,7 @@ pub(crate) fn classify_reason(reason: &str) -> Option<&'static str> {
 impl From<String> for CallError {
     fn from(reason: String) -> Self {
         let kind = classify_reason(&reason);
-        Self { transient: kind.is_some(), kind: kind.unwrap_or("other"), reason, retry_after: None }
+        Self { transient: kind.is_some(), kind: kind.unwrap_or("other"), reason, retry_after: None, usage: None }
     }
 }
 
@@ -118,7 +128,9 @@ pub(crate) struct RetryCtx<'a> {
 /// Fresh parser/message per attempt; the caller's cancellation select drops requests and sleeps.
 /// Partial events (text, thinking, tool-call deltas) are forwarded live; on a transient failure a
 /// [`AssistantEvent::Retry`] tells consumers to discard them before the replay starts.
-pub(crate) async fn run_with_retries<S, F>(state: &mut S, max_retries: u32, tx: &mpsc::Sender<AssistantEvent>, ctx: RetryCtx<'_>, mut run: F) -> Result<AssistantMessage, String>
+/// The final error keeps the last attempt's partial usage (`CallError::usage`); earlier discarded attempts report
+/// theirs on the `Retry` event.
+pub(crate) async fn run_with_retries<S, F>(state: &mut S, max_retries: u32, tx: &mpsc::Sender<AssistantEvent>, ctx: RetryCtx<'_>, mut run: F) -> Result<AssistantMessage, CallError>
 where
     F: for<'a> FnMut(&'a mut S, mpsc::Sender<AssistantEvent>) -> BoxFuture<'a, Result<AssistantMessage, CallError>>,
 {
@@ -138,7 +150,7 @@ where
                 tokio::select! {
                     Some(ev) = rx.recv() => {
                         count(&ev, &mut tool_calls);
-                        if tx.send(ev).await.is_err() { return Err("consumer closed".into()); }
+                        if tx.send(ev).await.is_err() { return Err(String::from("consumer closed").into()); }
                     },
                     result = &mut call => break result,
                 }
@@ -148,7 +160,7 @@ where
         while let Ok(ev) = rx.try_recv() {
             count(&ev, &mut tool_calls);
             if tx.send(ev).await.is_err() {
-                return Err("consumer closed".into());
+                return Err(String::from("consumer closed").into());
             }
         }
         let (bytes, idle_secs) = (stats.bytes.load(Ordering::Relaxed), stats.idle_secs());
@@ -174,12 +186,14 @@ where
                     bytes_received = bytes,
                     secs_since_last_byte = idle_secs,
                     discarded_tool_calls = tool_calls,
+                    discarded_input_tokens = error.usage.as_ref().map_or(0, |u| u.input),
+                    discarded_output_tokens = error.usage.as_ref().map_or(0, |u| u.output),
                     reason = %error.reason,
                     "retrying transient LLM failure; discarding partial message"
                 );
-                let event = AssistantEvent::Retry { attempt: retry + 1, reason: error.reason, max_retries, delay_ms, kind: error.kind.into(), discarded_tool_calls: tool_calls };
+                let event = AssistantEvent::Retry { attempt: retry + 1, reason: error.reason, max_retries, delay_ms, kind: error.kind.into(), discarded_tool_calls: tool_calls, usage: error.usage };
                 if tx.send(event).await.is_err() {
-                    return Err("consumer closed".into());
+                    return Err(String::from("consumer closed").into());
                 }
                 tokio::time::sleep(delay).await;
             }
@@ -199,11 +213,11 @@ where
                         "LLM retries exhausted"
                     );
                 }
-                return Err(error.reason);
+                return Err(error);
             }
         }
     }
-    Err("retry attempts exhausted".into())
+    Err(String::from("retry attempts exhausted").into())
 }
 
 #[cfg(test)]

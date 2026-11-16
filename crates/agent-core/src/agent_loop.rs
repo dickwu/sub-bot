@@ -341,7 +341,7 @@ async fn stream_assistant(context: &Mutex<Vec<Message>>, cfg: &LoopConfig, cance
             },
         };
         match &ev {
-            AssistantEvent::Retry { attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls } => {
+            AssistantEvent::Retry { attempt, reason, max_retries, delay_ms, kind, discarded_tool_calls, .. } => {
                 // 同一次模型调用的重放：不消耗回合，也不再触发 before_call（压缩）。
                 emit(AgentEvent::MessageRetry {
                     attempt: *attempt,

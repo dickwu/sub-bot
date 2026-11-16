@@ -337,6 +337,9 @@ pub struct Config {
     /// MCP 服务器定义（名字 → stdio `command` / HTTP `url`）；profile 通过 `mcpServers` 引用，见 mcp/config.rs
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
+    /// 用量统计的估测费用（默认关闭）：`{enabled, pricesUsdPerMillion: {"provider/model": {input, output, cacheRead, cacheWrite, reasoning}}}`
+    #[serde(default)]
+    pub usage_estimate: crate::usage::report::UsageEstimateConfig,
     pub profiles: BTreeMap<String, Profile>,
     #[serde(default)]
     pub clients: Vec<Client>,
@@ -695,6 +698,7 @@ impl Config {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
         self.compaction.validate("compaction")?;
+        self.usage_estimate.validate("usageEstimate")?;
         let registry = agent_tools::ToolRegistry::with_builtins();
         if let Some(policy) = &self.tool_approval {
             policy.validate().map_err(anyhow::Error::msg)?;
@@ -939,6 +943,7 @@ impl Config {
             persist_sessions: None,
             compaction: Default::default(),
             mcp_servers: BTreeMap::new(),
+            usage_estimate: Default::default(),
             profiles,
             clients: vec![Client { name: "default".into(), token_sha256: sha256_hex(token), profiles: vec!["default".into()], ..Default::default() }],
         }

@@ -3,6 +3,7 @@
 //! - `rpc`：stdio JSONL RPC（对应 pi `--mode rpc`，见 coding-agent/src/modes/rpc/rpc-mode.ts）
 //! - `run`：一次性执行一个 prompt 并打印结果
 //! - `turns`：调整运行中会话的回合预算（maxTurns）
+//! - `usage`：查看本地记录的 LLM 用量（按账号 / 模型 / 日期汇总）
 //! - `models`：实时列出 provider 支持的模型
 //! - `hash-token`：生成配置文件里用的 token 哈希
 //!
@@ -39,6 +40,7 @@ mod store;
 mod turns;
 #[cfg(test)]
 mod turns_tests;
+mod usage;
 pub mod webhook;
 
 use agent_ai::{Message, ThinkingLevel};
@@ -166,6 +168,8 @@ enum Cmd {
     },
     /// 调整服务端会话的回合预算（连接参数同 ask）：--set N（绝对值）| --add N（可为负）| --stop（停止暂停在上限的 run）；打印 JSON 响应
     Turns(turns::Turns),
+    /// 查看本地记录的 LLM 用量（不连接服务、不加载密钥）：默认今天，可按账号 / 模型 / 日期等分组
+    Usage(usage::cli::Usage),
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
     Models {
         /// 列出全部（含 embedding、语音、图片、快照等）
@@ -372,6 +376,11 @@ async fn main() -> anyhow::Result<()> {
         logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
         return keys::run(&cli, command);
     }
+    if let Cmd::Usage(ref args) = cli.cmd {
+        // usage 只读 dataDir 里的用量日志，不加载密钥、不建日志目录
+        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
+        return usage::cli::run(args, cli.config.as_deref(), cli.data_dir.clone());
+    }
     if let Cmd::Ask(_) | Cmd::Turns(_) = cli.cmd {
         // ask / turns only need stderr diagnostics; never create a log directory or store.
         logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
@@ -541,7 +550,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {

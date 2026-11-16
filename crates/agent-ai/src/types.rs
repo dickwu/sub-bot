@@ -64,6 +64,13 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+impl Usage {
+    /// 所有计数都为 0：provider 没有报告用量（失败/中断的调用默认如此）。用量统计据此跳过，不记录虚构的 0。
+    pub fn is_empty(&self) -> bool {
+        self.input == 0 && self.output == 0 && self.cache_read == 0 && self.cache_write == 0 && self.total_tokens == 0 && self.reasoning == 0
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
@@ -365,6 +372,10 @@ pub enum AssistantEvent {
         /// Tool calls streamed by the discarded attempt (never executed).
         #[serde(default)]
         discarded_tool_calls: u32,
+        /// Provider-reported usage of the discarded attempt (billed even though the output is thrown away);
+        /// `None` when the attempt failed before any usage was reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Usage>,
     },
     TextDelta {
         content_index: usize,

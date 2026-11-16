@@ -162,7 +162,15 @@ impl Provider for FailoverProvider {
                                     tracing::warn!(issue = "typed", provider = %slot.key.provider, from = %slot.key.account, to = %next.key.account, class, "account failover");
                                     let reason = format!("{FAILOVER_PREFIX}{} -> {} ({class})", slot.key.account, next.key.account);
                                     // failover 只发生在还没有任何内容之前：没有要丢弃的工具调用，也不等待
-                                    let retry = AssistantEvent::Retry { attempt, reason, max_retries: (order.len() - 1) as u32, delay_ms: 0, kind: "account_failover".into(), discarded_tool_calls: 0 };
+                                    let retry = AssistantEvent::Retry {
+                                        attempt,
+                                        reason,
+                                        max_retries: (order.len() - 1) as u32,
+                                        delay_ms: 0,
+                                        kind: "account_failover".into(),
+                                        discarded_tool_calls: 0,
+                                        usage: None,
+                                    };
                                     if tx.send(retry).await.is_err() {
                                         return;
                                     }

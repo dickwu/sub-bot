@@ -1245,6 +1245,46 @@ RPC：`{"id":"9","type":"set_max_turns","maxTurns":300}`（或 `"addTurns":50` /
 - 异步任务 `webhookEvents` 新增 `turn_budget`（`all` 也包含），投递 `task.turn_budget_low` 与 `task.turn_budget_exhausted`，`data` 为事件字段加 `{taskId, sessionId, turnsUrl}`；回调目标对象的 `events` 也可写这两个名字。
 - 日志：INFO `turn budget changed`（session_id、max_turns、previous、turns_used、by）、`turn budget low`、`turn budget exhausted`、`turn budget wait resolved`；ask 超时为 WARN `turn budget wait timed out; stopping the run`。
 
+## 用量统计（v0.11.0）
+
+sub-bot 把每次 LLM 调用里 **provider 已经返回的 token 数** 记在本机，不需要 Anthropic / OpenAI 的 Admin key，也不是账单。能记的才会记：input、output、缓存读写（Anthropic 的 cache read / cache write；OpenAI 的 cached tokens）、推理 token，以及时间、`provider/account`、模型、profile、会话 id、调用方 client 名（只有名字，没有 token）、重试次数。被丢弃的重试尝试和失败调用只要当时返回了用量，也会记下来并打上标记。压缩摘要和路由分类调用同样计入。provider 没有返回用量的调用会被跳过，不会写成全 0。
+
+记录在 `<dataDir>/usage/YYYY-MM-DD.jsonl`，日期按 **本机时区** 切分。追加写入，不经过 `state/` 的独占锁，所以 `serve` 在跑时 `run` / `ask` 也能记。目录权限 0700，文件 0600。
+
+```bash
+sub-bot usage                  # 今天，按账号汇总
+sub-bot usage --month --by model
+sub-bot usage --days 7 --by account,day
+sub-bot usage --since 2026-11-01 --until 2026-11-16 --account anthropic/work
+sub-bot usage --today --json
+```
+
+`--today`（默认）、`--month`、`--days N`、`--since` / `--until`（RFC 3339 或 `YYYY-MM-DD`）四选一。`--by` 可重复或逗号分隔：`account`（即 `provider/account`）、`model`、`profile`、`session`、`day`、`caller`。还可以按 `--account`、`--provider`、`--model`、`--profile`、`--session`、`--caller` 过滤。范围内没有记录时退出码仍是 0，总数为 0。这条命令只读本地日志，不会启动服务，也不会去加载 API key。
+
+HTTP 查询与 CLI `--json` 是同一份对象，需要已有的 Bearer token（任意有效 client 均可，用量是这台机器上的合计）：
+
+```bash
+curl -sS http://127.0.0.1:7878/v1/usage?by=account -H "Authorization: Bearer <token>"
+```
+
+stdio RPC 没有对应方法（它只服务于一个会话，并不镜像这类查询接口）。
+
+可选的 **估测费用** 默认关闭。打开后按配置里的静态单价表估算，表格会多一列 `estimatedCostUsd`，并标明这是估测（estimate），不是账单：
+
+```json
+{
+  "usageEstimate": {
+    "enabled": false,
+    "pricesUsdPerMillion": {
+      "anthropic/claude-opus-5-5": { "input": 5.0, "output": 25.0, "cacheRead": 0.5, "cacheWrite": 6.25 },
+      "openai/gpt-6.1-sol": { "input": 1.75, "output": 14.0, "cached": 0.175, "reasoning": 14.0 }
+    }
+  }
+}
+```
+
+单价按 `provider/model` 计，单位是美元 / 百万 token。`cacheRead`（OpenAI 也可写 `cached`）和 `cacheWrite` 默认按 `input`，`reasoning` 默认按 `output`。没有单价的模型不会出现费用数字。价格会变，这张表需要你自己维护。
+
 ## 工具调用审批（toolApproval）
 
 每次执行工具之前按策略判定 **allow / ask / deny**：allow 直接执行；deny 不执行，模型收到错误工具结果 `tool call denied by policy: <reason>` 后继续；ask 暂停这次工具调用，发出 `approval_required` 事件，等调用方批准或拒绝（或超时 / abort）。默认 `"never"`，不配置时行为与以前完全相同。

@@ -5,7 +5,7 @@
 //! - 系统提示放 `instructions`；`reasoning.effort`；`store: false`（不在 OpenAI 侧保存会话）；
 //! - 流事件：`response.output_text.delta`、`response.output_item.added/done`、
 //!   `response.function_call_arguments.delta`、`response.completed/incomplete/failed`、`error`。
-use crate::{provider::Request, types::*};
+use crate::{provider::Request, retry::CallError, types::*};
 use futures::StreamExt;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -93,6 +93,21 @@ impl StreamState {
         Self { msg: AssistantMessage::empty(model), text: String::new(), thinking: String::new(), calls: BTreeMap::new(), status: None, incomplete_reason: None, completed: false }
     }
 
+    fn read_usage(&mut self, u: &Value) {
+        if u.is_object() {
+            self.msg.usage.input = u["input_tokens"].as_u64().unwrap_or(0);
+            self.msg.usage.output = u["output_tokens"].as_u64().unwrap_or(0);
+            self.msg.usage.cache_read = u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+            self.msg.usage.reasoning = u["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
+            self.msg.usage.total_tokens = u["total_tokens"].as_u64().unwrap_or(self.msg.usage.input + self.msg.usage.output);
+        }
+    }
+
+    /// Usage reported so far (partial until `response.completed`).
+    pub(crate) fn usage(&self) -> &Usage {
+        &self.msg.usage
+    }
+
     fn next_index(&self) -> usize {
         1 + self.calls.len()
     }
@@ -160,16 +175,11 @@ impl StreamState {
                 let r = &v["response"];
                 self.status = r["status"].as_str().map(str::to_string);
                 self.incomplete_reason = r["incomplete_details"]["reason"].as_str().map(str::to_string);
-                let u = &r["usage"];
-                if u.is_object() {
-                    self.msg.usage.input = u["input_tokens"].as_u64().unwrap_or(0);
-                    self.msg.usage.output = u["output_tokens"].as_u64().unwrap_or(0);
-                    self.msg.usage.cache_read = u["input_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
-                    self.msg.usage.reasoning = u["output_tokens_details"]["reasoning_tokens"].as_u64().unwrap_or(0);
-                    self.msg.usage.total_tokens = u["total_tokens"].as_u64().unwrap_or(self.msg.usage.input + self.msg.usage.output);
-                }
+                self.read_usage(&r["usage"]);
             }
             "response.failed" => {
+                // A failed response may still report (billed) usage.
+                self.read_usage(&v["response"]["usage"]);
                 let e = &v["response"]["error"];
                 return Err(format!("OpenAI responses failed: {}", e["message"].as_str().map(str::to_string).unwrap_or_else(|| e.to_string())));
             }
@@ -221,9 +231,20 @@ fn parse_args(s: &str) -> Value {
     serde_json::from_str(s).unwrap_or_else(|_| Value::String(s.to_string()))
 }
 
-pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: std::time::Duration) -> Result<AssistantMessage, String> {
-    let _ = tx.send(AssistantEvent::Start).await;
+/// Failures keep any usage the stream already reported (e.g. on `response.failed`).
+pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: std::time::Duration) -> Result<AssistantMessage, CallError> {
     let mut st = StreamState::new(model);
+    match read_stream(resp, tx, idle_timeout, &mut st).await {
+        Ok(()) => {
+            let usage = st.usage().clone();
+            st.finish().map_err(|error| CallError::from(error).with_usage(&usage))
+        }
+        Err(error) => Err(CallError::from(error).with_usage(st.usage())),
+    }
+}
+
+async fn read_stream(resp: reqwest::Response, tx: &mpsc::Sender<AssistantEvent>, idle_timeout: std::time::Duration, st: &mut StreamState) -> Result<(), String> {
+    let _ = tx.send(AssistantEvent::Start).await;
     let mut buf: Vec<u8> = Vec::new();
     let mut bytes = resp.bytes_stream();
     let mut out = vec![];
@@ -243,11 +264,11 @@ pub(crate) async fn parse_stream(resp: reqwest::Response, model: &str, tx: &mpsc
                 let _ = tx.send(ev).await;
             }
             if st.completed {
-                return st.finish();
+                return Ok(());
             }
         }
     }
-    st.finish()
+    Ok(())
 }
 
 #[cfg(test)]

@@ -41,6 +41,9 @@ rand.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 reqwest.workspace = true
+# 用量统计：本地时区的日边界（clock）与时区名（与 chrono 的 clock 特性共用同一个 iana-time-zone）
+chrono.workspace = true
+iana-time-zone = "0.1"
 regex = "1"
 httpdate = "1"
 hyper = { version = "1", features = ["client", "http1"] }

@@ -739,6 +739,8 @@ pub struct Hub {
     pub(crate) session_dir: Option<PathBuf>,
     pub(crate) sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     store: Arc<crate::store::Store>,
+    /// 用量日志（`<dataDir>/usage`），不占用 state/ 的独占锁
+    pub(crate) usage: Arc<crate::usage::Journal>,
     shutting_down: AtomicBool,
     http: reqwest::Client,
     #[cfg(test)]
@@ -979,6 +981,7 @@ impl Hub {
             StoreMode::Memory => crate::store::Store::memory(),
             StoreMode::Persistent => crate::store::Store::open(&config.data_dir().join("state"), Duration::from_secs(config.task_ttl_secs))?,
         };
+        let usage = Arc::new(crate::usage::Journal::for_data_dir(&config.data_dir()));
         let pending = store.pending();
         issues.attach_store(&store);
         for task in store.tasks.lock().unwrap().values_mut() {
@@ -1013,6 +1016,7 @@ impl Hub {
         Ok(Arc::new(Self {
             issues,
             store,
+            usage,
             config,
             providers,
             unavailable,
@@ -1220,7 +1224,8 @@ impl Hub {
             Some(a) => a,
             None => self.profile_account(p, provider_id).to_string(),
         };
-        let provider = self.session_provider(p, provider_id, &account)?;
+        let meta = Arc::new(crate::usage::UsageMeta { caller: client.name.clone(), profile: Some(profile_name.clone()), session_id: Some(id.clone()) });
+        let provider = self.session_provider(p, provider_id, &account, meta)?;
         // MCP 工具（会话创建时的快照）；只有 Anthropic 的工具结果支持图片
         for tool in self.mcp.session_tools(&profile_name, &requested_mcp, provider_id == "anthropic")? {
             if tools.iter().any(|t| t.name() == tool.name()) {
@@ -1617,12 +1622,14 @@ impl Hub {
     }
 
     /// 会话使用的 provider：主账号 + 已加载的 fallback 账号，包成 [`FailoverProvider`]（链长 1 时只负责给消息标注账号）。
-    fn session_provider(&self, p: &Profile, provider_id: &str, account: &str) -> Result<Arc<dyn Provider>> {
-        let mut chain = vec![AccountSlot { key: AccountKey::new(provider_id, account), provider: self.provider(provider_id, account)? }];
+    fn session_provider(&self, p: &Profile, provider_id: &str, account: &str, meta: Arc<crate::usage::UsageMeta>) -> Result<Arc<dyn Provider>> {
+        let wrap = |key: AccountKey, provider: Arc<dyn Provider>| -> Arc<dyn Provider> { Arc::new(crate::usage::RecordingProvider::new(provider, key, meta.clone(), self.usage.clone())) };
+        let key = AccountKey::new(provider_id, account);
+        let mut chain = vec![AccountSlot { key: key.clone(), provider: wrap(key, self.provider(provider_id, account)?) }];
         for name in self.fallback_accounts(p, provider_id, account) {
             let key = AccountKey::new(provider_id, &name);
             match self.providers.get(&key) {
-                Some(provider) => chain.push(AccountSlot { key, provider: provider.clone() }),
+                Some(provider) => chain.push(AccountSlot { key: key.clone(), provider: wrap(key, provider.clone()) }),
                 None => tracing::debug!(provider = provider_id, account = %name, "fallback account not loaded; skipped"),
             }
         }

@@ -109,7 +109,7 @@ pub fn effort_caps(provider_id: &str, model: &str) -> EffortCaps {
         None
     } else {
         match m {
-            "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-luna" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" => Some(Medium),
+            "gpt-5.5" | "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-luna" | "gpt-6-sol" | "gpt-6.1-sol" | "gpt-6.1-terra" | "gpt-6.2-sol" => Some(Medium),
             "gpt-5.1" | "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" => Some(Off),
             _ => None,
         }
@@ -166,12 +166,16 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
 
 /// 模型的上下文窗口（输入 + 输出，token），用于自动压缩阈值。取保守值；profile 的 `contextWindow` 可覆盖。
 /// - Claude：已列出的 4.x / 5.x 都按 200k（1M 上下文需要 beta 头，这里不假定）；
-/// - gpt-5.x / gpt-6.x：400k；gpt-4.1：1M（按 1,000,000 计）；gpt-4o / o 系列：128k / 200k；
+/// - gpt-6.2-astra / gpt-6.2-sol：1,050,000；其它 gpt-5.x / gpt-6.x：400k；
+/// - gpt-4.1：1M（按 1,000,000 计）；gpt-4o / o 系列：128k / 200k；
 /// - 其它（含 faux）：128k。
 pub fn context_window(provider_id: &str, model: &str) -> u64 {
     let m = base(model);
     if provider_id == "anthropic" || m.starts_with("claude-") {
         return 200_000;
+    }
+    if matches!(m, "gpt-6.2-astra" | "gpt-6.2-sol") {
+        return 1_050_000;
     }
     if m.starts_with("gpt-6") || m.starts_with("gpt-5") {
         return 400_000;
@@ -241,7 +245,7 @@ pub fn reasoning_support(model: &str) -> ReasoningSupport {
         "gpt-5.2" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" | "gpt-5.5" => ReasoningSupport::Levels(GPT52P),
         "gpt-5.2-codex" | "gpt-5.3-codex" => ReasoningSupport::Levels(CODEX),
         "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-6-sol" | "gpt-6-luna" | "gpt-6.1-terra" => ReasoningSupport::Levels(WITH_MAX),
-        "gpt-6-astra" | "gpt-6.1-sol" => ReasoningSupport::Levels(FULL),
+        "gpt-6-astra" | "gpt-6.1-sol" | "gpt-6.2-astra" | "gpt-6.2-sol" => ReasoningSupport::Levels(FULL),
         _ => ReasoningSupport::Unknown,
     }
 }
@@ -301,6 +305,9 @@ mod tests {
         assert_eq!(context_window("anthropic", "claude-opus-5-5"), 200_000);
         assert_eq!(context_window("anthropic", "claude-fable-5-1-20260101"), 200_000);
         assert_eq!(context_window("openai", "gpt-6.1-sol"), 400_000);
+        for model in ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-astra-2026-11-17", "gpt-6.2-sol-2026-11-17"] {
+            assert_eq!(context_window("openai", model), 1_050_000);
+        }
         assert_eq!(context_window("openai", "gpt-5-2025-08-07"), 400_000);
         assert_eq!(context_window("openai", "gpt-4.1"), 1_000_000);
         assert_eq!(context_window("openai", "o3"), 200_000);
@@ -326,7 +333,8 @@ mod tests {
             ("gpt-5.2-codex gpt-5.3-codex", CODEX, None),
             ("gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna gpt-6-sol gpt-6-luna gpt-6.1-terra", WITH_MAX, Some(Medium)),
             ("gpt-6-astra", FULL, None),
-            ("gpt-6.1-sol", FULL, Some(Medium)),
+            ("gpt-6.1-sol gpt-6.2-sol", FULL, Some(Medium)),
+            ("gpt-6.2-astra", FULL, None),
             // o3：2026-11-02 实测只接受 low/medium/high（xhigh/max 返回 400）。
             ("o1 o3 o4-mini", O_SERIES, None),
             ("chat-latest", MEDIUM_ONLY, None),

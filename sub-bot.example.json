@@ -2,6 +2,9 @@
   "dataDir": "/var/lib/sub-bot",
   "pricing": {
     "enabled": true,
+    "source": "models.dev",
+    "modelsDevUrl": "https://models.dev/api.json?type=all",
+    "refreshHours": 24,
     "models": {}
   },
   "shutdownGraceSecs": 10,
@@ -82,7 +85,9 @@
       "llmMaxRetries": 1,
       "allowedModels": [
         "gpt-6.1-sol",
-        "gpt-6-astra"
+        "gpt-6-astra",
+        "gpt-6.2-astra",
+        "gpt-6.2-sol"
       ],
       "reasoningEffort": "high",
       "workspaceRoots": [

@@ -1,55 +1,51 @@
-//! Built-in official USD-per-million-token price table used by `sub-bot usage` cost estimates.
+//! Config overrides, builtin USD-per-million-token prices, and per-record estimate math.
 //!
-//! These defaults were copied from the official API pricing pages on **2026-11-16**
-//! (America/Winnipeg). They are an estimate, not a bill: they omit batch/flex/fast tiers,
-//! regional premiums, and unpublished discounts. Users can override or extend the table
-//! in the config `pricing` section (`pricing.models`). A model with no official or
-//! overridden price is left unpriced and shown as `-`; rates are never invented.
+//! Most builtin rows are from the official API pricing pages, checked 2026-11-16
+//! (America/Winnipeg):
+//! - Anthropic: <https://platform.claude.com/docs/en/about-claude/pricing>
+//! - OpenAI: <https://developers.openai.com/api/docs/pricing>
 //!
-//! Sources (fetched 2026-11-16):
-//! - Anthropic API token prices: <https://platform.claude.com/docs/en/about-claude/pricing>
-//!   (`https://www.anthropic.com/pricing` is consumer Claude subscription plans, not API rates.)
-//! - OpenAI API token prices: <https://developers.openai.com/api/docs/pricing>
-//!   (`https://openai.com/api/pricing` is business/enterprise seat plans, not API rates.)
-//!
-//! Long-context tiers are included only where those pages list them:
-//! - Claude Haiku 5.5: prompts **over** 100,000 tokens use the higher rates.
-//! - `gpt-6.1-sol` / `gpt-6-astra`: prompts **more than** 272,000 input tokens use the
-//!   long-context rates (2× input and cache, 1.5× output) for the full request.
-//!
-//! OpenAI cache-write TTLs on the official page are 30 minutes and 12 hours (not Anthropic's
-//! 5-minute / 1-hour writes). Those rates live in `cacheWrite30m` / `cacheWrite12h`.
+//! The GPT-6.2 rows are from the 2026-11-17 models.dev sample. These are standard
+//! token rates, not batch/flex/fast rates or a bill. OpenAI's 30m/12h cache-write
+//! TTLs are separate from Anthropic's 5m/1h and from long-context surcharges.
 
+use super::catalog::{ContextBand, PriceBands, RateBand};
 use super::Tokens;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Config `pricing` section: built-in official table plus optional per-model overrides.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PricingConfig {
-    /// Default true: show estimated cost. Set false to hide cost columns.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Overrides and additions keyed by `provider/model`. A listed model replaces the
-    /// built-in row entirely (not a field-level merge).
-    #[serde(default)]
-    pub models: BTreeMap<String, ModelPrice>,
+pub(super) const MODELS_DEV_URL: &str = "https://models.dev/api.json?type=all";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum PricingSource {
+    #[default]
+    #[serde(rename = "models.dev")]
+    ModelsDev,
+    #[serde(rename = "builtin")]
+    Builtin,
 }
 
-fn default_true() -> bool {
-    true
+/// Config `pricing` section. `enabled` controls estimates, `source` controls live I/O.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct PricingConfig {
+    pub enabled: bool,
+    pub source: PricingSource,
+    pub models_dev_url: String,
+    pub refresh_hours: u32,
+    /// Overrides and additions keyed by `provider/model`. Each replaces a whole row.
+    pub models: BTreeMap<String, ModelPrice>,
 }
 
 impl Default for PricingConfig {
     fn default() -> Self {
-        Self { enabled: true, models: BTreeMap::new() }
+        Self { enabled: true, source: PricingSource::ModelsDev, models_dev_url: MODELS_DEV_URL.into(), refresh_hours: 24, models: BTreeMap::new() }
     }
 }
 
 /// Deprecated `usageEstimate` shape from v0.11.0. Prices here are treated as overrides;
-/// `enabled` is ignored so the official table is shown unless `pricing.enabled` is false.
+/// `enabled` is ignored; only `pricing.enabled` controls estimates.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UsageEstimateConfig {
@@ -61,7 +57,23 @@ pub struct UsageEstimateConfig {
 
 impl PricingConfig {
     pub fn validate(&self, at: &str) -> Result<()> {
-        validate_map(&self.models, at)
+        ensure!(self.models_dev_endpoint().is_some(), "{at}.modelsDevUrl must be an absolute HTTP(S) URL without userinfo or a fragment");
+        ensure!((1..=8760).contains(&self.refresh_hours), "{at}.refreshHours must be in 1..=8760");
+        validate_map(&self.models, &format!("{at}.models"))
+    }
+
+    pub(super) fn models_dev_endpoint(&self) -> Option<reqwest::Url> {
+        let text = self.models_dev_url.as_str();
+        // Require an explicit authority, and reject even empty userinfo before URL normalization.
+        let (scheme, rest) = text.split_once("://")?;
+        if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) || text.chars().any(char::is_control) {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#', '\\']).next()?;
+        if authority.is_empty() || authority.contains('@') {
+            return None;
+        }
+        reqwest::Url::parse(text).ok().filter(|url| url.host_str().is_some() && url.username().is_empty() && url.password().is_none() && url.fragment().is_none())
     }
 
     /// Fold legacy `usageEstimate.pricesUsdPerMillion` into `models` (caller overrides still win).
@@ -70,16 +82,7 @@ impl PricingConfig {
         for (k, v) in &self.models {
             models.insert(k.clone(), v.clone());
         }
-        Self { enabled: self.enabled, models }
-    }
-
-    /// Official table plus overrides in `models`.
-    pub fn resolved(&self) -> BTreeMap<String, ModelPrice> {
-        let mut table = official_prices();
-        for (k, v) in &self.models {
-            table.insert(k.clone(), v.clone());
-        }
-        table
+        Self { models, ..self.clone() }
     }
 
     pub fn validate_legacy(legacy: &UsageEstimateConfig, at: &str) -> Result<()> {
@@ -89,11 +92,19 @@ impl PricingConfig {
 
 fn validate_map(map: &BTreeMap<String, ModelPrice>, at: &str) -> Result<()> {
     for (key, price) in map {
-        let valid_key = key.split_once('/').is_some_and(|(p, m)| !p.trim().is_empty() && !m.trim().is_empty());
-        ensure!(valid_key, "{at}: key '{key}' must be 'provider/model'");
+        ensure!(split_price_key(key).is_some(), "{at}: key '{key}' must be 'provider/model'");
         price.validate(&format!("{at}.{key}"))?;
     }
     Ok(())
+}
+
+pub(super) fn split_price_key(key: &str) -> Option<(&str, &str)> {
+    let (provider, model) = key.split_once('/')?;
+    (valid_key_part(provider) && valid_key_part(model)).then_some((provider, model))
+}
+
+pub(super) fn valid_key_part(part: &str) -> bool {
+    !part.trim().is_empty() && !part.chars().any(char::is_control)
 }
 
 /// USD per million tokens. `cacheRead` also accepts the alias `cached` (OpenAI cached input).
@@ -173,32 +184,35 @@ impl ModelPrice {
         v
     }
 
-    fn pick(&self, tokens: &Tokens, provider: &str) -> Rates {
-        let prompt = billed_prompt_tokens(provider, tokens);
-        if let Some(lc) = &self.long_context {
-            if prompt > lc.threshold {
-                return Rates {
-                    input: lc.input,
-                    output: lc.output,
-                    cache_read: lc.cache_read.or(self.cache_read).unwrap_or(lc.input),
-                    cache_write_5m: lc.cache_write_5m.or(self.cache_write_5m),
-                    cache_write_1h: lc.cache_write_1h.or(self.cache_write_1h),
-                    cache_write_30m: lc.cache_write_30m.or(self.cache_write_30m),
-                    cache_write_12h: lc.cache_write_12h.or(self.cache_write_12h),
-                    reasoning: lc.reasoning.or(self.reasoning).unwrap_or(lc.output),
-                };
-            }
-        }
-        Rates {
+    pub(super) fn bands(&self) -> PriceBands {
+        let base = RateBand {
             input: self.input,
             output: self.output,
-            cache_read: self.cache_read.unwrap_or(self.input),
+            cache_read: Some(self.cache_read.unwrap_or(self.input)),
             cache_write_5m: self.cache_write_5m,
             cache_write_1h: self.cache_write_1h,
             cache_write_30m: self.cache_write_30m,
             cache_write_12h: self.cache_write_12h,
             reasoning: self.reasoning.unwrap_or(self.output),
-        }
+        };
+        let tiers = self
+            .long_context
+            .iter()
+            .map(|lc| ContextBand {
+                threshold: lc.threshold,
+                rates: RateBand {
+                    input: lc.input,
+                    output: lc.output,
+                    cache_read: Some(lc.cache_read.or(self.cache_read).unwrap_or(lc.input)),
+                    cache_write_5m: lc.cache_write_5m.or(self.cache_write_5m),
+                    cache_write_1h: lc.cache_write_1h.or(self.cache_write_1h),
+                    cache_write_30m: lc.cache_write_30m.or(self.cache_write_30m),
+                    cache_write_12h: lc.cache_write_12h.or(self.cache_write_12h),
+                    reasoning: lc.reasoning.or(self.reasoning).unwrap_or(lc.output),
+                },
+            })
+            .collect();
+        PriceBands { base, tiers, builtin_ttl_fields: Vec::new() }
     }
 }
 
@@ -219,17 +233,6 @@ impl LongContextPrice {
         }
         v
     }
-}
-
-struct Rates {
-    input: f64,
-    output: f64,
-    cache_read: f64,
-    cache_write_5m: Option<f64>,
-    cache_write_1h: Option<f64>,
-    cache_write_30m: Option<f64>,
-    cache_write_12h: Option<f64>,
-    reasoning: f64,
 }
 
 /// Estimated USD cost broken into the four buckets shown in `--json` / `GET /v1/usage`.
@@ -291,12 +294,9 @@ pub fn cache_hit_rate_from_parts(uncached: u64, cache_read: u64, cache_write: u6
 }
 
 /// Look up `provider/model`, then the same id with a trailing `-YYYYMMDD` snapshot suffix stripped.
-pub fn lookup<'a>(prices: &'a BTreeMap<String, ModelPrice>, provider: &str, model: &str) -> Option<&'a ModelPrice> {
+pub(super) fn lookup<'a, T>(prices: &'a BTreeMap<String, T>, provider: &str, model: &str) -> Option<(&'a str, &'a T)> {
     let key = format!("{provider}/{model}");
-    if let Some(p) = prices.get(&key) {
-        return Some(p);
-    }
-    strip_snapshot(model).and_then(|base| prices.get(&format!("{provider}/{base}")))
+    prices.get_key_value(&key).or_else(|| strip_snapshot(model).and_then(|base| prices.get_key_value(&format!("{provider}/{base}")))).map(|(key, price)| (key.as_str(), price))
 }
 
 fn strip_snapshot(model: &str) -> Option<&str> {
@@ -304,22 +304,17 @@ fn strip_snapshot(model: &str) -> Option<&str> {
     (date.len() == 8 && date.chars().all(|c| c.is_ascii_digit())).then_some(base)
 }
 
-/// Estimate one record. `None` if the model is unpriced, or if cache writes cannot be priced
-/// without inventing a TTL (OpenAI writes present but not split into 30m/12h).
-pub fn estimate_record(prices: &BTreeMap<String, ModelPrice>, provider: &str, model: &str, tokens: &Tokens) -> Option<CostBreakdown> {
-    let price = lookup(prices, provider, model)?;
-    let rates = price.pick(tokens, provider);
+/// Apply the selected context band to the whole call. `None` if a used cache rate is absent.
+pub(super) fn estimate_record(price: &PriceBands, provider: &str, tokens: &Tokens) -> Option<CostBreakdown> {
+    let prompt = billed_prompt_tokens(provider, tokens);
+    let rates = price.tiers.iter().rev().find(|tier| prompt > tier.threshold).map_or(&price.base, |tier| &tier.rates);
     let writes = tokens.write_buckets();
     // OpenAI writes with no TTL split cannot be priced without guessing 30m vs 12h.
     if provider != "anthropic" && writes.unsplit > 0 {
         return None;
     }
     let need = |count: u64, rate: Option<f64>| if count == 0 { Some(0.0) } else { rate.map(|r| count as f64 * r) };
-    let write_cost = need(writes.t5m, rates.cache_write_5m)
-        .and_then(|a| need(writes.t1h, rates.cache_write_1h).map(|b| a + b))
-        .and_then(|a| need(writes.t30m, rates.cache_write_30m).map(|b| a + b))
-        .and_then(|a| need(writes.t12h, rates.cache_write_12h).map(|b| a + b))?;
-    // Anthropic writes with no 1h/5m rate when that bucket is used → unpriced.
+    let write_cost = need(writes.t5m, rates.cache_write_5m)? + need(writes.t1h, rates.cache_write_1h)? + need(writes.t30m, rates.cache_write_30m)? + need(writes.t12h, rates.cache_write_12h)?;
     let uncached = uncached_input(provider, tokens);
     let reasoning = tokens.reasoning.min(tokens.output);
     let output_non_reasoning = tokens.output.saturating_sub(reasoning);
@@ -328,14 +323,14 @@ pub fn estimate_record(prices: &BTreeMap<String, ModelPrice>, provider: &str, mo
         CostBreakdown {
             input_cost: uncached as f64 * rates.input / mtok,
             output_cost: (output_non_reasoning as f64 * rates.output + reasoning as f64 * rates.reasoning) / mtok,
-            cache_read_cost: tokens.cache_read as f64 * rates.cache_read / mtok,
+            cache_read_cost: need(tokens.cache_read, rates.cache_read)? / mtok,
             cache_write_cost: write_cost / mtok,
         }
         .rounded(),
     )
 }
 
-fn official_prices() -> BTreeMap<String, ModelPrice> {
+pub(super) fn official_prices() -> BTreeMap<String, ModelPrice> {
     let mut m = BTreeMap::new();
     // Anthropic: https://platform.claude.com/docs/en/about-claude/pricing (2026-11-16)
     // columns: base input, 5m cache writes, 1h cache writes, cache hits and refreshes, output.
@@ -369,8 +364,11 @@ fn official_prices() -> BTreeMap<String, ModelPrice> {
     m.insert("anthropic/claude-haiku-5-5".into(), haiku);
 
     // OpenAI: https://developers.openai.com/api/docs/pricing (2026-11-16), Standard short/long context.
-    insert_openai(&mut m, "openai/gpt-6.1-sol", 2.0, 10.0, 0.10, 2.50, 5.0, 4.0, 15.0, 0.20, 5.0, 10.0);
-    insert_openai(&mut m, "openai/gpt-6-astra", 10.0, 50.0, 1.0, 12.50, 25.0, 20.0, 75.0, 2.0, 25.0, 50.0);
+    insert_openai(&mut m, "openai/gpt-6.1-sol", 2.0, 10.0, 0.10, 2.50, Some(5.0), 4.0, 15.0, 0.20, 5.0, Some(10.0));
+    insert_openai(&mut m, "openai/gpt-6-astra", 10.0, 50.0, 1.0, 12.50, Some(25.0), 20.0, 75.0, 2.0, 25.0, Some(50.0));
+    // models.dev (2026-11-17): only the short (30m) write rate is known, in both context bands.
+    insert_openai(&mut m, "openai/gpt-6.2-astra", 8.0, 40.0, 0.4, 10.0, None, 16.0, 60.0, 0.8, 20.0, None);
+    insert_openai(&mut m, "openai/gpt-6.2-sol", 2.0, 10.0, 0.1, 2.5, None, 4.0, 15.0, 0.2, 5.0, None);
     m
 }
 
@@ -400,12 +398,12 @@ fn insert_openai(
     output: f64,
     cached: f64,
     write_30m: f64,
-    write_12h: f64,
+    write_12h: Option<f64>,
     long_input: f64,
     long_output: f64,
     long_cached: f64,
     long_30m: f64,
-    long_12h: f64,
+    long_12h: Option<f64>,
 ) {
     map.insert(
         key.into(),
@@ -416,7 +414,7 @@ fn insert_openai(
             cache_write_5m: None,
             cache_write_1h: None,
             cache_write_30m: Some(write_30m),
-            cache_write_12h: Some(write_12h),
+            cache_write_12h: write_12h,
             reasoning: None,
             long_context: Some(LongContextPrice {
                 threshold: 272_000,
@@ -426,7 +424,7 @@ fn insert_openai(
                 cache_write_5m: None,
                 cache_write_1h: None,
                 cache_write_30m: Some(long_30m),
-                cache_write_12h: Some(long_12h),
+                cache_write_12h: long_12h,
                 reasoning: None,
             }),
         },

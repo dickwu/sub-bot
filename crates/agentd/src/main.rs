@@ -168,8 +168,10 @@ enum Cmd {
     },
     /// 调整服务端会话的回合预算（连接参数同 ask）：--set N（绝对值）| --add N（可为负）| --stop（停止暂停在上限的 run）；打印 JSON 响应
     Turns(turns::Turns),
-    /// 查看本地记录的 LLM 用量（不连接服务、不加载密钥）：默认今天，可按账号 / 模型 / 日期等分组
+    /// 查看已记录的 LLM 用量与费用估测（不连接服务、不加载密钥）
     Usage(usage::cli::Usage),
+    /// 查看估测使用的标准 token 单价（公开价格目录；不加载密钥）
+    Pricing(usage::cli::Pricing),
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
     Models {
         /// 列出全部（含 embedding、语音、图片、快照等）
@@ -376,10 +378,17 @@ async fn main() -> anyhow::Result<()> {
         logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
         return keys::run(&cli, command);
     }
-    if let Cmd::Usage(ref args) = cli.cmd {
-        // usage 只读 dataDir 里的用量日志，不加载密钥、不建日志目录
-        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
-        return usage::cli::run(args, cli.config.as_deref(), cli.data_dir.clone());
+    match &cli.cmd {
+        Cmd::Usage(args) => {
+            // 本地报表不构造 Hub、不加载密钥；公开目录的诊断仅写 stderr。
+            logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
+            return usage::cli::run(args, cli.config.as_deref(), cli.data_dir).await;
+        }
+        Cmd::Pricing(args) => {
+            logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
+            return usage::cli::run_pricing(args, cli.config.as_deref(), cli.data_dir).await;
+        }
+        _ => {}
     }
     if let Cmd::Ask(_) | Cmd::Turns(_) = cli.cmd {
         // ask / turns only need stderr diagnostics; never create a log directory or store.
@@ -550,7 +559,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::Pricing(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -781,6 +790,19 @@ fn format_efforts(model: &agent_ai::ModelInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pricing_and_usage_refresh_cli_flags() {
+        let Cmd::Pricing(list) = Cli::try_parse_from(["sub-bot", "pricing", "--refresh", "--json"]).unwrap().cmd else { panic!("pricing list") };
+        assert!(list.refresh && list.json && list.key.is_none());
+        let Cmd::Pricing(show) = Cli::try_parse_from(["sub-bot", "--config", "c.json", "pricing", "openai/gpt-6.2-sol"]).unwrap().cmd else { panic!("pricing show") };
+        assert_eq!((show.key.as_deref(), show.refresh, show.json), (Some("openai/gpt-6.2-sol"), false, false));
+        for bad in ["openai", "/model", "openai/", "openai/ ", "openai/\nmodel"] {
+            assert!(Cli::try_parse_from(["sub-bot", "pricing", bad]).is_err());
+        }
+        let Cmd::Usage(usage) = Cli::try_parse_from(["sub-bot", "usage", "--refresh-prices", "--json"]).unwrap().cmd else { panic!("usage") };
+        assert!(usage.refresh_prices && usage.json);
+    }
 
     #[test]
     fn probe_and_extensible_effort_cli() {

@@ -1800,6 +1800,11 @@ mod tests {
         assert_eq!(body["range"]["kind"], "today");
         assert_eq!(body["estimate"]["currency"], "USD");
         assert!(body["estimate"]["note"].as_str().unwrap().contains("not a bill"));
+        assert_eq!(body["estimate"].get("fetchedAt"), Some(&Value::Null));
+        assert_eq!(body["estimate"]["cacheStatus"], "missing");
+        assert_eq!(body["total"].get("priceSource"), Some(&Value::Null));
+        assert_eq!(body["total"]["priceSources"], json!({}));
+        assert!(body["total"].get("estCost").is_none());
 
         let now = chrono::Local::now();
         let day = now.format("%Y-%m-%d").to_string();
@@ -1831,7 +1836,10 @@ mod tests {
         assert_eq!(body["total"]["input"], 13);
         assert_eq!(body["total"]["failed"], 1);
         assert_eq!(body["groups"].as_array().unwrap().len(), 2);
-        assert!(body["total"]["estCost"].is_number(), "official prices should cover opus-5-5 and sonnet-5-5");
+        assert_eq!(body["total"]["priceSource"], "builtin");
+        assert_eq!(body["total"]["priceSources"], json!({"builtin":2}));
+        assert!(body["groups"].as_array().unwrap().iter().all(|g| g["priceSource"] == "builtin"));
+        assert!(body["total"]["estCost"].is_number(), "builtin prices should cover opus-5-5 and sonnet-5-5");
         assert!(body["total"]["inputCost"].is_number());
         assert!(body["total"]["outputCost"].is_number());
         assert!(body["total"]["cacheReadCost"].is_number());
@@ -1842,6 +1850,34 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["total"]["requests"], 1);
         assert_eq!(body["total"]["input"], 10);
+
+        journal.append(&rec("work", "unknown-model", 1, false, false)).unwrap();
+        let mut no_long_ttl = rec("default", "gpt-6.2-sol", 10, false, false);
+        no_long_ttl.provider = "openai".into();
+        no_long_ttl.tokens.cache_write_12h = 1;
+        journal.append(&no_long_ttl).unwrap();
+        let (status, mixed) = request(&app, "GET", "/v1/usage?by=model", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(mixed["total"].get("priceSource"), Some(&Value::Null));
+        assert_eq!(mixed["total"]["priceSources"], json!({"builtin":3,"unknown":1}));
+        assert_eq!(mixed["total"]["unpricedRequests"], 2);
+        assert!(mixed["total"].get("estCost").is_none());
+        let known = mixed["groups"].as_array().unwrap().iter().find(|g| g["key"]["model"] == "gpt-6.2-sol").unwrap();
+        assert_eq!(known["priceSource"], "builtin");
+        assert_eq!(known["unpricedRequests"], 1);
+        assert!(known.get("estCost").is_none());
+
+        let mut disabled = hub.config.clone();
+        disabled.pricing.enabled = false;
+        let disabled = router(AppState { hub: Hub::new(disabled, "faux", None, None).unwrap() });
+        let (status, hidden) = request(&disabled, "GET", "/v1/usage", Some("test-token"), json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(hidden.get("estimate").is_none());
+        for row in std::iter::once(&hidden["total"]).chain(hidden["groups"].as_array().unwrap()) {
+            for field in ["priceSource", "priceSources", "unpricedRequests", "estCost", "cacheReadCost"] {
+                assert!(row.get(field).is_none(), "unexpected {field}");
+            }
+        }
 
         assert_eq!(request(&app, "GET", "/v1/usage?today=true&month=true", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);
         assert_eq!(request(&app, "GET", "/v1/usage?days=0", Some("test-token"), json!({})).await.0, StatusCode::BAD_REQUEST);

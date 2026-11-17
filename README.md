@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：v0.10.6（长流稳健性：`streamIdleTimeoutSecs` 默认改为 1800 秒、最大 7200 秒，可在全局 / provider / 账号 / profile / 请求级设置；LLM 连接启用 TCP keepalive；已流出工具调用事件后遇到瞬时故障也会丢弃部分消息并重放，`message_retry` 增加 `maxRetries` / `delayMs` / `kind` / `discardedToolCalls`；请求级 `session.llmMaxRetries`，见「LLM 重试与进度」「流空闲超时」）。v0.10.4（回合预算：默认 `maxTurns` 改为 150；调用方可按会话 / 请求设置 `maxTurns` / `onMaxTurns`，运行中通过 `POST /v1/sessions/{id}/turns` 或 `sub-bot turns` 提高 / 降低 / 停止，没有封顶，模型不能自己延长；达到上限时 stop / ask / summarize，见「回合预算（maxTurns）」）。v0.10.3（修复：macOS Keychain 条目每次 `brew upgrade` 后都要重新授权——条目改为经 Apple 的 `/usr/bin/security` 读写，ACL 不再绑定 sub-bot 二进制，升级后无需任何操作；新增一次性迁移命令 `sub-bot keys reauth`（`--from-env` 零弹窗、`--dry-run`、`--json`），见「密钥存储」）。v0.10.2（修复：一次未认证请求（401）在 issues.log 里出现同一 issue 的 count 1 / count 2 两行——HTTP 访问日志 `request finished` 不再单独成为 issue，4xx 从不上报，5xx 只在该请求没有更具体的 issue 时兜底上报；issue 脱敏不再把 `missing or unknown bearer token` 这类普通短语打成 `[redacted]`，真正的 Bearer 凭据、`sk-…`、GitHub token、JWT、`key/token/secret/password = 值` 和已配置的密钥仍然掩盖；README 补充 brew upgrade 之后 LaunchAgent 的重新授权与重启步骤）。v0.10.1（修复：Anthropic extended thinking 会话压缩后每次调用都报 400 `Invalid signature in thinking block`；压缩保留的消息在发给模型的上下文里去掉 thinking 块，已损坏的会话恢复后自愈）。v0.10.0：内置 `grep` / `find`（嵌入 ripgrep 引擎，无需安装 `rg`）、会话持久化与重启后恢复（`--resume`）、手动 / 自动上下文压缩、工具审批（`toolApproval`，HTTP / RPC / 终端审批）、MCP 客户端（stdio / streamable HTTP，`mcpServers`）；许可证 MIT OR Apache-2.0。v0.9.3（修复：Keychain 等待授权提示、可选账号加载失败、账号 failover 的 WARN 日志不再被重复上报为 `log_warn` issue，issues.log / webhook 每个事件只收到一条 typed issue）。v0.9.2（macOS Keychain 读取不再无限挂起：等待授权对话框超过 1 秒提示、`keychainTimeoutSecs`（默认 30 秒）后报明确错误；`/v1/chat` 顶层 `profile` / `model` 作为 `session.*` 的别名，未知字段返回 400）。v0.9.1（修复：只经由 profile 命名账号使用的 provider 不再要求其默认账号，`keys check` 同步；`serve` 启动时显示 key 配置错误原因而不是通用文案）。v0.9.0：新增 macOS Keychain key 来源（`apiKeyKeychain`）、`sub-bot keys set|list|delete|check`（macOS 存 Keychain，Linux 存 0600 受管 key 文件），以及同一 provider 多账号（`providers.<id>.accounts`、profile `account` / `allowedAccounts`、请求级 `account` 覆盖、OpenAI organization/project 请求头、429/额度耗尽时的账号 failover），见「密钥存储」与「同一 provider 多账号」。v0.8.1：OpenAI 默认模型 `gpt-6.1-sol`，内置配置默认只允许 `gpt-6.1-sol` / `gpt-6-astra`；`models` 标记 profile 允许的模型；推理强度调整只 warn 一次，`session_run` 日志记录路由后的实际模型。推理强度可在运行时按请求/会话动态修改（HTTP / CLI / RPC），Claude provider 支持 standard / deep / auto 模型路由（见「动态推理强度与模型路由」）。`ask` 同步支持 SSE 文本增量 / `--json` NDJSON；默认数据目录无 panic 回退并检查临时目录所有权；`/v1/issues` 即时更新去重计数。支持 Unix socket、本地身份认证、问题上报（issues）、多目标 webhook、异步任务、结果轮询和 webhook 投递。接入了 OpenAI Responses API 和 Chat Completions（按模型自动选择）。Claude（Anthropic）多 provider 配置见下文；会话默认持久化，可在重启后按 ID 恢复，长会话自动压缩上下文（见「会话持久化与恢复」「上下文压缩」）；内置 `grep` / `find` 工具见「内置工具与预设」。
+> 状态：**v0.13.0**。用量报表默认用 models.dev 的公开标准单价做费用估测，离线时沿用最近一次有效快照或内置表；新增 `sub-bot pricing` 和 `usage --refresh-prices`。内置 OpenAI 允许列表新增 GPT-6.2 Astra / Sol，默认仍是 GPT-6.1 Sol。见「用量统计」与 [CHANGELOG.md](CHANGELOG.md)。
 
 ## Claude (Anthropic)
 
@@ -152,7 +152,7 @@ curl -X DELETE "localhost:7878/v1/sessions/$SID?purge=true" -H "Authorization: B
 }
 ```
 
-内置上下文窗口（保守值）：Claude（已列出的 4.x / 5.x）200k；gpt-5.x / gpt-6.x 400k；gpt-4.1 1M；o 系列 200k；其它 128k。窗口包含输出，阈值留出了回复空间。
+内置上下文窗口：`gpt-6.2-astra` / `gpt-6.2-sol` 为 1,050,000（与下面的计价分档无关）；其它模型沿用保守值：Claude（已列出的 4.x / 5.x）200k；其它 gpt-5.x / gpt-6.x 400k；gpt-4.1 1M；o 系列 200k；其它 128k。窗口包含输出，压缩阈值留出了回复空间。
 
 ### 触发与估计
 
@@ -384,9 +384,9 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 
 不带 `--config` 时会使用单 client、单 `default` profile 的模式，以 `--workspace`（默认当前目录）为根，并自动将服务进程的有效 uid 映射到 client `default`。运行 `sub-bot serve --unix-socket` 后，同一用户即可用 `sub-bot ask "hello"` 零 token 调用；同一 uid 下的所有进程都获得该身份。TCP 仍需通过 `SUB_BOT_TOKEN` 或 `serve --token` 指定调用凭据；省略时生成的随机 token 不会打印。显式配置文件不会自动添加 uid 映射，需要自行配置 `localClients` 或 `trustLoopback`。
 
-离线试用（不调用 OpenAI）：加上 `--provider faux`。
+试用时可加上 `--provider faux`，不调用 OpenAI。若要让 `serve` 也不联网更新估测价格，配置 `pricing.source: "builtin"`（见「用量统计」）。
 
-**默认 OpenAI 模型**：默认模型是 `gpt-6.1-sol`；推荐的 OpenAI 模型只有 `gpt-6.1-sol` 与 `gpt-6-astra`。不带 `--config` 且 provider 为 OpenAI 时，内置 `default` profile 的 `allowedModels` 只允许这两个（`--model` 显式指定的其它模型会自动加入）。需要其它 OpenAI 模型时，在配置文件 profile 的 `allowedModels` 中显式添加（或不填 `allowedModels` 表示不限制）。
+**默认 OpenAI 模型**：默认仍是 `gpt-6.1-sol`。不带 `--config` 且 provider 为 OpenAI 时，内置 `default` profile 的 `allowedModels` 包含 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6.2-astra` 和 `gpt-6.2-sol`（`--model` 显式指定的其它模型会自动加入）。在配置文件中可自行设置 profile 的 `allowedModels`，不填则不限制。
 
 `serve` 收到 Ctrl-C 或 SIGTERM 时停止接受新会话/提交，取消正在运行的会话，等运行收尾并写入 JSONL 后退出。
 
@@ -420,7 +420,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
       "tools": ["read", "ls", "grep", "find", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"（见「内置工具与预设」）
       "model": "gpt-6.1-sol",                  // profile 默认模型
-      "allowedModels": ["gpt-6.1-sol", "gpt-6-astra"],  // 可选：bot 能切换到的模型（支持 * 通配），不填则不限制；其它 OpenAI 模型需在此显式添加
+      "allowedModels": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"],  // 可选：支持 * 通配，不填则不限制
       "reasoningEffort": "high",               // 可选：none|minimal|low|medium|high|xhigh|max 或 provider 小写名称
       "api": "auto",                           // 可选：auto|chat|responses，覆盖 defaultApi
       "maxOutputTokens": 8000,                 // 可选：单次模型调用的输出上限
@@ -496,9 +496,9 @@ sub-bot --model gpt-6-astra --reasoning-effort xhigh run --json "say hi"
 - Anthropic 4.7+/已列出的 5.x 用 `thinking: adaptive` + `output_config.effort`（low/medium/high/xhigh/max）；opus/sonnet-4-6、mythos-preview 同机制但没有 xhigh。opus-4-5 用 effort + enabled budget；sonnet/haiku-4-5 仅 enabled budget（low/medium/high → 8192/16384/32000），不发 effort。日期后缀不影响目录匹配。未知 Claude 用 adaptive + effort 原样传递。
 - Adaptive 默认输出额度按**有效**档位为 low/medium 16000、high 32000、xhigh 64000、max 为模型上限；显式 `maxOutputTokens` 优先，最终不超过模型上限（已知 adaptive 128000、4.5/未知 64000）。Budget 机制还保证输出额度至少 budget+4096。启用 thinking 不发 temperature；签名 thinking 回放保持不变。
 
-### 实测能力（不经过钳制）
+### 推理能力表（不经过钳制）
 
-2026-11-02 用 `probe-efforts` 对账号内全部模型逐档实测（none…max + ultra）：
+主要来自 2026-11-02 的 `probe-efforts` 实测（none…max + ultra）；GPT-6.2 两项为内置目录能力。GPT-6.2 Sol 的目录默认档位是 `medium`，Astra 未指定；默认值仅供显示，不自动发送。
 
 | 模型 | 接受的档位 | 最高三档 |
 |---|---|---|
@@ -507,6 +507,7 @@ sub-bot --model gpt-6-astra --reasoning-effort xhigh run --json "say hi"
 | gpt-5.2 / 5.4 / 5.4-mini / 5.4-nano / 5.5 | none … xhigh | medium, high, xhigh |
 | gpt-5.6-luna/sol/terra, gpt-6-luna/sol, gpt-6.1-terra | none, low … max | high, xhigh, max |
 | gpt-6-astra, gpt-6.1-sol | low … max | high, xhigh, max |
+| gpt-6.2-astra, gpt-6.2-sol | low, medium, high, xhigh, max | high, xhigh, max |
 | o3 | low, medium, high | low, medium, high |
 | chat-latest | medium | medium |
 | gpt-4.x / 3.5 | 不支持 reasoning_effort | - |
@@ -1245,7 +1246,7 @@ RPC：`{"id":"9","type":"set_max_turns","maxTurns":300}`（或 `"addTurns":50` /
 - 异步任务 `webhookEvents` 新增 `turn_budget`（`all` 也包含），投递 `task.turn_budget_low` 与 `task.turn_budget_exhausted`，`data` 为事件字段加 `{taskId, sessionId, turnsUrl}`；回调目标对象的 `events` 也可写这两个名字。
 - 日志：INFO `turn budget changed`（session_id、max_turns、previous、turns_used、by）、`turn budget low`、`turn budget exhausted`、`turn budget wait resolved`；ask 超时为 WARN `turn budget wait timed out; stopping the run`。
 
-## 用量统计（v0.12.0）
+## 用量统计（v0.13.0）
 
 sub-bot 把每次 LLM 调用里 **provider 已经返回的 token 数** 记在本机，不需要 Anthropic / OpenAI 的 Admin key，也不是账单。能记的才会记：input、output、缓存读写、推理 token，以及时间、`provider/account`、模型、profile、会话 id、调用方 client 名（只有名字，没有 token）、重试次数。被丢弃的重试尝试和失败调用只要当时返回了用量，也会记下来并打上标记。压缩摘要和路由分类调用同样计入。provider 没有返回用量的调用会被跳过，不会写成全 0。
 
@@ -1259,21 +1260,74 @@ sub-bot usage --month --by model
 sub-bot usage --days 7 --by account,day
 sub-bot usage --since 2026-11-01 --until 2026-11-16 --account anthropic/work
 sub-bot usage --today --json
+sub-bot usage --by model --refresh-prices --json
 ```
 
-`--today`（默认）、`--month`、`--days N`、`--since` / `--until`（RFC 3339 或 `YYYY-MM-DD`）四选一。`--by` 可重复或逗号分隔：`account`（即 `provider/account`）、`model`、`profile`、`session`、`day`、`caller`。还可以按 `--account`、`--provider`、`--model`、`--profile`、`--session`、`--caller` 过滤。范围内没有记录时退出码仍是 0，总数为 0。这条命令只读本地日志，不会启动服务，也不会去加载 API key。
+`--today`（默认）、`--month`、`--days N`、`--since` / `--until`（RFC 3339 或 `YYYY-MM-DD`）四选一。`--by` 可重复或逗号分隔：`account`（即 `provider/account`）、`model`、`profile`、`session`、`day`、`caller`。还可以按 `--account`、`--provider`、`--model`、`--profile`、`--session`、`--caller` 过滤。范围内没有记录时退出码仍是 0，总数为 0。命令不修改用量日志、不启动服务、不加载密钥；可能联网下载并缓存的只有公开的价格目录。
 
 HTTP 查询与 CLI `--json` 是同一份对象，需要已有的 Bearer token（任意有效 client 均可，用量是这台机器上的合计）：
 
 ```bash
-curl -sS http://127.0.0.1:7878/v1/usage?by=account -H "Authorization: Bearer <token>"
+curl -sS 'http://127.0.0.1:7878/v1/usage?by=model' -H 'Authorization: Bearer <token>'
 ```
 
-stdio RPC 没有对应方法（它只服务于一个会话，并不镜像这类查询接口）。
+stdio RPC 没有对应方法。HTTP 查询只使用服务内存中的价格快照，不会触发下载。
 
-`sub-bot usage` 和 `GET /v1/usage` 会显示 **cache hit rate** 和 **estCost**（美元估测，不是账单）。命中率 = `cacheRead / (uncached input + cacheRead + cacheWrite)`。`--json` 里还有分项：`inputCost`、`outputCost`、`cacheReadCost`、`cacheWriteCost`。没有官方或配置单价的模型显示 `-`，不会编造价格。
+`estCost` 是按**报表生成时**的标准单价计算的美元费用：**估测，不是账单**。历史记录也用同一份快照，不追溯当时的单价，不考虑批量、快速模式、区域价或折扣。命中率 = `cacheRead / (uncached input + cacheRead + cacheWrite)`。有价格的合计还给出 `inputCost`、`outputCost`、`cacheReadCost`、`cacheWriteCost`。某次调用找不到单价，或用到了缺少单价的缓存分项（包括未拆 TTL 的 OpenAI 写入），会计入 `unpricedRequests`；含这种调用的组及总计不输出费用（表格显示 `-`）。
 
-内置单价表来自官方 API 定价页，**2026-11-16** 抓取，单位都是美元 / 百万 token（MTok）：
+CLI / HTTP JSON 片段（同一个报表可混用不同来源）：
+
+```json
+{
+  "estimate": {
+    "currency": "USD",
+    "note": "estimate (估测), not a bill. Uses report-time standard token prices; see sub-bot pricing for rates.",
+    "fetchedAt": "2026-11-17T12:00:00Z",
+    "cacheStatus": "fresh"
+  },
+  "groups": [
+    {"key": {"model": "gpt-6.2-sol"}, "requests": 1, "priceSource": "models.dev", "priceSources": {"models.dev": 1}, "unpricedRequests": 0, "estCost": 0.002},
+    {"key": {"model": "other"}, "requests": 1, "priceSource": "unknown", "priceSources": {"unknown": 1}, "unpricedRequests": 1}
+  ],
+  "total": {"requests": 2, "priceSource": null, "priceSources": {"models.dev": 1, "unknown": 1}, "unpricedRequests": 1}
+}
+```
+
+`priceSources` 按请求次数统计 `override` / `models.dev` / `builtin` / `unknown`；混合或无记录时 `priceSource` 为 `null`（空报表的 `priceSources` 为 `{}`）。已匹配价格但无法计费的请求仍保留该来源。`estimate.fetchedAt` 是通过校验的公开目录的 UTC 时间，没有快照则为 `null`；`cacheStatus` 为 `fresh` / `stale` / `missing` / `disabled`，即使每一条都用覆盖价也会反映目录状态。
+
+### 查看和刷新价格目录
+
+```bash
+sub-bot pricing                               # 列出可估测的模型（不是 allowedModels）
+sub-bot pricing openai/gpt-6.2-sol             # 标准输入 / 输出 / 缓存单价与上下文分档
+sub-bot pricing --refresh --json               # 强制尝试刷新；JSON 只写 stdout
+```
+
+默认配置（每个字段都可省略）：
+
+```json
+{
+  "pricing": {
+    "enabled": true,
+    "source": "models.dev",
+    "modelsDevUrl": "https://models.dev/api.json?type=all",
+    "refreshHours": 24,
+    "models": {}
+  }
+}
+```
+
+缓存为 `<dataDir>/pricing/models-dev.json`，只保存校验过的模型单价，不保存完整目录。两个 CLI 命令在缓存缺失或达到 `refreshHours`（1–8760 小时）时尝试一次短时下载；`serve` 启动时先读本地缓存，后台立即检查，之后每 15 分钟检查一次。请求不携带 API key、Admin key、用量或所查模型。`modelsDevUrl` 可指向绝对 HTTP(S) 镜像 URL，允许查询参数，不允许 URL 内的用户名、密码或片段；更换 URL 后不使用旧镜像的缓存。
+
+下载失效、超时或目录不可用时，继续使用最近一次有效缓存（过期也可用），没有缓存才回退到内置表；估测仍可输出，诊断走 stderr/服务日志。`pricing --refresh` 和 `usage --refresh-prices` 只是跳过新鲜度检查，失败不会使命令失败。要**完全禁用价格目录的联网和缓存读取**，设 `pricing.source: "builtin"`，强制刷新也不会联网，覆盖价仍生效。`pricing.enabled: false` 则隐藏所有估测字段，并禁止 `usage`、HTTP 与服务后台的价格 I/O；显式运行 `pricing` 仍可查看或刷新目录，且遵守 `source`。
+
+### 计价规则和内置价格
+
+单价单位是美元 / 百万 token（USD/MTok）。优先顺序为 **`pricing.models` 覆盖 > models.dev > 内置表**。每层用上游 `provider/model` 键先精确匹配，再尝试去掉末尾的 `-YYYYMMDD`，所以配置里的基础模型仍优先于目录的日期快照行；`-YYYY-MM-DD` 不自动截断。`pricing` JSON 的 `matchedKey` 显示实际命中的键。
+
+目录只采纳 OpenAI / Anthropic 的标准 token 单价。计价按一次调用的 prompt 大小选档，**严格超过** cutoff 才换档，选中的档用于整次调用；Anthropic 的 prompt 要加上缓存读写，OpenAI 的 input 已包含它们。目录的 `cache_write` 仅对应 Anthropic 5m / OpenAI 30m。内置表明确有该模型、该分档的长 TTL 单价，而且所有上下文 cutoff 一致时，才补入内置的 Anthropic 1h / OpenAI 12h **绝对值**；`pricing` 的 `builtinTtlFields` 标出这些字段。不会按比例推导长 TTL，也不会拿长上下文单价当长 TTL 单价。
+
+内置表的大部分行来自 **2026-11-16** 的官方 API 定价页：
 
 - Anthropic：<https://platform.claude.com/docs/en/about-claude/pricing>（`https://www.anthropic.com/pricing` 是 Claude 订阅，不是 API token 价）
   - `claude-fable-5-2`：input 8，5m write 10，1h write 16，cache read 0.20，output 40
@@ -1285,7 +1339,11 @@ stdio RPC 没有对应方法（它只服务于一个会话，并不镜像这类�
   - `gpt-6.1-sol`：短上下文 input 2，cached input 0.10，output 10，30m write 2.50，12h write 5；**超过** 272,000 input tokens 时 input 4，cached 0.20，output 15，30m 5，12h 10
   - `gpt-6-astra`：短上下文 input 10，cached input 1，output 50，30m write 12.50，12h write 25；超过 272,000 时 input 20，cached 2，output 75，30m 25，12h 50
 
-可以用配置覆盖或补行（完全替换该 `provider/model` 一行）。`pricing.enabled: false` 可关掉费用列。v0.11.0 的 `usageEstimate.pricesUsdPerMillion` 仍会当作覆盖并入，但其 `enabled: false` 不再隐藏官方表。
+- 新增两行来自 **2026-11-17** 的 models.dev 样本。prompt ≤272,000 / >272,000 的 input、output、cache read、30m write 依次如下；两档均无已知 12h 单价：
+  - `gpt-6.2-astra`：`8 / 40 / 0.4 / 10` → `16 / 60 / 0.8 / 20`
+  - `gpt-6.2-sol`：`2 / 10 / 0.1 / 2.5` → `4 / 15 / 0.2 / 5`
+
+配置可覆盖或补充一整行（不从较低优先级补字段）。旧 `usageEstimate.pricesUsdPerMillion` 仍会作为覆盖并入，同键由 `pricing.models` 优先；`usageEstimate.enabled` 忽略。
 
 ```json
 {
@@ -1299,8 +1357,6 @@ stdio RPC 没有对应方法（它只服务于一个会话，并不镜像这类�
   }
 }
 ```
-
-带日期后缀的模型 id（如 `claude-opus-5-5-20261101`）会回退到去掉 `-YYYYMMDD` 后的官方行。OpenAI 只报告了 cache write 总数、没有 30m/12h 拆分时，整行费用显示 `-`（不能靠猜测 TTL 定价）。
 
 ## 工具调用审批（toolApproval）
 

@@ -741,6 +741,8 @@ pub struct Hub {
     store: Arc<crate::store::Store>,
     /// 用量日志（`<dataDir>/usage`），不占用 state/ 的独占锁
     pub(crate) usage: Arc<crate::usage::Journal>,
+    /// Immutable pricing snapshots; construction does not touch disk or network.
+    pub(crate) pricing: Arc<crate::usage::price_store::PriceStore>,
     shutting_down: AtomicBool,
     http: reqwest::Client,
     #[cfg(test)]
@@ -981,7 +983,9 @@ impl Hub {
             StoreMode::Memory => crate::store::Store::memory(),
             StoreMode::Persistent => crate::store::Store::open(&config.data_dir().join("state"), Duration::from_secs(config.task_ttl_secs))?,
         };
-        let usage = Arc::new(crate::usage::Journal::for_data_dir(&config.data_dir()));
+        let data_dir = config.data_dir();
+        let usage = Arc::new(crate::usage::Journal::for_data_dir(&data_dir));
+        let pricing = Arc::new(crate::usage::price_store::PriceStore::new(data_dir, &config.effective_pricing()));
         let pending = store.pending();
         issues.attach_store(&store);
         for task in store.tasks.lock().unwrap().values_mut() {
@@ -1017,6 +1021,7 @@ impl Hub {
             issues,
             store,
             usage,
+            pricing,
             config,
             providers,
             unavailable,

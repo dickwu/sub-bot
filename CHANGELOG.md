@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.13.0] - 2026-11-17
+
+- Usage estimates now use report-time OpenAI and Anthropic standard token rates from models.dev, with config overrides first and builtin prices as the offline baseline. The public feed request sends no provider credentials, model query, or usage records; estimates are not bills.
+- Added `sub-bot pricing [PROVIDER/MODEL] [--refresh] [--json]` and `usage --refresh-prices`. `usage` refreshes stale pricing best-effort; `serve` refreshes in the background. A failed refresh keeps the last valid snapshot, even if stale. Set `pricing.source: "builtin"` to disable all live pricing I/O.
+- Usage JSON and `GET /v1/usage` report `priceSource`, per-source request counts, and the live snapshot's `fetchedAt` / `cacheStatus`. Journal format, `pricing.models`, legacy price overrides, and `pricing.enabled: false` remain compatible.
+- Added builtin prices, default allow-list entries, and 1,050,000-token context windows for GPT-6.2 Astra and Sol. The default OpenAI model remains GPT-6.1 Sol.
+- Dependencies: clap 4.6.8, rmcp 3.11 (pulls in unicode-normalization), uuid 1.29.3, zeroize 1.9.2.
+
 ## [0.12.0] - 2026-11-16
 
 Estimated usage cost that prices cached tokens separately from ordinary input, plus a cache hit rate. Still not a bill, and still no Admin key.

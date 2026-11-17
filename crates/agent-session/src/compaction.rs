@@ -446,9 +446,10 @@ mod tests {
         only.content = vec![thinking(), redacted()];
         // 原本就为空的失败消息原样保留
         let failed = AssistantMessage::failed("m", StopReason::Error, "boom");
-        let kept = vec![user("q"), Message::Assistant(text), Message::Assistant(call), result("c1", "ok"), Message::Assistant(only), Message::Assistant(failed.clone())];
+        let question = user("q");
+        let kept = vec![question.clone(), Message::Assistant(text), Message::Assistant(call), result("c1", "ok"), Message::Assistant(only), Message::Assistant(failed.clone())];
         let stripped = strip_kept_thinking(&kept);
-        assert_eq!(stripped, vec![user("q"), Message::Assistant(text_expected), Message::Assistant(call_expected), result("c1", "ok"), Message::Assistant(failed)]);
+        assert_eq!(stripped, vec![question, Message::Assistant(text_expected), Message::Assistant(call_expected), result("c1", "ok"), Message::Assistant(failed)]);
         for m in &stripped {
             if let Message::Assistant(a) = m {
                 assert!(!a.content.iter().any(|c| matches!(c, Content::Thinking { .. } | Content::RedactedThinking { .. })));

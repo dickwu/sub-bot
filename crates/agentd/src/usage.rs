@@ -7,7 +7,10 @@
 //! - 文件按本机本地时区的日期切分；目录 0700、文件 0600；O_APPEND + flock 写整行并 `sync_data`。不在 `state/` 的
 //!   独占锁里，`run` / `ask` 可与 `serve` 同时写。历史从不压缩改写。
 //! - 读取（[`load`]）：缺文件 = 空；最后一行被截断（崩溃）则忽略；损坏的完整行跳过并计数，其余照常统计。
+mod catalog;
 pub mod cli;
+mod models_dev;
+pub(crate) mod price_store;
 pub mod prices;
 pub mod report;
 #[cfg(test)]

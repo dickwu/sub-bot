@@ -101,6 +101,7 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
                 &config,
                 json!({
                     "defaultProvider":"faux", "defaultReasoningEffort":"minimal",
+                    "pricing":{"source":"builtin"},
                     "dataDir":dir.0.join(if env_base { "env-data" } else { "config-data" }),
                     "providers":{"anthropic":{"baseUrl":if env_base { "http://127.0.0.1:1/wrong" } else { &base }}},
                     "profiles":{"claude":{"model":"claude-test","workspaceRoots":[dir.0],"tools":["bash"],"loadContextFiles":false}},

@@ -1,6 +1,8 @@
 //! 用量日志、聚合、估测费用与 RecordingProvider 的测试。
 use super::{
-    prices::{self, ModelPrice, PricingConfig, UsageEstimateConfig},
+    catalog::{PriceBook, PriceSource},
+    models_dev::{compile_row, parse_models_dev},
+    prices::{self, ModelPrice, PricingConfig, PricingSource, UsageEstimateConfig},
     report::{aggregate, build, Filters, GroupBy, Query, RangeSpec},
     Journal, RecordingProvider, Tokens, UsageMeta, UsageRecord, RECORD_VERSION, USAGE_DIR,
 };
@@ -214,6 +216,14 @@ fn ranges_use_local_timezone_boundaries() {
     assert!(RangeSpec::Between { since: Some("2026-11-17".into()), until: Some("2026-11-16".into()) }.resolve(&now).is_err());
 }
 
+fn builtin_config() -> PricingConfig {
+    PricingConfig { source: PricingSource::Builtin, ..PricingConfig::default() }
+}
+
+fn builtin_book() -> PriceBook {
+    PriceBook::build(&builtin_config())
+}
+
 #[test]
 fn aggregation_groups_filters_and_empty_range() {
     let tz = offset_hours(8);
@@ -230,7 +240,8 @@ fn aggregation_groups_filters_and_empty_range() {
     ];
     let range = RangeSpec::Today.resolve(&now).unwrap();
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Account], filters: Filters::default() };
-    let (groups, total) = aggregate(&records, &range, &query, &tz, &PricingConfig::default().merge_legacy(&UsageEstimateConfig::default()));
+    let book = builtin_book();
+    let (groups, total) = aggregate(&records, &range, &query, &tz, &book);
     assert_eq!(total.requests, 3);
     assert_eq!(total.tokens.input, 20);
     assert_eq!(total.retried, 1);
@@ -243,29 +254,34 @@ fn aggregation_groups_filters_and_empty_range() {
 
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Account, GroupBy::Model], filters: Filters { account: Some("anthropic/work".into()), ..Default::default() } };
     let range = query.range.resolve(&now).unwrap();
-    let (groups, total) = aggregate(&records, &range, &query, &tz, &PricingConfig::default().merge_legacy(&UsageEstimateConfig::default()));
+    let (groups, total) = aggregate(&records, &range, &query, &tz, &book);
     assert_eq!(total.requests, 1);
     assert_eq!(groups[0].key.get("account").unwrap(), "anthropic/work");
     assert_eq!(total.tokens.input, 10);
 
     let query = Query { range: RangeSpec::Today, by: vec![GroupBy::Day], filters: Filters::default() };
-    let report = build(&query, &now, "Asia/Shanghai", None, &PricingConfig::default()).unwrap();
+    let report = build(&query, &now, "Asia/Shanghai", None, &book).unwrap();
     assert_eq!(report.total.requests, 0);
     assert_eq!(report.timezone, "Asia/Shanghai");
     assert_eq!(report.groups.len(), 0);
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(json["total"].get("priceSource"), Some(&serde_json::Value::Null));
+    assert_eq!(json["total"]["priceSources"], serde_json::json!({}));
+    assert!(json["total"].get("estCost").is_none());
 }
 
 #[test]
 fn estimate_costs_official_table_overrides_and_validation() {
-    let pricing = PricingConfig::default().merge_legacy(&UsageEstimateConfig::default());
-    pricing.validate("pricing.models").unwrap();
+    builtin_config().validate("pricing").unwrap();
+    let pricing = builtin_book();
+    let cost_of = |record| pricing.cost(record).1;
 
     // Official Opus 5.5 (2026-11-16): input $4, output $20, cacheRead $0.20, 5m write $5.
     // 100*4 + 50*0.20 + 20*5 + 10*20 = 400 + 10 + 100 + 200 = 710 / 1e6
     let anthro_toks = toks(100, 10, 50, 20, 0);
     assert_eq!(anthro_toks.cache_write_5m, 20);
     let anthro = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", anthro_toks);
-    let cost = pricing.cost(&anthro).unwrap();
+    let cost = cost_of(&anthro).unwrap();
     assert!((cost.input_cost - 0.0004).abs() < 1e-12);
     assert!((cost.cache_read_cost - 0.000010).abs() < 1e-12);
     assert!((cost.cache_write_cost - 0.0001).abs() < 1e-12);
@@ -275,12 +291,12 @@ fn estimate_costs_official_table_overrides_and_validation() {
     // 1h writes use the 1h rate ($8 / MTok on opus 5.5).
     let split = Tokens { input: 0, output: 0, cache_write_5m: 0, cache_write_1h: 20, cache_write: 20, total_tokens: 20, ..Default::default() };
     let anthro_1h = record(1, "2026-11-16", "anthropic", "work", "claude-opus-5-5", split);
-    assert!((pricing.cost(&anthro_1h).unwrap().cache_write_cost - 0.00016).abs() < 1e-12);
+    assert!((cost_of(&anthro_1h).unwrap().cache_write_cost - 0.00016).abs() < 1e-12);
 
     // Official gpt-6.1-sol: input $2, cached $0.10, output $10. prompt=100 includes 40 cached, 0 writes.
     // uncached 60*2 + 40*0.10 + 80*10 = 120 + 4 + 800 = 924 / 1e6
     let openai = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks_openai(100, 80, 40, 0, 0, 30));
-    let cost = pricing.cost(&openai).unwrap();
+    let cost = cost_of(&openai).unwrap();
     assert!((cost.input_cost - 0.00012).abs() < 1e-12);
     assert!((cost.cache_read_cost - 0.000004).abs() < 1e-12);
     assert!((cost.output_cost - 0.0008).abs() < 1e-12);
@@ -291,26 +307,26 @@ fn estimate_costs_official_table_overrides_and_validation() {
     // OpenAI writes without a 30m/12h split cannot be priced (would invent a TTL).
     let unsplit = Tokens { input: 100, output: 0, cache_write: 10, total_tokens: 100, ..Default::default() };
     let openai_unsplit = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", unsplit);
-    assert!(pricing.cost(&openai_unsplit).is_none());
+    assert!(cost_of(&openai_unsplit).is_none());
 
     // OpenAI 30m writes at $2.50 / MTok (gpt-6.1-sol short context).
     let with_write = record(1, "2026-11-16", "openai", "default", "gpt-6.1-sol", toks_openai(100, 0, 0, 20, 0, 0));
     // uncached = 100-20=80 * 2, write 20*2.50 → 160 + 50 = 210 / 1e6
-    assert!((pricing.cost(&with_write).unwrap().total() - 0.000210).abs() < 1e-12);
+    assert!((cost_of(&with_write).unwrap().total() - 0.000210).abs() < 1e-12);
 
     // Haiku 5.5 long-context tier: prompt over 100,000 tokens uses the higher rates.
     let short = record(1, "2026-11-16", "anthropic", "my", "claude-haiku-5-5", toks(100_000, 0, 0, 0, 0));
-    assert!((pricing.cost(&short).unwrap().input_cost - 0.01).abs() < 1e-12); // 100k * 0.10 / 1e6
+    assert!((cost_of(&short).unwrap().input_cost - 0.01).abs() < 1e-12); // 100k * 0.10 / 1e6
     let long = record(1, "2026-11-16", "anthropic", "my", "claude-haiku-5-5", toks(100_001, 0, 0, 0, 0));
-    assert!((pricing.cost(&long).unwrap().input_cost - 0.0500005).abs() < 1e-12); // 100001 * 0.50 / 1e6
+    assert!((cost_of(&long).unwrap().input_cost - 0.0500005).abs() < 1e-12); // 100001 * 0.50 / 1e6
 
     // Snapshot suffix still matches the official row.
     let snap = record(1, "2026-11-16", "anthropic", "my", "claude-opus-5-5-20261101", toks(1_000_000, 0, 0, 0, 0));
-    assert!((pricing.cost(&snap).unwrap().input_cost - 4.0).abs() < 1e-12);
+    assert!((cost_of(&snap).unwrap().input_cost - 4.0).abs() < 1e-12);
 
     // Unknown model is unpriced (never invent a rate).
     let unknown = record(1, "2026-11-16", "anthropic", "my", "claude-secret-model", toks(10, 0, 0, 0, 0));
-    assert!(pricing.cost(&unknown).is_none());
+    assert!(cost_of(&unknown).is_none());
 
     // User override replaces the official row.
     let mut models = std::collections::BTreeMap::new();
@@ -328,14 +344,13 @@ fn estimate_costs_official_table_overrides_and_validation() {
             long_context: None,
         },
     );
-    let overridden = PricingConfig { enabled: true, models: models.clone() }.merge_legacy(&UsageEstimateConfig::default());
-    // merge_legacy applies official first then models, so override wins.
-    let cost = overridden.cost(&anthro).unwrap();
+    let overridden = PriceBook::build(&PricingConfig { models, ..builtin_config() });
+    let cost = overridden.cost(&anthro).1.unwrap();
     // 100*1 + 50*0.1 + 20*1.25 + 10*2 = 100 + 5 + 25 + 20 = 150 / 1e6
     assert!((cost.total() - 0.00015).abs() < 1e-12);
 
-    let disabled = PricingConfig { enabled: false, models: Default::default() };
-    assert!(disabled.cost(&anthro).is_none());
+    let disabled = PriceBook::build(&PricingConfig { enabled: false, ..builtin_config() });
+    assert!(disabled.cost(&anthro).1.is_none());
 
     let bad = UsageEstimateConfig {
         enabled: None,
@@ -363,6 +378,8 @@ fn old_records_without_cache_write_split_count_as_5m() {
     assert_eq!(loaded.records[0].tokens.cache_write, 15);
     assert_eq!(loaded.records[0].tokens.cache_write_5m, 15);
     assert_eq!(loaded.records[0].tokens.cache_write_1h, 0);
+    assert_eq!(builtin_book().cost(&loaded.records[0]).1.unwrap().cache_write_cost, 0.000075);
+    fs::remove_dir_all(dir).unwrap();
 }
 
 struct Scripted {
@@ -472,7 +489,113 @@ fn missing_usage_dir_builds_empty_report() {
     let tz = offset_hours(-6);
     let now = tz.with_ymd_and_hms(2026, 11, 16, 12, 0, 0).unwrap();
     let query = Query { range: RangeSpec::Today, by: GroupBy::parse_list(&["account"]).unwrap(), filters: Filters::default() };
-    let report = build(&query, &now, "America/Winnipeg", None, &PricingConfig::default()).unwrap();
+    let report = build(&query, &now, "America/Winnipeg", None, &builtin_book()).unwrap();
     assert_eq!(report.total.requests, 0);
     assert_eq!(report.groups.len(), 0);
+}
+
+fn with_live(pricing: &PricingConfig, feed: &[u8]) -> PriceBook {
+    let builtins = prices::official_prices();
+    let rows = parse_models_dev(feed)
+        .unwrap()
+        .models
+        .into_iter()
+        .map(|(key, row)| {
+            let bands = compile_row(&builtins, &key, &row).unwrap();
+            (key, bands)
+        })
+        .collect();
+    PriceBook::build(pricing).with_live("2026-11-17T12:00:00Z".parse().unwrap(), rows)
+}
+
+#[test]
+fn resolver_prioritizes_source_before_snapshot_alias() {
+    let cfg = serde_json::from_str(r#"{"models":{"openai/foo":{"input":2,"output":3}}}"#).unwrap();
+    let pricing = with_live(
+        &cfg,
+        br#"{"openai":{"models":{
+      "foo-20261117":{"cost":{"input":9,"output":10,"cache_write":11}},
+      "bar":{"cost":{"input":2,"output":3}},
+      "bar-20261117":{"cost":{"input":7,"output":8}},
+      "bar-2026-11-17":{"cost":{"input":8,"output":10}},
+      "literal-alias":{"id":"unusable","name":"Not a model id","cost":{"input":1,"output":2}}
+    }}}"#,
+    );
+    for (model, stored, source, price) in [
+        ("foo-20261117", "openai/foo", PriceSource::Override, 2.0),
+        ("bar-20261117", "openai/bar-20261117", PriceSource::ModelsDev, 7.0),
+        ("bar-20261118", "openai/bar", PriceSource::ModelsDev, 2.0),
+        ("bar-2026-11-17", "openai/bar-2026-11-17", PriceSource::ModelsDev, 8.0),
+        ("literal-alias", "openai/literal-alias", PriceSource::ModelsDev, 1.0),
+        ("gpt-6.2-sol-20261117", "openai/gpt-6.2-sol", PriceSource::Builtin, 2.0),
+    ] {
+        let found = pricing.lookup("openai", model).unwrap();
+        assert_eq!((found.matched_key, found.source, found.bands.base.input), (stored, source, price));
+    }
+    for unknown in ["unusable", "Not a model id", "bar-2026-11-18", "bar-1117", "bar-２０２６１１１７", "latest:bar"] {
+        assert!(pricing.lookup("openai", unknown).is_none(), "{unknown}");
+    }
+    assert!(pricing.lookup("anthropic", "bar").is_none());
+    let used = |model| record(1, "2026-11-17", "openai", "a", model, toks_openai(100, 5, 0, 1, 0, 0));
+    assert_eq!(pricing.cost(&used("foo-20261117")), (PriceSource::Override, None)); // no live field merge
+    assert_eq!(pricing.cost(&used("no-model")), (PriceSource::Unknown, None));
+}
+
+#[test]
+fn context_cutoffs_are_strict_and_apply_per_call_to_billed_prompt_only() {
+    let pricing = with_live(&PricingConfig::default(), include_bytes!("../../tests/fixtures/models-dev-pricing.json"));
+    let at = |provider, model, tokens| record(1, "2026-11-17", provider, "a", model, tokens);
+    let near = |actual: f64, expected: f64| assert!((actual - expected).abs() < 1e-12, "{actual} != {expected}");
+    for prompt in [99_999, 100_000, 100_001] {
+        let (input, output, cache_read, write) = if prompt > 100_000 { (0.5, 2.5, 0.05, 0.625) } else { (0.1, 0.5, 0.01, 0.125) };
+        let r = at("anthropic", "claude-haiku-5-5", toks(prompt - 2, 8, 1, 1, 0));
+        let (source, cost) = pricing.cost(&r);
+        let cost = cost.unwrap();
+        assert_eq!(source, PriceSource::ModelsDev);
+        near(cost.input_cost, (prompt - 2) as f64 * input / 1e6);
+        near(cost.output_cost, 8.0 * output / 1e6);
+        near(cost.cache_read_cost, cache_read / 1e6);
+        near(cost.cache_write_cost, write / 1e6);
+    }
+    for prompt in [271_999, 272_000, 272_001] {
+        let (input, output, cache_read, write) = if prompt > 272_000 { (4., 15., 0.2, 5.) } else { (2., 10., 0.1, 2.5) };
+        let r = at("openai", "gpt-6.2-sol", toks_openai(prompt, 300_000, 1, 1, 0, 400_000));
+        let (source, cost) = pricing.cost(&r);
+        let cost = cost.unwrap();
+        assert_eq!(source, PriceSource::ModelsDev);
+        near(cost.input_cost, (prompt - 2) as f64 * input / 1e6);
+        near(cost.output_cost, 300_000.0 * output / 1e6);
+        near(cost.cache_read_cost, cache_read / 1e6);
+        near(cost.cache_write_cost, write / 1e6);
+    }
+
+    let tz = offset_hours(0);
+    let now = tz.timestamp_millis_opt(1).unwrap();
+    let query = Query { by: vec![GroupBy::Model], ..Default::default() };
+    let range = query.range.resolve(&now).unwrap();
+    let short = at("openai", "gpt-6.2-sol", toks_openai(200_000, 0, 0, 0, 0, 0));
+    let (groups, total) = aggregate(&[short.clone(), short], &range, &query, &tz, &pricing);
+    assert_eq!(groups[0].totals.est_cost, Some(0.8));
+    assert_eq!(total.est_cost, Some(0.8));
+}
+
+#[test]
+fn missing_buckets_never_inherit_live_rates_or_retry_a_lower_source() {
+    let book = with_live(
+        &PricingConfig::default(),
+        br#"{"openai":{"models":{"gpt-6.2-sol":{"cost":{
+      "input":2,"output":10,"cache_read":0.1,"cache_write":2.5,
+      "tiers":[{"tier":{"type":"context","size":272000},"input":4,"output":15}]
+    }}}}}"#,
+    );
+    let price = |t| book.cost(&record(1, "2026-11-17", "openai", "a", "gpt-6.2-sol", t));
+    for tokens in [
+        toks_openai(300_000, 0, 1, 0, 0, 0),                          // cache read absent in tier
+        toks_openai(300_000, 0, 0, 1, 0, 0),                          // cache write absent in tier
+        toks_openai(1, 0, 0, 0, 1, 0),                                // 12h never known for this model
+        Tokens { input: 100, cache_write: 20, ..Default::default() }, // unsplit
+    ] {
+        assert_eq!(price(tokens), (PriceSource::ModelsDev, None));
+    }
+    assert_eq!(price(toks_openai(300_000, 0, 0, 0, 0, 0)).1.unwrap().total(), 1.2);
 }

@@ -17,6 +17,15 @@ pub async fn serve(hub: Arc<Hub>, bind: Option<SocketAddr>) -> anyhow::Result<()
     #[cfg(unix)]
     let uds = hub.config.unix_socket.as_deref().map(|path| crate::local::socket::bind(path, hub.config.socket_mode()?)).transpose()?;
     let shutdown = CancellationToken::new();
+    // With both sockets bound, seed once so even the first request can use a stale
+    // cache. The detached worker never holds up serving requests on a download.
+    let mut pricing = tokio::task::JoinSet::new();
+    if hub.pricing.worker_enabled() {
+        hub.pricing.seed_from_disk().await;
+        let store = hub.pricing.clone();
+        let stop = shutdown.clone();
+        pricing.spawn(async move { store.run_worker(stop).await });
+    }
     let mut servers = tokio::task::JoinSet::new();
     let app = crate::http::app(hub.clone());
     if let Some(listener) = tcp {
@@ -53,6 +62,7 @@ pub async fn serve(hub: Arc<Hub>, bind: Option<SocketAddr>) -> anyhow::Result<()
     };
     tracing::info!("shutting down; aborting sessions");
     shutdown.cancel();
+    let _ = pricing.join_next().await;
     // abort_all bounds session settlement, reporter flush and store flush by shutdownGraceSecs.
     hub.abort_all().await;
     hub.mcp.shutdown().await;

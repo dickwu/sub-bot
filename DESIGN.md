@@ -21,7 +21,16 @@
 
 ## 本地用量统计（v0.12.0）
 
-每次 LLM 调用（含压缩摘要、路由分类，以及仍返回了 `Usage` 的失败 / 被丢弃重试尝试）由包在账号 provider 外的 `RecordingProvider` 观察 `Done` / `Error` / `Retry` 事件，追加写入 `<dataDir>/usage/YYYY-MM-DD.jsonl`（本机时区日期）。`agent-ai` 的 `CallError` 携带该次尝试已报告的用量；没有用量则不写记录。日志不进 `state/` 的 flock，`Journal` 自己对当天文件 `flock` + `O_APPEND` + `sync_data`。`sub-bot usage` 与 `GET /v1/usage` 共用 `usage::report` 的聚合（默认按 `provider/account`）。stdio RPC 不镜像该查询。估测费用按官方 API 单价表（2026-11-16 取自 platform.claude.com 与 developers.openai.com/api/docs/pricing）计算，可用配置 `pricing.models` 覆盖；标明 estimate / 估测，不是账单。Anthropic 的 cache write 按 5 分钟 / 1 小时 TTL 分列（旧记录无拆分时计为 5 分钟）；OpenAI 的 cached input 与 uncached input 分开，且 `prompt_tokens`/`input_tokens` 已含缓存，合计时不得再加一遍。
+每次 LLM 调用（含压缩摘要、路由分类，以及仍返回了 `Usage` 的失败 / 被丢弃重试尝试）由包在账号 provider 外的 `RecordingProvider` 观察 `Done` / `Error` / `Retry` 事件，追加写入 `<dataDir>/usage/YYYY-MM-DD.jsonl`（本机时区日期）。`agent-ai` 的 `CallError` 携带该次尝试已报告的用量；没有用量则不写记录。日志不进 `state/` 的 flock，`Journal` 自己对当天文件 `flock` + `O_APPEND` + `sync_data`。`sub-bot usage` 与 `GET /v1/usage` 共用 `usage::report` 的聚合（默认按 `provider/account`）。stdio RPC 不镜像该查询。Anthropic 的 cache write 按 5 分钟 / 1 小时 TTL 分列（旧记录无拆分时计为 5 分钟）；OpenAI 的 cached input 与 uncached input 分开，且 `prompt_tokens`/`input_tokens` 已含缓存，合计时不得再加一遍。
+
+### models.dev 价格快照（v0.13.0）
+
+- **职责边界**：价格仅用于报表生成时的估测（历史记录同样如此），不是账单；不影响模型路由、provider 用量或 JSONL 格式。`PriceBook` 是不可变快照，`PriceStore` 只短暂持锁克隆/交换 `Arc`。整份 CLI / HTTP 报表只使用一个快照，按调用计算后再聚合。
+- **生命周期**：`Hub` 构造仅建内存里的内置表及覆盖价。`serve` 绑定监听器后读一次磁盘缓存，不等网络；TCP/Unix socket 共用一个后台任务（立即检查，之后每 15 分钟，可取消）。同步磁盘操作和解析在阻塞线程执行，不在 HTTP 请求路径。`GET /v1/usage` 只克隆当前快照，不刷新。`usage` 和 `pricing` 通过部分配置读取目录与价格设置，不加载 provider / webhook 密钥。
+- **信任边界**：固定对配置的目录 URL 发公开 GET；无查询模型、用量、Admin key 或 provider 凭据。只收 200，不重定向、不重试，16 MiB 上限，CLI 3s 连接 / 8s 总预算，后台 2s / 15s。先限量收集，再借用 serde raw JSON 解析 OpenAI / Anthropic 的标准 cost。忽略其它 provider、非 context 档与实验模式。坏行单独跳过；空结果或丢失整个已知 provider 不替换最近有效快照。
+- **缓存**：`<dataDir>/pricing/models-dev.json` 只包含已校验的单价、schema 版本、规范化 URL（含 query）的哈希及 UTC `fetchedAt`。私有目录和独占临时文件，经 `sync_all` / 原子改名发布；单独的非阻塞 `models-dev.lock` 保护提交，不持锁下载。写缓存失败仍可用有效内存快照。默认 24h TTL，未来时间视为过期；刷新失败保持原时间，过期缓存仍可回退，无缓存才用内置表。日志仅含状态/计数/耗时等，不记录 URL、内容或内层解析错误。
+- **解析与估测**：先按覆盖 > 目录 > 内置选来源，再在该层尝试精确 `provider/model` 与末尾 `-YYYYMMDD` 回退。覆盖替换整行。context cutoff 严格小于计费 prompt 才换档，整次调用用同一档；目录的 `cache_write` 是短 TTL（Anthropic 5m / OpenAI 30m）。仅在对应模型与所有 cutoff 一致时补内置的绝对长 TTL 值（1h / 12h），不推算、不跨档挪用。缺需要的分项时仍保留命中来源但不产出费用。
+- **可观测性与离线配置**：JSON 在每组及总计给出 `priceSource`（混合/空为 null）和 `priceSources` 计数，`estimate` 附 `fetchedAt` / `cacheStatus`（用报表时间判断）。`source: "builtin"` 不读价格缓存也不联网；`enabled: false` 隐藏估测并关闭 usage/serve 的价格 I/O，但不禁止显式 `sub-bot pricing`。
 
 ## 回合预算（maxTurns，v0.10.4）
 
@@ -37,10 +46,10 @@
 - **服务侧**（`agentd::approvals`）：profile/全局策略 + `SessionRequest.toolApproval` ⇒ 闸门；`GET/POST /v1/sessions/{id}/approvals[/{callId}]`（handler 通过 `FromRef<AppState> for Arc<Hub>` 取 hub）、RPC `approve`、会话视图/get_state 的 `pendingApprovals`；异步任务另开一个订阅把 `approval_required` 投递为 `task.approval_required` webhook。超时在 `report_event` 里上报 warn issue `approval_timeout`（WARN 日志带 `issue="typed"`，不重复成 `log_warn`）。
 - **CLI**：`ask` 在交互终端（stderr TTY + `/dev/tty`，非 `--json`）里用 `/dev/tty` 询问并 POST 决定，`--auto-approve/--auto-deny`；`--async` 轮询 approvals 列表。`run` 交互时询问，否则 ask ⇒ deny + 警告，`--auto-approve` 例外。
 
-## v0.8.1 OpenAI 默认模型
+## OpenAI 默认模型
 
-- `config::DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"`（全局 `defaultModel` 默认值与 CLI 回退），`DEFAULT_OPENAI_ALLOWED_MODELS = ["gpt-6.1-sol", "gpt-6-astra"]`。
-- `Config::fallback_for`（无 `--config`）：provider 为 openai（或未指定且模型不是 `claude-*`）时 default profile 的 `allowedModels` 为上述两个，`--model` 显式指定的其它模型自动加入；anthropic/faux 不限制。显式配置文件仍可使用任何模型。
+- `config::DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"`（全局 `defaultModel` 默认值与 CLI 回退，不变），`DEFAULT_OPENAI_ALLOWED_MODELS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"]`。两个 GPT-6.2 型号使用 1,050,000 的上下文窗口，不改变最大输出设置。
+- `Config::fallback_for`（无 `--config`）：provider 为 openai（或未指定且模型不是 `claude-*`）时 default profile 使用上述 `allowedModels`，`--model` 显式指定的其它模型自动加入；anthropic/faux 不限制。显式配置文件仍可使用任何模型。
 - `sub-bot models`：无 `--profile` 时按同 provider、设置了 `allowedModels` 的 profile 并集标记 `*`，JSON 增加 `allowed`。
 - 推理强度调整：hub 的 `SessionDynamic::apply_effort` 按 (模型, 请求值) 去重后 warn 一次；provider 内部用 `resolve_effort_quiet`（debug）。`session_run` span 在路由后重录 `model` / `reasoning_effort`。
 

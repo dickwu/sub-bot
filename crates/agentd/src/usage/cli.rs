@@ -1,9 +1,12 @@
-//! CLI `sub-bot usage` 与 HTTP `GET /v1/usage`：解析时间范围 / 分组 / 过滤，生成同一份 [`super::report::Report`]。
-//! CLI 不构造 Hub、不加载 provider 或 webhook 的密钥文件，只读 dataDir 与 `pricing`（及已弃用的 `usageEstimate` 覆盖）。
+//! CLI `sub-bot usage` / `pricing` use partial config; no Hub or provider credentials.
+//! `GET /v1/usage` uses the same report and a read-only snapshot from the Hub.
+use super::catalog::{CacheInfo, ContextBand, PriceBook, PriceSource, RateBand};
+use super::price_store::{PriceStore, RefreshUse};
+use super::prices::split_price_key;
 use super::report::{build_local, Filters, GroupBy, PricingConfig, Query, RangeSpec, Report, Totals, UsageEstimateConfig, MAX_DAYS};
 use anyhow::{Context, Result};
 use serde::de::{self, Deserializer, Visitor};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// `sub-bot usage` 参数。
@@ -30,6 +33,9 @@ pub struct Usage {
     /// 输出 JSON
     #[arg(long)]
     pub json: bool,
+    /// 强制尝试刷新公开价格目录（仍遵守 pricing 设置）
+    #[arg(long)]
+    pub refresh_prices: bool,
     /// 过滤账号（`provider/account` 或账号名）
     #[arg(long)]
     pub account: Option<String>,
@@ -60,6 +66,23 @@ impl Usage {
     }
 }
 
+#[derive(Debug, clap::Args)]
+pub struct Pricing {
+    /// 查看一个 provider/model；省略则列出整个价格目录
+    #[arg(value_name = "PROVIDER/MODEL", value_parser = parse_price_key)]
+    pub key: Option<String>,
+    /// 忽略缓存的新鲜度，尝试重新下载（builtin 模式仍离线）
+    #[arg(long)]
+    pub refresh: bool,
+    /// 输出 JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+fn parse_price_key(key: &str) -> Result<String, &'static str> {
+    split_price_key(key).map(|_| key.to_owned()).ok_or("expected provider/model")
+}
+
 fn filters(account: Option<String>, provider: Option<String>, model: Option<String>, profile: Option<String>, session: Option<String>, caller: Option<String>) -> Filters {
     Filters { account, provider, model, profile, session, caller }
 }
@@ -85,7 +108,7 @@ pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<
         Some(path) => {
             let text = std::fs::read_to_string(path).with_context(|| format!("cannot read configuration {}", path.display()))?;
             let file: UsageFile = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
-            file.pricing.validate("pricing.models")?;
+            file.pricing.validate("pricing")?;
             PricingConfig::validate_legacy(&file.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
             file
         }
@@ -95,19 +118,111 @@ pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<
     Ok((dir, file.pricing.merge_legacy(&file.usage_estimate)))
 }
 
-pub fn run(args: &Usage, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
+pub async fn run(args: &Usage, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
     let query = args.query()?;
-    let (data_dir, estimate) = resolve(config_path, data_dir)?;
+    query.filters.validate()?;
+    query.range.resolve(&chrono::Local::now())?;
+    let (data_dir, cfg) = resolve(config_path, data_dir)?;
     let usage_dir = data_dir.join(super::USAGE_DIR);
-    let dir = usage_dir.is_dir().then_some(usage_dir.as_path());
-    tracing::debug!(data_dir = %data_dir.display(), range = query.range.kind(), by = ?query.by.iter().map(|b| b.as_str()).collect::<Vec<_>>(), "usage report");
-    let report = build_local(&query, dir, &estimate)?;
+    tracing::debug!(range = query.range.kind(), by = ?query.by.iter().map(|b| b.as_str()).collect::<Vec<_>>(), "usage report");
+    let pricing = PriceStore::new(data_dir, &cfg).ensure_current(RefreshUse::Usage, args.refresh_prices).await;
+    let report = build_local(&query, usage_dir.is_dir().then_some(usage_dir.as_path()), &pricing)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_table(&report);
     }
     Ok(())
+}
+
+pub async fn run_pricing(args: &Pricing, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
+    let (data_dir, cfg) = resolve(config_path, data_dir)?;
+    let book = PriceStore::new(data_dir, &cfg).ensure_current(RefreshUse::Pricing, args.refresh).await;
+    let keys = args.key.as_deref().map_or_else(|| book.known_keys().into_iter().collect::<Vec<_>>(), |key| vec![key]);
+    let report = PricingReport { currency: "USD", unit: "perMillionTokens", cache: book.cache_info(chrono::Utc::now()), models: keys.into_iter().map(|key| PricingRow::lookup(key, &book)).collect() };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_pricing(&report);
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct PricingReport<'a> {
+    currency: &'static str,
+    unit: &'static str,
+    #[serde(flatten)]
+    cache: CacheInfo,
+    models: Vec<PricingRow<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PricingRow<'a> {
+    key: &'a str,
+    matched_key: Option<&'a str>,
+    price_source: PriceSource,
+    base: Option<&'a RateBand>,
+    tiers: &'a [ContextBand],
+    builtin_ttl_fields: &'a [&'static str],
+}
+
+impl<'a> PricingRow<'a> {
+    fn lookup(key: &'a str, book: &'a PriceBook) -> Self {
+        match split_price_key(key).and_then(|(provider, model)| book.lookup(provider, model)) {
+            Some(price) => Self {
+                key,
+                matched_key: Some(price.matched_key),
+                price_source: price.source,
+                base: Some(&price.bands.base),
+                tiers: &price.bands.tiers,
+                builtin_ttl_fields: &price.bands.builtin_ttl_fields,
+            },
+            None => Self { key, matched_key: None, price_source: PriceSource::Unknown, base: None, tiers: &[], builtin_ttl_fields: &[] },
+        }
+    }
+}
+
+fn print_pricing(report: &PricingReport<'_>) {
+    for model in &report.models {
+        print!("{} [{}]", model.key, model.price_source.as_str());
+        if let Some(matched) = model.matched_key.filter(|key| *key != model.key) {
+            print!(" (matched {matched})");
+        }
+        println!();
+        if let Some(base) = model.base {
+            println!("  band           input     output  reasoning  cacheRead    write5m    write1h   write30m   write12h");
+            print_band("base", base);
+            for tier in model.tiers {
+                print_band(&format!(">{}", tier.threshold), &tier.rates);
+            }
+        }
+        if !model.builtin_ttl_fields.is_empty() {
+            println!("  Builtin long-TTL rates: {}", model.builtin_ttl_fields.join(", "));
+        }
+    }
+    println!("Standard rates in USD per million tokens (estimate / 估测, not a bill; '-' = no rate). {}", freshness(report.cache));
+}
+
+fn print_band(band: &str, r: &RateBand) {
+    let rate = |v: Option<f64>| v.map(|v| v.to_string()).unwrap_or_else(|| "-".into());
+    println!(
+        "  {band:<10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        r.input,
+        r.output,
+        r.reasoning,
+        rate(r.cache_read),
+        rate(r.cache_write_5m),
+        rate(r.cache_write_1h),
+        rate(r.cache_write_30m),
+        rate(r.cache_write_12h)
+    );
+}
+
+fn freshness(cache: CacheInfo) -> String {
+    let at = cache.fetched_at.map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)).unwrap_or_else(|| "-".into());
+    format!("models.dev cache: {} (fetchedAt: {at}).", cache.cache_status.as_str())
 }
 
 /// HTTP `GET /v1/usage` 查询参数（与 CLI 同一套过滤）。
@@ -180,7 +295,8 @@ pub fn report_for_hub(hub: &crate::hub::Hub, params: &UsageParams) -> Result<Rep
         model = query.filters.model.as_deref().unwrap_or("-"),
         "usage report requested"
     );
-    build_local(&query, dir.is_dir().then_some(dir.as_path()), &hub.config.effective_pricing())
+    let pricing = hub.pricing.snapshot();
+    build_local(&query, dir.is_dir().then_some(dir.as_path()), &pricing)
 }
 
 fn print_table(report: &Report) {
@@ -229,7 +345,10 @@ fn print_table(report: &Report) {
     }
     print_row(&total_row, &widths);
     if let Some(note) = &report.estimate {
-        println!("estCost is an estimate (估测) in {}, not a bill. {}", note.currency, note.note);
+        let sources = report.total.sources.as_ref().expect("enabled estimates have source metadata");
+        let sources = sources.price_sources.iter().map(|(source, count)| format!("{}={count}", source.as_str())).collect::<Vec<_>>().join(", ");
+        let sources = if sources.is_empty() { "-" } else { &sources };
+        println!("estCost ({}): {} Sources: {sources}. {}", note.currency, note.note, freshness(note.cache));
     }
 }
 
@@ -305,6 +424,14 @@ mod parse_tests {
         let q = u.query().unwrap();
         assert_eq!(q.range, RangeSpec::Today);
         assert_eq!(q.by, vec![GroupBy::Account]);
+    }
+
+    #[test]
+    fn refresh_flag_is_independent_of_report_query() {
+        let u = parse(&["--refresh-prices", "--json", "--days", "2"]).unwrap();
+        assert!(u.refresh_prices && u.json);
+        assert_eq!(u.query().unwrap().range, RangeSpec::Days(2));
+        assert!(!parse(&[]).unwrap().refresh_prices);
     }
 
     #[test]

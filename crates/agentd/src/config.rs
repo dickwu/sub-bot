@@ -337,7 +337,7 @@ pub struct Config {
     /// MCP 服务器定义（名字 → stdio `command` / HTTP `url`）；profile 通过 `mcpServers` 引用，见 mcp/config.rs
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, crate::mcp::McpServerConfig>,
-    /// 用量估测价格表：官方默认表 + 可选 `models` 覆盖。`pricing.enabled` 默认 true。
+    /// 用量估测价格表：models.dev（默认）/ 内置表与 `models` 覆盖。
     #[serde(default)]
     pub pricing: crate::usage::report::PricingConfig,
     /// 已弃用：v0.11.0 的 `usageEstimate`。其中的单价并入 `pricing.models`；`enabled` 忽略。
@@ -490,7 +490,7 @@ fn default_model() -> String {
 /// 默认 OpenAI 模型（全局 defaultModel 的默认值）。
 pub const DEFAULT_OPENAI_MODEL: &str = "gpt-6.1-sol";
 /// 内置 default profile（无配置文件、provider=openai）默认只允许的 OpenAI 模型；需要其它模型时在 profile 的 allowedModels 中显式添加。
-pub const DEFAULT_OPENAI_ALLOWED_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-astra"];
+pub const DEFAULT_OPENAI_ALLOWED_MODELS: &[&str] = &["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"];
 
 /// provider=anthropic 且没有配置/请求模型时使用的默认 Claude 模型。
 pub const DEFAULT_CLAUDE_MODEL: &str = "claude-opus-5-5";
@@ -610,7 +610,7 @@ impl Config {
         self.data_dir.clone().unwrap_or_else(Self::default_data_dir)
     }
 
-    /// Official price table plus config overrides (`pricing.models` and legacy `usageEstimate`).
+    /// Pricing settings with both sets of config overrides merged.
     pub fn effective_pricing(&self) -> crate::usage::report::PricingConfig {
         self.pricing.merge_legacy(&self.usage_estimate)
     }
@@ -706,7 +706,7 @@ impl Config {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
         self.compaction.validate("compaction")?;
-        self.pricing.validate("pricing.models")?;
+        self.pricing.validate("pricing")?;
         crate::usage::report::PricingConfig::validate_legacy(&self.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
         let registry = agent_tools::ToolRegistry::with_builtins();
         if let Some(policy) = &self.tool_approval {
@@ -1126,7 +1126,8 @@ mod tests {
         assert_eq!(example.profiles["claude"].deep_model.as_deref(), Some(DEFAULT_CLAUDE_DEEP_MODEL));
         assert_eq!(example.default_model, DEFAULT_OPENAI_MODEL);
         assert_eq!(example.profiles["coder"].model.as_deref(), Some(DEFAULT_OPENAI_MODEL));
-        assert_eq!(example.profiles["coder"].allowed_models.as_deref(), Some(&["gpt-6.1-sol".to_string(), "gpt-6-astra".to_string()][..]));
+        assert_eq!(example.profiles["coder"].allowed_models, Some(DEFAULT_OPENAI_ALLOWED_MODELS.iter().map(|m| m.to_string()).collect()));
+        assert_eq!(example.pricing, crate::usage::prices::PricingConfig::default());
         assert_eq!(example.profiles["reviewer"].model.as_deref(), Some("gpt-6-astra"));
         assert!(Config::model_allowed(&example.profiles["coder"], "gpt-6-astra") && !Config::model_allowed(&example.profiles["coder"], "gpt-4.1-mini"));
     }
@@ -1134,12 +1135,12 @@ mod tests {
     #[test]
     fn default_openai_model_and_fallback_allowed_models() {
         assert_eq!(DEFAULT_OPENAI_MODEL, "gpt-6.1-sol");
-        assert_eq!(DEFAULT_OPENAI_ALLOWED_MODELS, ["gpt-6.1-sol", "gpt-6-astra"]);
+        assert_eq!(DEFAULT_OPENAI_ALLOWED_MODELS, ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"]);
         let parsed: Config = serde_json::from_str(r#"{"profiles":{}}"#).unwrap();
         assert_eq!(parsed.default_model, DEFAULT_OPENAI_MODEL);
         let allowed = |cfg: &Config| cfg.profiles["default"].allowed_models.clone();
         let defaults: Vec<String> = DEFAULT_OPENAI_ALLOWED_MODELS.iter().map(|m| m.to_string()).collect();
-        // 未指定 provider / 显式 openai，且没有 --model：只允许两个默认模型。
+        // 未指定 provider / 显式 openai，且没有 --model：使用内置允许列表。
         for provider in [None, Some("openai")] {
             let cfg = Config::fallback_for(provider, None, "t", PathBuf::from("."));
             assert_eq!(cfg.default_model, DEFAULT_OPENAI_MODEL);
@@ -1152,7 +1153,7 @@ mod tests {
         let cfg = Config::fallback_for(None, Some("gpt-6-astra".into()), "t", PathBuf::from("."));
         assert_eq!((cfg.default_model.as_str(), allowed(&cfg)), ("gpt-6-astra", Some(defaults.clone())));
         let cfg = Config::fallback_for(Some("openai"), Some("gpt-5.5".into()), "t", PathBuf::from("."));
-        assert_eq!(allowed(&cfg), Some(vec!["gpt-5.5".to_string(), "gpt-6.1-sol".into(), "gpt-6-astra".into()]));
+        assert_eq!(allowed(&cfg), Some(std::iter::once("gpt-5.5".into()).chain(defaults).collect()));
         assert!(Config::model_allowed(&cfg.profiles["default"], "gpt-5.5"));
         // anthropic / faux（以及未指定 provider 但模型是 Claude）不受影响。
         for (provider, model) in [(Some("anthropic"), None), (Some("faux"), None), (Some("anthropic"), Some("claude-sonnet-5-5")), (None, Some("claude-sonnet-5-5"))] {
@@ -1160,6 +1161,54 @@ mod tests {
             assert_eq!(allowed(&cfg), None, "{provider:?} {model:?}");
         }
         assert_eq!(allowed(&Config::fallback("faux".into(), "t", PathBuf::from("."))), None);
+    }
+
+    #[test]
+    fn both_config_readers_validate_pricing_and_keep_legacy_overrides() {
+        use crate::usage::prices::{PricingConfig, PricingSource};
+        use serde_json::json;
+        let path = std::env::temp_dir().join(format!("sub-bot-price-config-{}.json", uuid::Uuid::new_v4()));
+        let partial = |path: &Path| crate::usage::cli::resolve(Some(path), None).map(|(_, pricing)| pricing);
+        for cfg in [json!({"profiles":{}}), json!({"profiles":{}, "pricing":{}})] {
+            std::fs::write(&path, cfg.to_string()).unwrap();
+            assert_eq!(Config::load(&path).unwrap().pricing, PricingConfig::default());
+            assert_eq!(partial(&path).unwrap(), PricingConfig::default());
+        }
+        let config = json!({"profiles":{},
+            "pricing": {"source":"builtin", "modelsDevUrl":"http://127.0.0.1:9000/catalog?q=all", "refreshHours":72,
+                        "models":{"openai/m":{"input":9,"output":9}}},
+            "usageEstimate":{"enabled":false,"pricesUsdPerMillion":{
+                "openai/m":{"input":1,"output":2},"anthropic/m":{"input":3,"output":4,"cached":0.1,"cacheWrite":0.5}}}
+        });
+        std::fs::write(&path, config.to_string()).unwrap();
+        let pricing = Config::load(&path).unwrap().effective_pricing();
+        assert_eq!(pricing, partial(&path).unwrap());
+        assert_eq!(pricing.source, PricingSource::Builtin);
+        assert!(pricing.enabled);
+        assert_eq!(pricing.refresh_hours, 72);
+        assert_eq!(pricing.models_dev_url, "http://127.0.0.1:9000/catalog?q=all");
+        assert_eq!(pricing.models["openai/m"].input, 9.0);
+        assert_eq!((pricing.models["anthropic/m"].cache_read, pricing.models["anthropic/m"].cache_write_5m), (Some(0.1), Some(0.5)));
+
+        for (field, bad) in [
+            ("modelsDevUrl", json!("ftp://private.example/?private")),
+            ("modelsDevUrl", json!("https:///private.example")),
+            ("modelsDevUrl", json!("/private")),
+            ("modelsDevUrl", json!("https://private:private@example.test/")),
+            ("modelsDevUrl", json!("https://@example.test/private")),
+            ("modelsDevUrl", json!("https://example.test/#private")),
+            ("refreshHours", json!(0)),
+            ("refreshHours", json!(8761)),
+        ] {
+            let mut cfg = config.clone();
+            cfg["pricing"][field] = bad;
+            std::fs::write(&path, cfg.to_string()).unwrap();
+            let full_error = Config::load(&path).err().unwrap().to_string();
+            assert_eq!(full_error, partial(&path).unwrap_err().to_string());
+            assert!(full_error.contains(&format!("pricing.{field}")));
+            assert!(!full_error.contains("private"));
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

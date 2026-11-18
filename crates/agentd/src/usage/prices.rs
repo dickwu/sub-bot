@@ -11,6 +11,7 @@
 
 use super::catalog::{ContextBand, PriceBands, RateBand};
 use super::Tokens;
+use crate::config::ConfigRule;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -56,10 +57,10 @@ pub struct UsageEstimateConfig {
 }
 
 impl PricingConfig {
-    pub fn validate(&self, at: &str) -> Result<()> {
-        ensure!(self.models_dev_endpoint().is_some(), "{at}.modelsDevUrl must be an absolute HTTP(S) URL without userinfo or a fragment");
-        ensure!((1..=8760).contains(&self.refresh_hours), "{at}.refreshHours must be in 1..=8760");
-        validate_map(&self.models, &format!("{at}.models"))
+    pub fn validate(&self) -> Result<()> {
+        ensure!(self.models_dev_endpoint().is_some(), ConfigRule("pricing.modelsDevUrl must be an absolute HTTP(S) URL without userinfo or a fragment"));
+        ensure!((1..=8760).contains(&self.refresh_hours), ConfigRule("pricing.refreshHours must be in 1..=8760"));
+        validate_map(&self.models, "pricing.models")
     }
 
     pub(super) fn models_dev_endpoint(&self) -> Option<reqwest::Url> {
@@ -85,14 +86,14 @@ impl PricingConfig {
         Self { models, ..self.clone() }
     }
 
-    pub fn validate_legacy(legacy: &UsageEstimateConfig, at: &str) -> Result<()> {
-        validate_map(&legacy.prices_usd_per_million, at)
+    pub fn validate_legacy(legacy: &UsageEstimateConfig) -> Result<()> {
+        validate_map(&legacy.prices_usd_per_million, "usageEstimate.pricesUsdPerMillion")
     }
 }
 
 fn validate_map(map: &BTreeMap<String, ModelPrice>, at: &str) -> Result<()> {
     for (key, price) in map {
-        ensure!(split_price_key(key).is_some(), "{at}: key '{key}' must be 'provider/model'");
+        ensure!(split_price_key(key).is_some(), ConfigRule("price keys must be 'provider/model'").at(at));
         price.validate(&format!("{at}.{key}"))?;
     }
     Ok(())
@@ -156,12 +157,12 @@ pub struct LongContextPrice {
 impl ModelPrice {
     fn validate(&self, at: &str) -> Result<()> {
         for (name, value) in self.rates() {
-            ensure!(value.is_finite() && value >= 0.0, "{at}.{name} must be a non-negative number");
+            ensure!(value.is_finite() && value >= 0.0, ConfigRule("price rates must be non-negative numbers").at(format_args!("{at}.{name}")));
         }
         if let Some(lc) = &self.long_context {
-            ensure!(lc.threshold > 0, "{at}.longContext.threshold must be positive");
+            ensure!(lc.threshold > 0, ConfigRule("price longContext.threshold must be positive").at(at));
             for (name, value) in lc.rates() {
-                ensure!(value.is_finite() && value >= 0.0, "{at}.longContext.{name} must be a non-negative number");
+                ensure!(value.is_finite() && value >= 0.0, ConfigRule("price rates must be non-negative numbers").at(format_args!("{at}.longContext.{name}")));
             }
         }
         Ok(())

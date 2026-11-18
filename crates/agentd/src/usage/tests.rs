@@ -272,7 +272,7 @@ fn aggregation_groups_filters_and_empty_range() {
 
 #[test]
 fn estimate_costs_official_table_overrides_and_validation() {
-    builtin_config().validate("pricing").unwrap();
+    builtin_config().validate().unwrap();
     let pricing = builtin_book();
     let cost_of = |record| pricing.cost(record).1;
 
@@ -360,7 +360,7 @@ fn estimate_costs_official_table_overrides_and_validation() {
         )]
         .into(),
     };
-    assert!(PricingConfig::validate_legacy(&bad, "usageEstimate.pricesUsdPerMillion").unwrap_err().to_string().contains("provider/model"));
+    assert!(PricingConfig::validate_legacy(&bad).unwrap_err().to_string().contains("provider/model"));
 
     // cache hit rate: Anthropic 50 / (100+50+20) = 50/170; OpenAI 40 / (60+40+0) = 40/100
     assert!((prices::cache_hit_rate("anthropic", &anthro.tokens).unwrap() - 50.0 / 170.0).abs() < 1e-12);

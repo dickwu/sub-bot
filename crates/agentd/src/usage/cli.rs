@@ -4,7 +4,8 @@ use super::catalog::{CacheInfo, ContextBand, PriceBook, PriceSource, RateBand};
 use super::price_store::{PriceStore, RefreshUse};
 use super::prices::split_price_key;
 use super::report::{build_local, Filters, GroupBy, PricingConfig, Query, RangeSpec, Report, Totals, UsageEstimateConfig, MAX_DAYS};
-use anyhow::{Context, Result};
+use crate::config::{config_diagnostic, read_config_json};
+use anyhow::Result;
 use serde::de::{self, Deserializer, Visitor};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -106,10 +107,9 @@ struct UsageFile {
 pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<(PathBuf, PricingConfig)> {
     let file = match config_path {
         Some(path) => {
-            let text = std::fs::read_to_string(path).with_context(|| format!("cannot read configuration {}", path.display()))?;
-            let file: UsageFile = serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("invalid configuration: {e}"))?;
-            file.pricing.validate("pricing")?;
-            PricingConfig::validate_legacy(&file.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
+            let file: UsageFile = read_config_json(path)?;
+            file.pricing.validate()?;
+            PricingConfig::validate_legacy(&file.usage_estimate)?;
             file
         }
         None => UsageFile::default(),
@@ -118,11 +118,18 @@ pub fn resolve(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<
     Ok((dir, file.pricing.merge_legacy(&file.usage_estimate)))
 }
 
+fn resolve_for_cli(config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<(PathBuf, PricingConfig)> {
+    resolve(config_path, data_dir).map_err(|e| match config_path {
+        Some(path) => config_diagnostic(path, Some("usage/pricing"), &e),
+        None => e,
+    })
+}
+
 pub async fn run(args: &Usage, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
     let query = args.query()?;
     query.filters.validate()?;
     query.range.resolve(&chrono::Local::now())?;
-    let (data_dir, cfg) = resolve(config_path, data_dir)?;
+    let (data_dir, cfg) = resolve_for_cli(config_path, data_dir)?;
     let usage_dir = data_dir.join(super::USAGE_DIR);
     tracing::debug!(range = query.range.kind(), by = ?query.by.iter().map(|b| b.as_str()).collect::<Vec<_>>(), "usage report");
     let pricing = PriceStore::new(data_dir, &cfg).ensure_current(RefreshUse::Usage, args.refresh_prices).await;
@@ -136,7 +143,7 @@ pub async fn run(args: &Usage, config_path: Option<&Path>, data_dir: Option<Path
 }
 
 pub async fn run_pricing(args: &Pricing, config_path: Option<&Path>, data_dir: Option<PathBuf>) -> Result<()> {
-    let (data_dir, cfg) = resolve(config_path, data_dir)?;
+    let (data_dir, cfg) = resolve_for_cli(config_path, data_dir)?;
     let book = PriceStore::new(data_dir, &cfg).ensure_current(RefreshUse::Pricing, args.refresh).await;
     let keys = args.key.as_deref().map_or_else(|| book.known_keys().into_iter().collect::<Vec<_>>(), |key| vec![key]);
     let report = PricingReport { currency: "USD", unit: "perMillionTokens", cache: book.cache_info(chrono::Utc::now()), models: keys.into_iter().map(|key| PricingRow::lookup(key, &book)).collect() };

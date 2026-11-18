@@ -36,7 +36,7 @@ pub struct Ask {
     pub conn: Connection,
     #[arg(long)]
     pub profile: Option<String>,
-    /// Continue a server session (also after a server restart: the server reloads it from its session directory).
+    /// Continue a server session (even after restart if it was persisted). Model and account stay fixed; --effort still applies.
     #[arg(long, visible_alias = "resume")]
     pub session: Option<String>,
     /// Working directory for a new session (session.cwd; relative paths resolve against this process's cwd).
@@ -53,10 +53,10 @@ pub struct Ask {
     /// reasoningEffort/requestedReasoningEffort/effortAdjusted/allowedEfforts/routing); with --async, print the final task JSON.
     #[arg(long)]
     pub json: bool,
-    /// Use the profile's deep model (same as --depth deep).
+    /// Use the profile's deep model (same as --depth deep); an explicit --model takes precedence on a new session.
     #[arg(long, conflicts_with = "depth")]
     pub deep: bool,
-    /// Model routing for a new session (or one without prompts yet): standard | deep | auto.
+    /// Model routing: standard | deep | auto. Only before the first prompt; an explicit --model takes precedence.
     #[arg(long)]
     pub depth: Option<crate::routing::Depth>,
     /// Account for a new session (session.account); must be allowed by the profile's allowedAccounts (HTTP 403 otherwise).
@@ -105,6 +105,8 @@ pub struct Client {
     token: Option<axum::http::HeaderValue>,
     http: reqwest::Client,
     provider: Option<String>,
+    /// 新会话的模型（session.model）
+    model: Option<String>,
     /// 粘性推理强度（/v1/chat 顶层 reasoningEffort）
     effort: Option<agent_ai::ThinkingLevel>,
     depth: Option<crate::routing::Depth>,
@@ -174,6 +176,7 @@ impl Client {
             token,
             http,
             provider: None,
+            model: None,
             effort: None,
             depth: None,
             account: None,
@@ -248,6 +251,9 @@ impl Client {
         }
         // 已有会话的 maxTurns 走 turns 端点（见 run）；onMaxTurns 只对新会话有效
         if session.is_none() {
+            if let Some(model) = &self.model {
+                body["session"]["model"] = json!(model);
+            }
             if let Some(n) = self.max_turns {
                 body["session"]["maxTurns"] = json!(n);
             }
@@ -617,7 +623,7 @@ impl StreamOutcome {
     }
 }
 
-pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: Option<agent_ai::ThinkingLevel>) -> anyhow::Result<()> {
+pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, model: Option<&str>, effort: Option<agent_ai::ThinkingLevel>) -> anyhow::Result<()> {
     use tokio::io::AsyncReadExt;
     let mut message = args.message.clone();
     if message == "-" {
@@ -626,7 +632,11 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
     }
     anyhow::ensure!(args.on_max_turns.is_none() || args.session.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
     anyhow::ensure!(!args.llm.is_set() || args.session.is_none(), crate::LLM_ARGS_RESUME_ERROR);
+    if model.is_some() && args.session.is_some() {
+        eprintln!("--model applies only to new sessions; continuing with the session's model");
+    }
     let mut client = args.conn.client(data_dir)?;
+    client.model = model.map(str::to_owned);
     client.max_turns = args.max_turns;
     client.llm = args.llm.clone();
     client.on_max_turns = args.on_max_turns;
@@ -775,6 +785,33 @@ mod tests {
         // Existing sessions keep the values fixed at creation.
         let body = client.chat_body("hi", None, Some("s"), json!({}));
         assert!(body["session"].get("streamIdleTimeoutSecs").is_none());
+    }
+
+    #[test]
+    fn chat_body_model_is_create_only() {
+        let mut client = Client::new(None, None, None).unwrap();
+        let modes = [json!({"stream": true}), json!({"async": true})];
+        for extra in &modes {
+            let body = client.chat_body("hi", Some("p"), None, extra.clone());
+            assert!(body.get("model").is_none() && body["session"].get("model").is_none());
+        }
+        client.model = Some("chosen-model".into());
+        client.account = Some("work".into());
+        client.cwd = Some(PathBuf::from("/srv/repo"));
+        client.effort = Some(agent_ai::ThinkingLevel::High);
+        client.depth = Some(crate::routing::Depth::Deep);
+        for extra in modes {
+            let body = client.chat_body("hi", Some("p"), None, extra.clone());
+            assert!(body.get("model").is_none());
+            assert_eq!(body["session"], json!({"profile": "p", "provider": null, "model": "chosen-model", "account": "work", "cwd": "/srv/repo"}));
+            assert_eq!(body["reasoningEffort"], "high");
+            assert_eq!(body["depth"], "deep");
+
+            let body = client.chat_body("hi", None, Some("s"), extra);
+            assert_eq!(body["sessionId"], "s");
+            assert!(body.get("model").is_none() && body["session"].get("model").is_none());
+            assert_eq!(body["reasoningEffort"], "high");
+        }
     }
 
     fn retry_event(attempt: u32) -> Value {

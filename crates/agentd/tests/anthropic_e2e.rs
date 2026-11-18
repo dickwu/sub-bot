@@ -1,21 +1,18 @@
 //! Real CLI -> hub -> Anthropic SSE -> bash -> tool_result -> streamed reply.
 #![cfg(unix)]
 
+#[path = "support/cli.rs"]
+mod cli;
+
 use axum::{body::Body, extract::State, http::HeaderMap, response::Response, routing::post, Json, Router};
+use cli::{command, output, TempDir};
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::{os::unix::fs::PermissionsExt, path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{os::unix::fs::PermissionsExt, process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     sync::{Mutex, Notify},
 };
-
-struct TempDir(PathBuf);
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 #[derive(Clone, Default)]
 struct Mock {
@@ -70,18 +67,10 @@ async fn messages(State(mock): State<Mock>, headers: HeaderMap, Json(body): Json
     Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(first.chain(tail))).unwrap()
 }
 
-fn command() -> tokio::process::Command {
-    let mut cmd = tokio::process::Command::new(env!("CARGO_BIN_EXE_sub-bot"));
-    // Isolate child configuration/credentials without inspecting the host environment.
-    cmd.env_clear().env("PATH", "/usr/bin:/bin").env("NO_PROXY", "*").kill_on_drop(true);
-    cmd
-}
-
 #[tokio::test]
 async fn anthropic_cli_tool_round_trip_streams_before_completion() {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let dir = TempDir(std::env::temp_dir().join(format!("sb-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])));
-        std::fs::create_dir(&dir.0).unwrap();
+        let dir = TempDir::new();
         let key = dir.0.join("anthropic.key");
         std::fs::write(&key, "mock-anthropic-key\n").unwrap();
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -111,7 +100,8 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
                 .to_string(),
             )
             .unwrap();
-            let mut cmd = command();
+            let mut cmd = command(&dir.0);
+            cmd.env("NO_PROXY", "*");
             cmd.arg("--config").arg(&config).arg("--anthropic-key-file").arg(&key).args(["--log-dir", "-", "serve", "--bind", "none", "--unix-socket"]).arg(&socket);
             if env_base {
                 cmd.env("ANTHROPIC_BASE_URL", &base);
@@ -121,7 +111,14 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
                 assert!(daemon.try_wait().unwrap().is_none(), "daemon exited before listening");
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let mut ask = command().args(["ask", "--json", "--profile", "claude", "--socket"]).arg(&socket).arg("Run echo hi").stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+            let mut ask = command(&dir.0)
+                .args(["--log-dir", "-", "ask", "--json", "--profile", "claude", "--socket"])
+                .arg(&socket)
+                .arg("Run echo hi")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
             let mut lines = BufReader::new(ask.stdout.take().unwrap()).lines();
             let mut streamed = false;
             let mut settled = false;
@@ -159,16 +156,16 @@ async fn anthropic_cli_tool_round_trip_streams_before_completion() {
 
             // Standalone run uses the same real provider; check aggregate cache writes and actual thinking metadata.
             mock.finish.notify_one();
-            let output = command()
-                .arg("--config")
-                .arg(&config)
-                .arg("--anthropic-key-file")
-                .arg(&key)
-                .env("ANTHROPIC_BASE_URL", &base)
-                .args(["--log-dir", "-", "run", "--profile", "claude", "--json", "Run echo hi"])
-                .output()
-                .await
-                .unwrap();
+            let output = output(command(&dir.0).arg("--config").arg(&config).arg("--anthropic-key-file").arg(&key).env("NO_PROXY", "*").env("ANTHROPIC_BASE_URL", &base).args([
+                "--log-dir",
+                "-",
+                "run",
+                "--profile",
+                "claude",
+                "--json",
+                "Run echo hi",
+            ]))
+            .await;
             assert!(output.status.success());
             let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
             assert_eq!(reply["text"], "Final reply: hi");

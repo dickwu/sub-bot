@@ -11,9 +11,16 @@
 
 ---
 
+## CLI 配置选择与 ask 模型（v0.14.1）
+
+- **单一配置来源**：clap 区分显式 `--config` 与 `SUB_BOT_CONFIG`；两者都没有才检查一个默认路径。`--no-config` 跳过环境变量与查找，与显式参数冲突。只有默认候选不存在（或没有候选）才自动使用 `Config::fallback_for`。发现与读取均保留所选路径，引用的密钥和 MCP 相对路径仍按配置文件所在目录解析。非普通文件、悬空链接、I/O 或解析/校验错误不回退；错误只显示配置路径、安全的规则或 JSON 行列，不回显配置值。INFO `configuration selected` 记录来源与路径（或回退原因），轻量命令只写 stderr。
+- **按命令读取**：`serve` / `run` / `rpc` / `models` / `probe-efforts` / `mcp list` / `issues` / `keys check` 用完整配置。`ask` / `turns` 只解析 `dataDir`（即使有 `--data-dir` 也校验所读字段）；`profiles` 读取 profile 并校验目录策略；`usage` / `pricing` 解析目录和价格设置；`keys list` / `reauth` 只解析 key 声明。各轻量读取器不初始化 Hub，也不会校验不相关的配置字段或解析其引用的密钥。`hash-token`、`keys set/delete` 与 help/version 跳过配置发现。
+- **身份**：使用文件的 `serve` 只按 `clients` 等配置授权，不添加内置 uid 映射。`run` / `rpc` 可使用已加载的全部 profile，以 `local` / `stdio` 身份独立运行和加载 provider，不借用 daemon 的 token。`ask` / `turns` 只从 `--token-file` 或 `SUB_BOT_TOKEN` 取 Bearer 凭据，继续由服务端鉴权。
+- **模型与续聊**：`ask::Client::chat_body` 在流式和异步请求中新建会话时发送 `session.model`（`--model` > `SUB_BOT_MODEL`；未指定则省略）。由已有的 `Hub::request_target` 校验 `allowedModels`（拒绝为 HTTP 400），显式模型优先于 depth 和默认值。已有 `sessionId` 时不发送模型、不重路由，提示后沿用绑定模型；顶层 `reasoningEffort` 仍可粘性修改。不改变 HTTP API。
+
 ## 按请求选择工作目录（v0.14.0）
 
-- **策略与默认值**：`Profile::validate_workspace` 只做结构校验，不探测挂载。`workspaceRoots` 必填且非空，保持配置顺序；相对根以 sub-bot 进程 cwd 为基准。无配置时 `--workspace`（默认 `.`）填入唯一的默认根。`allowedWorkspaceRoots` 省略或精确为 `["*"]` 时允许任意已有目录；否则允许 `workspaceRoots` 与额外绝对根的并集（含后代，`[]` 恢复 v0.13 的选择限制）。不可用的根不授权，不会回退成任意目录。
+- **策略与默认值**：`Profile::validate_workspace` 只做结构校验，不探测挂载。`workspaceRoots` 必填且非空，保持配置顺序；相对根以 sub-bot 进程 cwd 为基准。`--workspace`（默认 `.`）只填入内置 `default` profile 的根，不修改加载的配置。`allowedWorkspaceRoots` 省略或精确为 `["*"]` 时允许任意已有目录；否则允许 `workspaceRoots` 与额外绝对根的并集（含后代，`[]` 恢复 v0.13 的选择限制）。不可用的根不授权，不会回退成任意目录。
 - **解析**：`workdir::resolve_cwd` 在创建、从磁盘恢复或断言时使用同一套规则。默认 / HTTP 相对请求以第一个可用的 `workspaceRoots` 目录为基准；绝对请求不依赖默认目录。`run` / `rpc` 参数和 JSONL `cwd` 先用 `cli_cwd` 相对启动进程的 cwd 转成绝对路径。不改进程 cwd，不建目录、不做 shell 展开。校验目录类型，解析符号链接，按 `Path::starts_with` 比较路径组件；不接受不能写入 JSON / JSONL 的 cwd。
 - **绑定**：在 `Hub::create_inner`，先确认 client/profile，再解析目录。用于工具的始终是规范化 `cwd`；`sessionRoot` 只限制祖先指令文件查找。取配置顺序中首个匹配的 workspace 根（非最长匹配），没有匹配时取 `cwd` 自身，即使它是额外允许根的子目录。每层选择 `AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md` 的第一个文件，只注入可读文本，从外到内排列；不找 Git 根。MCP 的启动目录不变。
 - **持久化与恢复**：把 `cwd` / `sessionRoot` 写入 JSONL v2 header。恢复时校验当前 profile 策略，保存的绝对 cwd 不得消失或被重定向。保存的 `sessionRoot` 必须仍是规范目录，包含 cwd，且在当前计算出的边界内；即使新增了更宽的 workspace 根，仍使用原边界。旧文件只有 cwd 时推导 root，两者都没有时取 profile 默认值；成功恢复后追加一次 `session_info`，不改 header、不在列表时回填。恢复失败是 HTTP 409（容量限制仍为 429）。
@@ -57,7 +64,7 @@
 ## OpenAI 默认模型
 
 - `config::DEFAULT_OPENAI_MODEL = "gpt-6.1-sol"`（全局 `defaultModel` 默认值与 CLI 回退，不变），`DEFAULT_OPENAI_ALLOWED_MODELS = ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"]`。两个 GPT-6.2 型号使用 1,050,000 的上下文窗口，不改变最大输出设置。
-- `Config::fallback_for`（无 `--config`）：provider 为 openai（或未指定且模型不是 `claude-*`）时 default profile 使用上述 `allowedModels`，`--model` 显式指定的其它模型自动加入；anthropic/faux 不限制。显式配置文件仍可使用任何模型。
+- `Config::fallback_for`（未发现配置文件或显式 `--no-config`）：provider 为 openai（或未指定且模型不是 `claude-*`）时 default profile 使用上述 `allowedModels`，构造内置配置的进程可将 `--model` 指定的其它模型加入自己的内置列表；anthropic/faux 不限制。`ask` 不修改服务端列表；加载文件时以配置的 `allowedModels` 为准。
 - `sub-bot models`：无 `--profile` 时按同 provider、设置了 `allowedModels` 的 profile 并集标记 `*`，JSON 增加 `allowed`。
 - 推理强度调整：hub 的 `SessionDynamic::apply_effort` 按 (模型, 请求值) 去重后 warn 一次；provider 内部用 `resolve_effort_quiet`（debug）。`session_run` span 在路由后重录 `model` / `reasoning_effort`。
 
@@ -100,7 +107,7 @@
 - Unix 测试覆盖实际 UDS/TCP、uid/username/any 映射、无匹配 401、Bearer 优先级、IPv6/mapped loopback、伪造转发头、socket mode/残留清理/文件保护、faux provider 下同步和异步 ask。系统调用使用 Unix cfg，适用于 Linux/macOS CI。
 ## 持久化与恢复（agentd/store.rs）
 
-- 仅 `serve` 显式选择 `StoreMode::Persistent`。`Hub::new` 默认使用 `Store::memory()`（`StoreMode::Memory`），供 `run` / `rpc` / `models` 使用：不打开文件或锁、不加载 journal，因此没有重启恢复或历史 pending delivery 续投，可与同一 dataDir 的服务共存。内存 store 保留当前进程的任务/投递状态；日志与可选 session-dir 历史独立配置。
+- 仅 `serve` 显式选择 `StoreMode::Persistent`。`Hub::new` 默认使用 `Store::memory()`（`StoreMode::Memory`），供 `run` / `rpc` / `models` 使用：不打开文件或锁、不加载 journal，因此没有重启恢复或历史 pending delivery 续投，可与同一 dataDir 的服务共存。内存 store 保留当前进程的任务/投递状态；会话历史按 owner 和 UUID 分文件，可以共用 `sessionDir` 新建会话，但没有同一会话 JSONL 的跨进程写锁。
 - `Store` 管理 append-only `tasks.jsonl` 和 `deliveries.jsonl`，每次状态更新追加完整快照并 sync_data。启动按 ID 取最新记录，再通过临时文件 + rename + 目录 fsync 压缩；仅忽略崩溃留下的最后一个不完整行；完整行损坏时将原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），保留损坏行之前的记录，reporter 挂载后报告 error 级 `store_corrupt`。目录/文件权限分别为 0700/0600；`Store::open` 在读取/压缩前对 `<dataDir>/state/lock` 获取非阻塞排他 flock，文件句柄持有到 Store 释放，进程退出（含崩溃）自动解锁；同一 dataDir 的第二个服务启动失败，lock 文件不删除以避免 inode 竞争。
 - `dataDir` / CLI `--data-dir` 由 `Config::data_dir()` 统一解析，默认系统数据目录/sub-bot；journal 存放在 `<dataDir>/state`，不受 session-dir 影响。`shutdownGraceSecs` 默认 10，限制退出等待。task TTL 使用持久化的墙钟完成时间，重启不会延长 TTL。
 - task 入队和运行前记录 queued/running，完成记录结果/error 和各目标 delivery 状态。启动发现 queued/running 时转 failed（`interrupted by restart`），发出 error 级 `task_interrupted`，不重放工具副作用。结果只允许 owner 查询。
@@ -304,9 +311,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
   - Linux 用 systemd user unit；
   - macOS 用 launchd plist（`~/Library/LaunchAgents`）；
   - M5 提供 `sub-bot service install` 命令。
-- **配置和数据目录**：用 `directories` crate 按操作系统决定：
-  - Linux：`~/.config/sub-bot`，数据放在 `~/.local/share`；
-  - macOS：`~/Library/Application Support/sub-bot`；
+- **配置和数据目录**：Linux 和 macOS 的配置查找规则相同：`--config` > `SUB_BOT_CONFIG` > 一个默认路径（绝对 `XDG_CONFIG_HOME` 下的 `sub-bot/sub-bot.json`，否则是 `~/.config/sub-bot/sub-bot.json`）。不搜索 cwd，不读取 daemon 的实时状态。数据目录另用 `directories`，默认是 Linux 的 `~/.local/share/sub-bot`（遵循 XDG 数据目录）或 macOS 的 `~/Library/Application Support/sub-bot`；macOS 的 Application Support 不是默认 JSON 的位置。
 - **API Key 来源**：环境变量，或者系统钥匙串（`keyring` crate，M3）。Key 不写进配置文件。
 
 ---
@@ -403,7 +408,7 @@ cargo build --release
 export OPENAI_API_KEY_FILE=~/.config/sub-bot/openai.key   # 推荐；也可用 --openai-key-file 或 OPENAI_API_KEY
 ./target/release/sub-bot hash-token my-bot-token   # 把结果填进配置的 tokenSha256
 ./target/release/sub-bot --config sub-bot.example.json serve           # HTTP 服务
-./target/release/sub-bot --workspace ~/code rpc                       # stdio RPC
+./target/release/sub-bot --no-config --workspace ~/code rpc           # stdio RPC，强制使用内置 profile
 ./target/release/sub-bot --provider faux --config sub-bot.example.json serve   # 离线测试，不调用 OpenAI
 ```
 `sub-bot.example.json` 中有三个 profile：

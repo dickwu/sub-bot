@@ -46,18 +46,25 @@ mod workdir;
 
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
-use clap::{builder::TypedValueParser, Parser, Subcommand};
-use std::path::PathBuf;
+use clap::{builder::TypedValueParser, parser::ValueSource, CommandFactory, FromArgMatches, Parser, Subcommand};
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "sub-bot", version, about = "General-purpose local coding-agent service for other bots")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
-    /// JSON 配置（profiles + clients）；不填则使用以 --workspace 为根的 `default` profile
-    #[arg(long, global = true, env = "SUB_BOT_CONFIG")]
+    /// JSON 配置：--config > SUB_BOT_CONFIG > 默认路径（macOS / Linux）> 内置配置。
+    /// 默认查找 ~/.config/sub-bot/sub-bot.json；若 XDG_CONFIG_HOME 是绝对路径则只查 $XDG_CONFIG_HOME/sub-bot/sub-bot.json。
+    /// 已选文件损坏或不可读时直接报错；用 --no-config 跳过 env 和自动查找。
+    // Let --no-config ignore even an empty SUB_BOT_CONFIG. A selected empty path still fails to load.
+    #[arg(long, global = true, env = "SUB_BOT_CONFIG", value_name = "PATH", value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
     config: Option<PathBuf>,
-    /// 模型。serve：覆盖全局默认模型（profile 自己的 model 仍优先）；rpc/run：本会话使用的模型（受 allowedModels 限制）
+    /// 强制使用内置配置；忽略 SUB_BOT_CONFIG 和默认路径，不能与显式 --config 同用
+    #[arg(long, global = true)]
+    no_config: bool,
+    /// 模型。serve：覆盖全局默认模型；run/rpc：新会话的模型；ask：发给服务端作为新会话的模型。
+    /// 会话模型受 profile 的 allowedModels 限制；ask 续聊沿用原模型，--effort 仍可修改。
     #[arg(long, global = true, env = "SUB_BOT_MODEL")]
     model: Option<String>,
     /// 推理强度 none|minimal|low|medium|high|xhigh|max 或 provider 的小写名称；已知模型限制为最高三档（别名 --effort）
@@ -78,7 +85,7 @@ struct Cli {
     /// 文件日志格式：json | text
     #[arg(long, global = true, default_value = "json", env = "SUB_BOT_LOG_FORMAT")]
     log_format: String,
-    /// 无配置文件时 default profile 的 workspaceRoots（默认工作目录）；与 run/rpc 的 --cwd 不同
+    /// 仅设置内置 default profile 的 workspaceRoots（默认工作目录）；不覆盖配置文件，也不是会话的 --cwd
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
     /// 数据目录；默认系统数据目录/sub-bot
@@ -111,7 +118,7 @@ enum Cmd {
         #[cfg(unix)]
         #[arg(long, num_args = 0..=1)]
         unix_socket: Option<Option<PathBuf>>,
-        /// 仅在没有配置文件时使用：单一 client 的 token；不填则随机生成（不打印）
+        /// 仅在使用内置配置时设置单一 client 的 token；不填则随机生成（不打印）
         #[arg(long, env = "SUB_BOT_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// 覆盖配置的全局 streamIdleTimeoutSecs（1..=7200）；provider / 账号 / profile / 请求级设置仍然优先
@@ -122,6 +129,8 @@ enum Cmd {
     ///
     /// 默认同步流式输出助手文本并在结束时换行；--json 逐事件输出 NDJSON。
     /// --async 轮询后输出最终文本，--async --json 输出最终 task JSON。
+    /// 新会话的 --model（或 SUB_BOT_MODEL）优先于 --depth，由服务端检查 allowedModels。
+    /// 续聊（--session / --resume）不换模型或账号；--effort 仍可粘性修改。
     /// HTTP/模型错误、取消或超时会向 stderr 报错并返回非零退出码。
     Ask(ask::Ask),
     /// stdio JSONL RPC 模式（父进程即调用方，无需 token）
@@ -348,20 +357,18 @@ fn startup_failure(error: Option<&anyhow::Error>) -> (String, issues::IssueEvent
     }
 }
 
-async fn startup_failed(cli: &Cli, event: issues::IssueEvent) {
+async fn startup_failed(cli: &Cli, config_path: Option<&Path>, event: issues::IssueEvent) {
     let reporter = match issues::global() {
         Some(r) => r,
         None => {
             // Parse alerts independently: a bad profile/client must not hide startup failures.
-            let mut alerts = cli
-                .config
-                .as_ref()
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            let mut alerts = config_path
+                .filter(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file()))
+                .and_then(|p| config::read_config_json::<serde_json::Value>(p).ok())
                 .and_then(|v| v.get("alerts").cloned())
                 .and_then(|v| serde_json::from_value::<config::AlertsConfig>(v).ok())
                 .unwrap_or_default();
-            if alerts.resolve(cli.config.as_deref().and_then(|p| p.parent())).is_err() {
+            if alerts.resolve(config_path.and_then(Path::parent)).is_err() {
                 alerts.resolved.clear();
             }
             issues::Reporter::new(&alerts, issue_log_dir(cli), vec![])
@@ -378,21 +385,21 @@ fn local_client(cfg: &config::Config) -> config::Client {
     config::Client { name: "local".into(), token_sha256: String::new(), profiles: cfg.profiles.keys().cloned().collect(), ..Default::default() }
 }
 
-fn print_profiles(cli: &Cli, json: bool) -> anyhow::Result<()> {
+fn print_profiles(cli: &Cli, config_path: Option<&Path>, json: bool) -> anyhow::Result<()> {
     #[derive(serde::Deserialize)]
     struct ProfileListing {
         profiles: std::collections::BTreeMap<String, config::Profile>,
     }
-    let profiles = match &cli.config {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
-            serde_json::from_str::<ProfileListing>(&text).map_err(|_| anyhow::anyhow!("invalid configuration for profiles"))?.profiles
-        }
+    let profiles = match config_path {
+        Some(path) => config::read_config_json::<ProfileListing>(path).map_err(|e| config::config_diagnostic(path, Some("profiles"), &e))?.profiles,
         None => config::Config::fallback_for(None, None, "", cli.workspace.clone()).profiles,
     };
     let mut rows = Vec::with_capacity(profiles.len());
     for (name, profile) in profiles {
-        profile.validate_workspace(&name)?;
+        profile.validate_workspace(&name).map_err(|e| match config_path {
+            Some(path) => config::config_diagnostic(path, Some("profiles"), &e),
+            None => e,
+        })?;
         // to_value propagates a serialization error if the fallback --workspace is non-UTF-8.
         rows.push(serde_json::json!({
             "name": name, "workspaceRoots": serde_json::to_value(profile.workspace_roots)?, "allowedWorkspaceRoots": profile.allowed_workspace_roots,
@@ -408,58 +415,92 @@ fn print_profiles(cli: &Cli, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// ask / turns only need the location of the default socket. Parse the selected file
+/// even if an override wins, but never load service settings or resolve provider keys.
+fn client_data_dir(config_path: Option<&Path>, override_dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Location {
+        data_dir: Option<PathBuf>,
+    }
+    let configured_dir = match config_path {
+        Some(path) => config::read_config_json::<Location>(path).map_err(|e| config::config_diagnostic(path, None, &e))?.data_dir,
+        None => None,
+    };
+    Ok(override_dir.or(configured_dir).unwrap_or_else(config::Config::default_data_dir))
+}
+
+fn load_full_config(cli: &Cli, config_path: Option<&Path>, fallback_token: &str) -> anyhow::Result<config::Config> {
+    let mut loaded = match config_path {
+        Some(path) => config::Config::load(path).map_err(|e| config::config_diagnostic(path, None, &e))?,
+        None => config::Config::fallback_for(cli.provider.as_deref(), cli.model.clone(), fallback_token, cli.workspace.clone()),
+    };
+    if let Some(dir) = &cli.data_dir {
+        loaded.data_dir = Some(dir.clone());
+    }
+    if let Some(secs) = cli.keychain_timeout_secs {
+        loaded.keychain_timeout_secs = secs;
+    }
+    Ok(loaded)
+}
+
+fn resolve_cli_config(cli: &Cli, source: Option<ValueSource>) -> anyhow::Result<config::ConfigSelection> {
+    let named = match source {
+        Some(ValueSource::CommandLine) => cli.config.clone().map(|p| (config::ConfigFileSource::Explicit, p)),
+        Some(ValueSource::EnvVariable) => cli.config.clone().map(|p| (config::ConfigFileSource::Env, p)),
+        _ => None,
+    };
+    config::resolve_config(
+        named,
+        cli.no_config,
+        || {
+            let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            config::default_config_path(xdg.as_deref(), home.as_deref(), local::user_home_dir)
+        },
+        config::probe_default_file,
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let mut command = Cli::command();
+    let mut matches = command.get_matches_mut();
+    let config_source = matches.value_source("config");
+    let cli = Cli::from_arg_matches_mut(&mut matches).unwrap_or_else(|e| e.format(&mut command).exit());
+    if cli.no_config && config_source == Some(ValueSource::CommandLine) {
+        command.error(clap::error::ErrorKind::ArgumentConflict, "--no-config cannot be used with an explicit --config <PATH>").exit();
+    }
     if let Cmd::HashToken { ref token } = cli.cmd {
         println!("{}", config::sha256_hex(token));
         return Ok(());
     }
-    if let Cmd::Keys { ref command } = cli.cmd {
-        // keys 不构造 Hub、不建日志目录；诊断只写 stderr，结果写 stdout
-        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
-        return keys::run(&cli, command);
+    let stderr_only = matches!(cli.cmd, Cmd::Keys { .. } | Cmd::Profiles { .. } | Cmd::Usage(_) | Cmd::Pricing(_) | Cmd::Ask(_) | Cmd::Turns(_));
+    let log_dir = if stderr_only { Some(std::path::Path::new("-")) } else { cli.log_dir.as_deref() };
+    let _log_guard = logging::init(&cli.log_level, log_dir, &cli.log_format)?;
+    if let Cmd::Keys { command: mutation @ (keys::KeysCmd::Set { .. } | keys::KeysCmd::Delete { .. }) } = &cli.cmd {
+        return keys::run(&cli, mutation, None);
     }
-    match &cli.cmd {
-        Cmd::Profiles { json } => return print_profiles(&cli, *json),
-        Cmd::Usage(args) => {
-            // 本地报表不构造 Hub、不加载密钥；公开目录的诊断仅写 stderr。
-            logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
-            return usage::cli::run(args, cli.config.as_deref(), cli.data_dir).await;
-        }
-        Cmd::Pricing(args) => {
-            logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
-            return usage::cli::run_pricing(args, cli.config.as_deref(), cli.data_dir).await;
-        }
-        _ => {}
-    }
-    if let Cmd::Ask(_) | Cmd::Turns(_) = cli.cmd {
-        // ask / turns only need stderr diagnostics; never create a log directory or store.
-        logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
-        // Read only dataDir: ask must not load provider/webhook secret files or initialize a Hub.
-        let configured_dir = if cli.data_dir.is_none() {
-            #[derive(serde::Deserialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Location {
-                data_dir: Option<PathBuf>,
+    let selection = match resolve_cli_config(&cli, config_source) {
+        Ok(selection) => selection,
+        Err(error) => {
+            // There is no usable path to re-open for alerts if discovery itself failed.
+            if !stderr_only {
+                startup_failed(&cli, None, startup_failure(None).1).await;
             }
-            cli.config
-                .as_ref()
-                .map(|p| -> anyhow::Result<Option<PathBuf>> {
-                    let text = std::fs::read_to_string(p).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
-                    Ok(serde_json::from_str::<Location>(&text).map_err(|_| anyhow::anyhow!("invalid configuration"))?.data_dir)
-                })
-                .transpose()?
-                .flatten()
-        } else {
-            None
-        };
-        let data_dir = cli.data_dir.clone().or(configured_dir).unwrap_or_else(config::Config::default_data_dir);
-        return match &cli.cmd {
-            Cmd::Turns(args) => turns::run(args, data_dir).await,
-            Cmd::Ask(args) => ask::run(args, data_dir, cli.provider.as_deref(), cli.reasoning_effort).await,
-            _ => unreachable!(),
-        };
+            return Err(error);
+        }
+    };
+    selection.log();
+    let config_path = selection.path();
+    match &cli.cmd {
+        Cmd::Keys { command } => return keys::run(&cli, command, config_path),
+        Cmd::Profiles { json } => return print_profiles(&cli, config_path, *json),
+        Cmd::Usage(args) => return usage::cli::run(args, config_path, cli.data_dir).await,
+        Cmd::Pricing(args) => return usage::cli::run_pricing(args, config_path, cli.data_dir).await,
+        Cmd::Turns(args) => return turns::run(args, client_data_dir(config_path, cli.data_dir)?).await,
+        Cmd::Ask(args) => return ask::run(args, client_data_dir(config_path, cli.data_dir)?, cli.provider.as_deref(), cli.model.as_deref(), cli.reasoning_effort).await,
+        _ => {}
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -470,31 +511,20 @@ async fn main() -> anyhow::Result<()> {
         );
         previous(info);
     }));
-    let _log_guard = logging::init(&cli.log_level, cli.log_dir.as_deref(), &cli.log_format)?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), os = std::env::consts::OS, arch = std::env::consts::ARCH, provider = ?cli.provider, "sub-bot starting");
-    let load = |fallback_token: &str| -> anyhow::Result<config::Config> {
-        match &cli.config {
-            Some(p) => config::Config::load(p),
-            None => Ok(config::Config::fallback_for(cli.provider.as_deref(), cli.model.clone(), fallback_token, cli.workspace.clone())),
-        }
-    };
     let fallback_token = match &cli.cmd {
-        Cmd::Serve { token, .. } => token.clone().unwrap_or_else(http::random_token),
+        Cmd::Serve { token, .. } if config_path.is_none() => token.clone().unwrap_or_else(http::random_token),
         _ => String::new(),
     };
-    let mut loaded = match load(&fallback_token) {
+    let mut loaded = match load_full_config(&cli, config_path, &fallback_token) {
         Ok(cfg) => cfg,
-        Err(_) => {
-            startup_failed(&cli, startup_failure(None).1).await;
-            anyhow::bail!("configuration load failed (check config and secret files)");
+        Err(error) => {
+            let mut event = startup_failure(None).1;
+            event.message = error.to_string(); // Sanitized by load_full_config.
+            startup_failed(&cli, config_path, event).await;
+            return Err(error);
         }
     };
-    if let Some(dir) = &cli.data_dir {
-        loaded.data_dir = Some(dir.clone());
-    }
-    if let Some(secs) = cli.keychain_timeout_secs {
-        loaded.keychain_timeout_secs = secs;
-    }
     if let Cmd::Serve { stream_idle_timeout_secs: Some(secs), .. } = cli.cmd {
         loaded.stream_idle_timeout_secs = secs;
     }
@@ -561,7 +591,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(hub) => Some(hub),
             Err(error) => {
                 let (message, event) = startup_failure(Some(&error));
-                startup_failed(&cli, event).await;
+                startup_failed(&cli, config_path, event).await;
                 anyhow::bail!(message);
             }
         }
@@ -606,8 +636,8 @@ async fn main() -> anyhow::Result<()> {
         Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::Pricing(_) | Cmd::Profiles { .. } | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
-            if cli.config.is_none() {
-                eprintln!("no --config: single client 'default'; same-user Unix socket access enabled (use --unix-socket); TCP requires a token");
+            if config_path.is_none() {
+                eprintln!("built-in configuration: single client 'default'; same-user Unix socket access enabled (use --unix-socket); TCP requires a token");
             }
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
@@ -836,6 +866,23 @@ fn format_efforts(model: &agent_ai::ModelInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_describes_config_discovery_and_ask_model() {
+        for args in [vec!["sub-bot", "--help"], vec!["sub-bot", "ask", "--help"]] {
+            let error = Cli::command().try_get_matches_from(&args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+            let help = error.to_string();
+            for text in ["--config <PATH>", "SUB_BOT_CONFIG", "~/.config/sub-bot/sub-bot.json", "XDG_CONFIG_HOME", "--no-config", "SUB_BOT_MODEL", "allowedModels"] {
+                assert!(help.contains(text), "{args:?}: {text:?} missing from {help}");
+            }
+            if args.contains(&"ask") {
+                for text in ["--resume", "--model takes precedence", "--effort"] {
+                    assert!(help.contains(text), "{text:?} missing from {help}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn cwd_flags_parse_only_on_run_and_rpc() {

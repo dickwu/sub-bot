@@ -1,7 +1,12 @@
 //! Local transport identity comes only from the accepted socket, never HTTP headers.
 use crate::config::{Client, Config};
 use axum::{extract::connect_info::Connected, serve::IncomingStream};
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    ffi::{CStr, OsString},
+    net::{IpAddr, SocketAddr},
+    os::unix::ffi::OsStringExt,
+    path::PathBuf,
+};
 
 #[derive(Clone, Debug)]
 pub enum Peer {
@@ -58,6 +63,24 @@ impl Peer {
 
 #[cfg(unix)]
 fn username(uid: u32) -> Option<String> {
+    passwd_field(uid, PasswdField::Username)?.into_string().ok()
+}
+
+/// OS home directory, independent of the HOME environment variable.
+#[cfg(unix)]
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    // SAFETY: getuid has no arguments or memory preconditions.
+    passwd_field(unsafe { libc::getuid() }, PasswdField::Home).map(PathBuf::from)
+}
+
+#[cfg(unix)]
+enum PasswdField {
+    Username,
+    Home,
+}
+
+#[cfg(unix)]
+fn passwd_field(uid: u32, field: PasswdField) -> Option<OsString> {
     // getpwuid_r is reentrant on both Linux and macOS. Bound NSS buffer growth.
     let mut size = 1024;
     while size <= 1024 * 1024 {
@@ -73,8 +96,14 @@ fn username(uid: u32) -> Option<String> {
         if rc != 0 || result.is_null() {
             return None;
         }
-        // SAFETY: successful getpwuid_r initialized result; pw_name is a NUL-terminated string.
-        return unsafe { std::ffi::CStr::from_ptr((*result).pw_name) }.to_str().ok().map(str::to_owned);
+        // SAFETY: successful getpwuid_r initialized result; both fields are NUL-terminated strings.
+        let value = unsafe {
+            CStr::from_ptr(match field {
+                PasswdField::Username => (*result).pw_name,
+                PasswdField::Home => (*result).pw_dir,
+            })
+        };
+        return Some(OsString::from_vec(value.to_bytes().to_vec()));
     }
     None
 }

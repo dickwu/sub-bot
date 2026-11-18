@@ -6,7 +6,7 @@
 //!
 //! 约定：任何输出（stdout/stderr/JSON/错误）都只包含来源描述（路径、变量名、service/account 名），绝不包含 key。
 //! 不构造 Hub；`list` 只解析配置里与 key 有关的只读部分，`check` 需要完整 `Config::load`。
-use crate::config::{Config, KeychainRef};
+use crate::config::{config_diagnostic, read_config_json, Config, ConfigRule, KeychainRef};
 use crate::hub::KeyFiles;
 use agent_ai::keychain::{self, KeychainError, KeychainReader, SystemKeychain};
 use agent_ai::secrets::{
@@ -62,7 +62,7 @@ pub enum KeysCmd {
     Check,
     /// 一次性迁移：把旧版本 sub-bot（<= 0.10.2，ACL 绑定旧二进制）创建的 Keychain 条目重建为 /usr/bin/security 拥有的条目，之后 brew upgrade 无需任何操作（仅 macOS）
     ///
-    /// 目标：service sub-bot（或 --service）下的受管条目 + 配置里的 apiKeyKeychain 条目（--config），可用全局 --provider / --account 筛选。
+    /// 目标：service sub-bot（或 --service）下的受管条目 + 所选配置里的 apiKeyKeychain 条目，可用全局 --provider / --account 筛选。
     /// 每个条目读取一次（旧条目会弹一次授权对话框，点“始终允许”），删除后重建并读回校验。任一失败 ⇒ 非零退出码。
     Reauth {
         /// 只迁移该账号（需配合 --provider 更精确）
@@ -398,8 +398,8 @@ struct Declared {
 
 impl KeyConfig {
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
-        let mut cfg: Self = serde_json::from_str(&text).map_err(|_| anyhow::anyhow!("invalid configuration"))?;
+        let mut cfg: Self = read_config_json(path)?;
+        anyhow::ensure!(cfg.keychain_timeout_secs != Some(0), ConfigRule("keychainTimeoutSecs must be >= 1"));
         let dir = path.parent().unwrap_or(Path::new("."));
         let account_files = cfg.providers.values_mut().flat_map(|p| p.api_key_file.as_mut().into_iter().chain(p.accounts.values_mut().filter_map(|a| a.api_key_file.as_mut())));
         for file in account_files.chain(cfg.api_key_file.as_mut()) {
@@ -833,7 +833,11 @@ fn timed_system_store(timeout: Duration) -> TimedStore {
     TimedStore::new(Arc::new(SystemKeychain), timeout, keychain::WAIT_HINT_GRACE, |service, account| eprintln!("{}", keychain::wait_hint(service, account)))
 }
 
-pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
+pub fn run(cli: &crate::Cli, cmd: &KeysCmd, config_path: Option<&Path>) -> anyhow::Result<()> {
+    let read_config = || match config_path {
+        Some(path) => KeyConfig::read(path).map_err(|e| config_diagnostic(path, Some("keys"), &e)),
+        None => Ok(KeyConfig::default()),
+    };
     let stores = Stores { macos: keychain::supported(), managed_dir: managed_key_dir(), keychain: &SystemKeychain };
     let getenv = |k: &str| std::env::var(k).ok();
     let files = KeyFiles { openai: cli.openai_key_file.as_deref(), anthropic: cli.anthropic_key_file.as_deref() };
@@ -851,7 +855,7 @@ pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
             delete(&stores, pk, account, &target, &mut out)
         }
         KeysCmd::List { json } => {
-            let cfg = cli.config.as_deref().map(KeyConfig::read).transpose()?.unwrap_or_default();
+            let cfg = read_config()?;
             if let Some(f) = cli.provider.as_deref() {
                 anyhow::ensure!(provider_key(f).is_some(), "unknown provider '{f}'");
             }
@@ -860,18 +864,14 @@ pub fn run(cli: &crate::Cli, cmd: &KeysCmd) -> anyhow::Result<()> {
             print_rows(&list_rows(&stores, &cfg, cli.provider.as_deref(), files, &getenv), *json, &mut out)
         }
         KeysCmd::Reauth { account, service, from_env, dry_run, json } => {
-            let cfg = cli.config.as_deref().map(KeyConfig::read).transpose()?.unwrap_or_default();
+            let cfg = read_config()?;
             let timed = timed_system_store(keychain_timeout(cli, cfg.keychain_timeout_secs)?);
             let stores = Stores { keychain: &timed, ..stores };
             let opts = ReauthOpts { service: service.as_deref(), provider: cli.provider.as_deref(), account: account.as_deref(), from_env: *from_env, dry_run: *dry_run, json: *json };
             reauth(&stores, &cfg, &opts, &getenv, &mut out)
         }
         KeysCmd::Check => {
-            let mut cfg = match &cli.config {
-                Some(p) => Config::load(p).map_err(|e| anyhow::anyhow!("configuration load failed: {e}"))?,
-                None => Config::fallback_for(cli.provider.as_deref(), cli.model.clone(), "", cli.workspace.clone()),
-            };
-            cfg.keychain_timeout_secs = keychain_timeout(cli, Some(cfg.keychain_timeout_secs))?.as_secs();
+            let cfg = crate::load_full_config(cli, config_path, "")?;
             let timed = timed_system_store(Duration::from_secs(cfg.keychain_timeout_secs));
             let stores = Stores { keychain: &timed, ..stores };
             let default = cfg.default_provider.clone().unwrap_or_else(|| "openai".into());

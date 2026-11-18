@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：**v0.14.0**。创建会话时可选择工作目录（CLI、HTTP、stdio RPC），恢复时沿用已保存的目录和上下文边界。默认允许选择任意现有目录；如果原先依赖 `workspaceRoots` 限制选择范围，请在升级前加上 `"allowedWorkspaceRoots": []`。见「按请求选择工作目录」与 [CHANGELOG.md](CHANGELOG.md)。
+> 状态：**v0.14.1**。CLI 会自动读取默认配置文件，`run` / `rpc` 可直接使用其中的 profile；`ask --model` 现已在新建服务端会话时生效。跳过自动加载可用 `--no-config`。见「快速开始」与 [CHANGELOG.md](CHANGELOG.md)。
 
 ## Claude (Anthropic)
 
@@ -60,7 +60,7 @@
 }
 ```
 
-`run`、`rpc`、`models` 使用内存 store，不获取 dataDir 锁、不读取或写入这些 journal、不恢复任务或续投服务端 webhook，因此可与同一 dataDir 的 `serve` 并行运行。独立的日志输出和会话历史（`<dataDir>/sessions/<client>/`，每个会话一个文件，不需要锁）不受影响。
+`run`、`rpc`、`models` 使用内存 store，不获取 `<dataDir>/state/lock`，不读写服务端 task / delivery journal，也不恢复服务端任务或续投 webhook。`run` 和 `rpc` 可以与 `serve` 使用同一 `dataDir` 和 `sessionDir` 新建会话；历史分别写入 `local`、`stdio` 和 HTTP client 名下的 UUID 文件。**同一 owner / ID 的 JSONL 没有跨进程锁，不要并发恢复并写入同一个会话文件。**
 
 启动时压缩日志、清理超过 `taskTtlSecs` 的结果。最后一个不完整行会被忽略；完整行损坏时，原文件重命名为 `<name>.corrupt-<unix_ms>`（0600），恢复损坏行之前的记录，并上报 error issue `store_corrupt`。上次处于 queued/running 的任务不会重新执行工具，而是标记 failed，error 为 `interrupted by restart`，并上报 client/task 范围的 error issue `task_interrupted`。任务仍可由所属 client 通过 `GET /v1/tasks/{id}` 查询，直到 TTL 到期。
 
@@ -286,16 +286,16 @@ scripts/update-tap.sh 0.4.0 /path/to/homebrew-tap
 **安全取舍：任何以映射 uid 运行的进程，都能充当该 client；启用 `trustLoopback` 后，任何本地进程都能充当指定 client。** 这不是同一 uid 下不同 bot 的安全隔离。请保持 socket 和父目录权限严格，只映射可信用户；`any`/组共享会扩大信任范围。远程请求仍需要 token；不要把 loopback 信任当成反向代理后的远程认证。
 
 ```bash
-# 使用配置中的身份映射；同时监听 TCP 和默认 UDS
-sub-bot --config sub-bot.json serve --unix-socket
-# 或仅监听 UDS
-sub-bot --config sub-bot.json serve --unix-socket --bind none
+# 使用配置中的身份映射；假定服务使用默认路径中的 JSON，同时监听 TCP 和默认 UDS
+sub-bot serve --unix-socket
+# 如使用不同位置的配置，显式指定；也可以只监听 UDS
+sub-bot --config /path/to/sub-bot.json serve --unix-socket --bind none
 
 curl --unix-socket ~/.local/share/sub-bot/sub-bot.sock http://localhost/v1/chat \
   -H 'Content-Type: application/json' -d '{"message":"请检查当前项目","session":{"profile":"coder"}}'
 # macOS curl: --unix-socket "$HOME/Library/Application Support/sub-bot/sub-bot.sock"
 
-sub-bot ask "请检查当前项目"
+sub-bot ask --profile coder --model gpt-6.2-sol "请检查当前项目"
 sub-bot ask --json "逐事件输出 NDJSON"
 sub-bot ask --profile coder --async --json "运行测试并总结"
 printf '继续上次的任务' | sub-bot ask --session SESSION_ID -   # --resume 是 --session 的别名；服务重启后同样有效
@@ -303,7 +303,11 @@ sub-bot ask --socket /path/to/sub-bot.sock "hello"
 sub-bot ask --url http://127.0.0.1:7878 --token-file /path/to/token "hello"
 ```
 
-`ask` 不启动模型/provider，也不读取 OpenAI key。默认优先使用数据目录中的默认 socket（若存在），否则连接 `http://127.0.0.1:7878`；自定义 socket 路径或 TCP 端口需显式传 `--socket` / `--url`（二者互斥）。`--config` 中的 `dataDir` 和 `--data-dir` 同样影响默认 socket 查找。Token 可来自 `--token-file`，否则读取 `SUB_BOT_TOKEN`，不会打印。默认同步请求使用 SSE，助手文本增量到达即写入并 flush stdout，结束时换行（工具事件不打印）。同步 `--json` 即时输出 NDJSON：第一行是从响应头 `x-session-id` 取得的 `{"type":"session","sessionId":"<id>"}`，可将该 ID 传给后续 `ask --session <id>` 继续会话（旧服务端未返回此头时省略该行）。之后每行一个服务端原始 JSON 对象，包含文本、工具、错误，最后一行仍是服务端最终 `agent_settled` 事件，不是最终响应对象；多行 SSE data 合并为单行 JSON。Unix socket 与 TCP 行为一致，纯文本 stdout 不变。`--async` 使用异步任务 API 并轮询到最终结果后打印最终文本，`--async --json` 仍打印完整最终 task 对象。HTTP/模型失败、abort 或流在 settled 前断开会向 stderr 报错并返回非零退出码，stdout 可能已包含部分输出。`--timeout <secs>`（默认 3600）限制从发出请求到取得最终结果的总等待时间，包括异步轮询和网络等待；超时返回明确错误和非零退出码，但不会自动取消服务端任务。
+`ask` 和 `turns` 不启动 Hub 或 provider，不读取服务端密钥。连接优先级：显式 `--socket` 或 `--url`（二者互斥）> `<dataDir>/sub-bot.sock`（存在时）> `http://127.0.0.1:7878`。`dataDir` 来自 `--data-dir`、选中的配置文件或系统数据目录，按此顺序取值；自定义 socket 路径或 TCP 端口用 `--socket` / `--url`。认证用 `--token-file` 或 `SUB_BOT_TOKEN`（不从 `clients[].tokenSha256` 取 token），也可使用服务端已配置的本地身份映射。
+
+`ask --model`（或 `SUB_BOT_MODEL`，命令行优先）仅在**新建会话**时向服务端发送 `session.model`，覆盖 profile 默认模型与 `--depth` / `--deep` 路由。服务端按该 profile 的 `allowedModels` 校验；不允许时，流式和异步模式都在 stderr 显示 HTTP 400 及服务端错误。未指定模型时由服务端决定，不使用本地配置中的默认模型。`--session` / `--resume` 沿用会话模型和账号；若同时指定了模型，CLI 会提示并继续原会话，`--effort` 仍可粘性修改。要更换模型，请新建会话。
+
+默认同步请求使用 SSE，助手文本增量到达即写入并 flush stdout，结束时换行（工具事件不打印）。同步 `--json` 即时输出 NDJSON：第一行是从响应头 `x-session-id` 取得的 `{"type":"session","sessionId":"<id>"}`，可将该 ID 传给后续 `ask --session <id>` 继续会话（旧服务端未返回此头时省略该行）。随后逐行输出服务端事件，直到 `agent_settled`；如能读到会话视图，再附一行 `session_state`（含模型和推理强度等）。多行 SSE data 合并为单行 JSON。Unix socket 与 TCP 行为一致，纯文本 stdout 不变。`--async` 使用异步任务 API 并轮询到最终结果后打印最终文本，`--async --json` 仍打印完整最终 task 对象。HTTP/模型失败、abort 或流在 settled 前断开会向 stderr 报错并返回非零退出码，stdout 可能已包含部分输出。`--timeout <secs>`（默认 3600）限制从发出请求到取得最终结果的总等待时间，包括异步轮询和网络等待；超时不会自动取消服务端任务。
 
 ## 问题上报 (issues)
 
@@ -379,15 +383,19 @@ sub-bot keys set --provider openai   # 推荐：无回显输入 key；macOS 存 
 mkdir -p ~/.config/sub-bot && install -m 600 /dev/null ~/.config/sub-bot/openai.key && $EDITOR ~/.config/sub-bot/openai.key
 export OPENAI_API_KEY_FILE=~/.config/sub-bot/openai.key   # 或 --openai-key-file / 配置 apiKeyFile；也仍支持 OPENAI_API_KEY
 sub-bot hash-token "$(openssl rand -hex 24)"   # 记下 token 原文给 bot，把输出的哈希填进配置
-cp sub-bot.example.json sub-bot.json   # 编辑 profiles / clients
-sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
+# XDG_CONFIG_HOME 未设或不是绝对路径时，macOS 和 Linux 都默认使用这个目录
+mkdir -p ~/.config/sub-bot
+cp -n sub-bot.example.json ~/.config/sub-bot/sub-bot.json   # 不覆盖已有文件；编辑 profiles / clients、路径及密钥来源
+sub-bot serve --bind 127.0.0.1:7878 --unix-socket   # 自动读取默认路径；其它位置用 --config PATH
 ```
 
-不带 `--config` 时会使用单 client、单 `default` profile 的模式，以 `--workspace`（默认当前目录）为根，并自动将服务进程的有效 uid 映射到 client `default`。运行 `sub-bot serve --unix-socket` 后，同一用户即可用 `sub-bot ask "hello"` 零 token 调用；同一 uid 下的所有进程都获得该身份。TCP 仍需通过 `SUB_BOT_TOKEN` 或 `serve --token` 指定调用凭据；省略时生成的随机 token 不会打印。显式配置文件不会自动添加 uid 映射，需要自行配置 `localClients` 或 `trustLoopback`。
+配置文件可把同一套 profile 提供给 `serve`、`run` 和 `rpc`。例如本地配置中有 `coder-openai` 时，可以直接运行 `sub-bot run --profile coder-openai "检查当前项目"`，不必绕经服务，也不用 Bearer token。它会在本进程加载所需的 provider 凭据（macOS 上可能需要 Keychain 授权）。`ask` 则连接已运行的服务，按服务端授权的 profile 工作。
+
+**仅在使用内置配置时**，`serve` 才会提供单 client、单 `default` profile 模式，并自动将服务进程的有效 uid 映射到 client `default`。例如 `sub-bot --no-config serve --unix-socket` 启动后，同一用户可用 `sub-bot --no-config ask "hello"` 零 token 调用；同一 uid 的所有进程都获得该身份。TCP 仍需有效 token（内置模式下通过 `SUB_BOT_TOKEN` 或 `serve --token` 设置，省略则生成随机值，不打印）。**只要加载了文件**，无论自动发现还是显式传入，都用文件里的 `clients`、`localClients`、`trustLoopback`；没有隐式 uid 映射，`serve --token` 不覆盖文件中的认证配置。
 
 试用时可加上 `--provider faux`，不调用 OpenAI。若要让 `serve` 也不联网更新估测价格，配置 `pricing.source: "builtin"`（见「用量统计」）。
 
-**默认 OpenAI 模型**：默认仍是 `gpt-6.1-sol`。不带 `--config` 且 provider 为 OpenAI 时，内置 `default` profile 的 `allowedModels` 包含 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6.2-astra` 和 `gpt-6.2-sol`（`--model` 显式指定的其它模型会自动加入）。在配置文件中可自行设置 profile 的 `allowedModels`，不填则不限制。
+**默认 OpenAI 模型**：默认仍是 `gpt-6.1-sol`。使用内置配置且 provider 为 OpenAI 时，内置 `default` profile 的 `allowedModels` 包含 `gpt-6.1-sol`、`gpt-6-astra`、`gpt-6.2-astra` 和 `gpt-6.2-sol`（`serve` / `run` / `rpc` 进程的 `--model` 显式指定的其它模型也会加入自己的内置列表）。用 `ask --model` 不会扩大服务端的列表。配置文件中可自行设置 `allowedModels`，不填则不限制。
 
 `serve` 收到 Ctrl-C 或 SIGTERM 时停止接受新会话/提交，取消正在运行的会话，等运行收尾并写入 JSONL 后退出。
 
@@ -395,7 +403,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 
 工作目录 `cwd` 在**创建会话时**选定：文件工具以它为相对路径基准，`bash` 从那里启动。另有一个 `sessionRoot`，只用于限制向上读取项目指令。两者都是解析符号链接后的绝对路径，由会话固定，不能用 PATCH 更改。
 
-`workspaceRoots` 仍是必填的非空列表。第一个存在且可用的目录是默认 cwd；相对 `workspaceRoots` 以 sub-bot **进程启动目录**为基准，不是配置文件目录。无配置时，`--workspace`（默认 `.`）填入 `default` profile 的 `workspaceRoots`，与每个会话的 `--cwd` 不同。
+`workspaceRoots` 仍是必填的非空列表。第一个存在且可用的目录是默认 cwd；相对 `workspaceRoots` 以 sub-bot **进程启动目录**为基准，不是配置文件目录。同一配置供不同启动目录下的 `serve` 和 `run` 共用时，建议配置绝对根。`--workspace`（默认 `.`）只填入内置 `default` profile 的 `workspaceRoots`，不会覆盖自动发现或显式指定的文件；它也不同于每个会话的 `--cwd`。
 
 | profile 的 `allowedWorkspaceRoots` | 可选的 cwd（先解析符号链接，再按路径组件判断） |
 |---|---|
@@ -413,7 +421,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 sub-bot run --cwd "$HOME/src/app" "检查项目结构"
 sub-bot ask --socket "$SOCK" --profile coder --cwd /Volumes/GWD/inter "列出顶层文件"
 sub-bot rpc --cwd "$HOME/src/app"              # 启动时绑定；或不加参数，在首条 prompt 中给 cwd
-sub-bot --config sub-bot.json profiles --json   # 只读本地配置，不连服务、不读密钥、不探测挂载
+sub-bot profiles --json                       # 只读本地配置，不连服务、不读密钥、不探测挂载
+sub-bot --no-config --workspace "$HOME/src" run "检查默认目录"  # 强制使用内置 default profile
 ```
 
 无 `--cwd` 且不恢复的 RPC，可用这条 JSONL 作为第一条会话命令：
@@ -442,6 +451,19 @@ curl -s "localhost:7878/v1/sessions/$SID/prompt" -H "Authorization: Bearer $BOT_
 **这不是文件访问控制。** 策略只约束可选的会话目录和项目指令的向上查找；文件工具的相对路径检查不阻止 OS 跟随符号链接，而 `bash` 能访问服务用户有权限的路径。只把有这些工具的 profile 授权给可信调用方。
 
 ## 配置（`sub-bot.json`）
+
+macOS 和 Linux 的查找顺序相同：
+
+1. 显式 `--config <PATH>`；
+2. `SUB_BOT_CONFIG`；
+3. 一个默认路径：`$XDG_CONFIG_HOME/sub-bot/sub-bot.json`（仅当 `XDG_CONFIG_HOME` 是绝对路径），否则是 `~/.config/sub-bot/sub-bot.json`（优先绝对的 `HOME`，否则用系统记录的 home）。不搜索当前目录；如果选了 XDG 路径但文件不存在，不再查 `~/.config`；
+4. 仅当没有指定文件且默认文件不存在（或无法确定默认路径）时，使用内置 `default` profile。
+
+这是从**磁盘**读取配置，不读取运行中服务的配置状态。如果终端里的 XDG 路径和 LaunchAgent 固定的 `--config` 不同，请给 CLI 传入同一绝对路径。显式或环境变量指定的文件必须存在；选中的文件若不可读、不是普通文件、是悬空链接、JSON 损坏或未通过当前命令的校验，报错退出，不回退。INFO 日志 `configuration selected` 在 stderr 标明 `config_source`（`explicit` / `env` / `default-path` / `built-in`）及路径或回退原因，不影响 stdout 的 JSON / RPC 输出。
+
+`--no-config` 跳过 `SUB_BOT_CONFIG` 和默认路径，强制使用内置配置；不能与显式 `--config` 同用。它不会禁用模型、key、token 等其它环境变量，也不会隔离存储目录。`hash-token`、`keys set` / `keys delete`、`--help` / `--version` 不读取配置，可在文件损坏时用于诊断和修复。
+
+轻量命令只解析其所需的字段：`ask` / `turns` 读 `dataDir`，`profiles` 读 profile 与工作目录策略，`usage` / `pricing` 读目录和价格设置，`keys list` / `keys reauth` 读 key 相关设置。它们仍会检查 JSON 语法和所读字段，不加载其它服务端设置或引用的 webhook 密钥。`keys check` 使用完整配置检查凭据；`usage` / `pricing` 的公开价格刷新规则不变。
 
 ```jsonc
 {
@@ -515,9 +537,11 @@ curl -s "localhost:7878/v1/sessions/$SID/prompt" -H "Authorization: Bearer $BOT_
 
 - **`sub-bot.example.json` 里的 `tokenSha256` 是占位符，必须替换**。配置里只存 token 的 SHA-256，不存原文；加载时要求恰好 64 个十六进制字符，并拒绝未知 profile 引用、空 `workspaceRoots`、未知工具或预设。
 - 全局参数（也可以用环境变量设置）：
-  - `--config`（`SUB_BOT_CONFIG`）
+  - `--config <PATH>`（`SUB_BOT_CONFIG`）和 `--no-config`：选择配置来源，见上文
+  - `--workspace <DIR>`：只设置内置 `default` profile 的工作目录
+  - `--data-dir <PATH>`：覆盖配置 `dataDir`
   - `--provider openai|anthropic|faux`
-  - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型；`rpc` / `run` 时指定本会话的模型
+  - `--model`（`SUB_BOT_MODEL`）：`serve` 时覆盖全局默认模型（profile 或 provider 的默认值仍可优先）；`rpc` / `run` / `ask` 时为新会话指定模型，受 profile 的 `allowedModels` 限制
   - `--reasoning-effort` / `--effort`（`SUB_BOT_REASONING_EFFORT`）：同上，取值 `none|minimal|low|medium|high|xhigh|max` 或 provider 小写名称；`ask` 时作为 `/v1/chat` 顶层 `reasoningEffort` 发送（粘性）
   - `--api`（`SUB_BOT_API`）：`auto|chat|responses`，`serve` 时覆盖 `defaultApi`，`rpc` / `run` 时指定本会话
   - `--session-dir`（`SUB_BOT_SESSION_DIR`）：会话 JSONL 的持久化目录，按 bot 分子目录存放；优先于配置 `sessionDir`，默认 `<dataDir>/sessions`
@@ -525,6 +549,8 @@ curl -s "localhost:7878/v1/sessions/$SID/prompt" -H "Authorization: Bearer $BOT_
   - `--openai-key-file`：从文件读取 OpenAI API key（见「API key」）
   - `--keychain-timeout-secs`（`SUB_BOT_KEYCHAIN_TIMEOUT_SECS`）：覆盖 `keychainTimeoutSecs`（>= 1），对 `serve` / `run` / `rpc` / `keys check` / `keys list` 等所有读取 Keychain 的命令生效
   - `--log-level`、`--log-dir`、`--log-format`
+
+**升级提醒**：已 `export` 的 `SUB_BOT_MODEL` 现在也会影响新建的 `ask` 会话，即使连到另一台服务。要让 `ask` 使用服务端默认值，可执行 `unset SUB_BOT_MODEL`，或只对启动服务的命令设置（如 `SUB_BOT_MODEL=gpt-6.2-sol sub-bot serve`）。
 
 ## 模型与推理强度
 
@@ -929,7 +955,7 @@ Deleted OpenAI key for account 'default' from keychain (service=sub-bot, account
 
 条目不存在时报 `no key stored for openai/default` 并以非零状态退出。
 
-**`check`** 先完整加载配置（无 `--config` 时用内置默认配置），再对每个将在启动时加载的账号（启动必需的账号、所有 `accounts.*` 命名账号，以及显式声明了 key 来源的 default 账号）按完整优先级加载一次 key，只打印成功/失败和来源；用 `--provider` 时只检查该 provider（即使配置不需要它）。任一失败退出码为 1：
+**`check`** 先完整加载所选配置（未发现配置文件或使用 `--no-config` 时才用内置配置），再对每个将在启动时加载的账号（启动必需的账号、所有 `accounts.*` 命名账号，以及显式声明了 key 来源的 default 账号）按完整优先级加载一次 key，只打印成功/失败和来源；用 `--provider` 时只检查该 provider（即使配置不需要它）。任一失败退出码为 1：
 
 ```text
 openai/default: ok (keychain service=sub-bot account=openai/default)
@@ -980,7 +1006,7 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
 - **v0.10.3 起 Keychain 访问不再弹窗，升级也无需任何操作**：`keys set` / `keys reauth` 经 `/usr/bin/security` 创建的条目，ACL 信任的是 Apple 的 `security` 工具而不是某个 sub-bot 二进制；之后无论哪个版本的 sub-bot 读取（都是 spawn `/usr/bin/security find-generic-password -w`）都不会弹窗，`brew upgrade` 后只需 `launchctl kickstart -k` 重启服务。安全取舍见上文「配置 `apiKeyKeychain`」一节。
 - **为什么以前每次 brew upgrade 都要重新授权**（<= 0.10.2）：旧版本用 Security.framework（SecItemAdd）在 sub-bot 进程里创建条目，macOS 把创建者记为“可信应用”——但 Homebrew 的二进制只有 ad-hoc / linker 签名，没有稳定的 Team ID，所以 ACL 里存的是该二进制的 **cdhash**（`cdhash H"…"`），partition list 也是 `cdhash:<hash>`。每次升级都是一个新 cdhash，新二进制对 Keychain 来说就是另一个应用：GUI 会话里再弹一次授权（有人点击之前读取一直阻塞，v0.9.2 起有超时），没有 GUI（ssh、launchd 后台进程）时读取失败（`-25293` / `-25308`）或超时。用 `security add-generic-password -T /opt/homebrew/bin/sub-bot` 信任一个稳定路径也**没用**：ACL 存的仍是 cdhash 要求，partition 检查也基于 cdhash。
 - **从 <= 0.10.2 升级后的一次性迁移**：旧条目的 ACL 还绑着旧二进制，0.10.3 第一次读它仍会弹一次窗（或在 launchd 下超时）。在**这台 Mac 的图形界面终端**里（不是 ssh）执行一次，三选一：
-  - `sub-bot --config sub-bot.json keys reauth`：逐条读取旧条目（每条弹一次窗，输入登录密码并点 **“始终允许 / Always Allow”**）、删除并重建。带上服务用的 `--config`，这样配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）也会被迁移；`keys reauth --dry-run` 先看会动哪些条目。
+  - `sub-bot --config sub-bot.json keys reauth`：逐条读取旧条目（每条弹一次窗，输入登录密码并点 **“始终允许 / Always Allow”**）、删除并重建。带上服务用的 `--config`（若默认查找不能选到同一文件），这样配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）也会被迁移；`keys reauth --dry-run` 先看会动哪些条目。
   - `sub-bot keys reauth --from-env --provider openai`（`OPENAI_API_KEY` 已 export）：不读旧条目，零弹窗，ssh 下也能做。
   - `sub-bot keys set --provider openai`：重新输入 key，效果相同（新条目同样归属 `/usr/bin/security`）。
   然后重启后台服务：`launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot`。之后的升级不再需要这一步。
@@ -1048,7 +1074,7 @@ sub-bot 把 Security.framework 返回的 OSStatus 映射成以下错误（括号
 ```
 
 - launchd 启动的进程 PATH 很短，`EnvironmentVariables` 里补上 Homebrew 路径，模型调用的 `bash` 工具才能找到 `git`、`cargo` 等命令；启动早期的错误（例如 Keychain 超时）在 `launchd.err.log` 里。
-- launchd **不展开 `~` 和 `$HOME`**，plist 里必须写绝对路径。Apple Silicon 上 Homebrew 的路径是 `/opt/homebrew/bin/sub-bot`，Intel Mac 是 `/usr/local/bin/sub-bot`（`brew --prefix` 可确认）。
+- launchd **不展开 `~` 和 `$HOME`**，plist 里必须写绝对路径。终端里若设置了不同的 `XDG_CONFIG_HOME`，请给 `run`、`ask` 等命令传入与 plist 一致的 `--config /Users/you/.config/sub-bot/sub-bot.json`。Apple Silicon 上 Homebrew 的路径是 `/opt/homebrew/bin/sub-bot`，Intel Mac 是 `/usr/local/bin/sub-bot`（`brew --prefix` 可确认）。
 - `--config` / `--log-dir` / `--log-level` 是全局参数，可以写在 `serve` 前面；`--unix-socket` 不带值时监听 `<dataDir>/sub-bot.sock`（macOS 默认 `~/Library/Application Support/sub-bot/sub-bot.sock`），带路径则监听该路径。issues.log 也写在 `--log-dir` 指定的目录里。
 - 加载 / 查看 / 卸载：
 
@@ -1076,7 +1102,7 @@ launchctl kickstart -k gui/$(id -u)/com.dickwu.sub-bot
    sub-bot --config /Users/you/.config/sub-bot/sub-bot.json keys reauth
    ```
 
-   每个旧条目弹一次授权对话框，输入登录密码并点 **「始终允许」（Always Allow）**；输出 `<provider>/<account>: migrated (…)` 表示该条目已重建。带上服务用的 `--config`，配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）才会一起迁移。不想点窗（或只有 ssh）就用 `sub-bot keys reauth --from-env --provider anthropic`（先 export `ANTHROPIC_API_KEY`），或重新 `sub-bot keys set --provider anthropic`。`FAILED: …` 见上文错误码对照。
+   每个旧条目弹一次授权对话框，输入登录密码并点 **「始终允许」（Always Allow）**；输出 `<provider>/<account>: migrated (…)` 表示该条目已重建。确保选中服务使用的配置（必要时带上相同的 `--config`），配置里 `apiKeyKeychain` 指向的条目（命名账号、自定义 service）才会一起迁移。不想点窗（或只有 ssh）就用 `sub-bot keys reauth --from-env --provider anthropic`（先 export `ANTHROPIC_API_KEY`），或重新 `sub-bot keys set --provider anthropic`。`FAILED: …` 见上文错误码对照。
 2. 重启后台服务：
 
    ```bash

@@ -5,12 +5,156 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fmt,
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Once,
     },
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigFileSource {
+    Explicit,
+    Env,
+    DefaultPath,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigSelection {
+    File { source: ConfigFileSource, path: PathBuf },
+    BuiltIn(&'static str),
+}
+
+impl ConfigSelection {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::File { path, .. } => Some(path),
+            Self::BuiltIn(_) => None,
+        }
+    }
+
+    pub fn log(&self) {
+        match self {
+            Self::File { source, path } => {
+                let source = match source {
+                    ConfigFileSource::Explicit => "explicit",
+                    ConfigFileSource::Env => "env",
+                    ConfigFileSource::DefaultPath => "default-path",
+                };
+                tracing::info!(config_source = source, config_path = ?path, "configuration selected");
+            }
+            Self::BuiltIn(reason) => tracing::info!(config_source = "built-in", reason, "configuration selected"),
+        }
+    }
+}
+
+/// Use the same config layout on macOS and Linux, independent of the system data directory.
+pub fn default_config_path(xdg: Option<&Path>, home: Option<&Path>, os_home: impl FnOnce() -> Option<PathBuf>) -> Option<PathBuf> {
+    let base = match xdg.filter(|p| p.is_absolute()) {
+        Some(xdg) => xdg.to_owned(),
+        None => home.filter(|p| p.is_absolute()).map(Path::to_owned).or_else(os_home).filter(|p| p.is_absolute())?.join(".config"),
+    };
+    Some(base.join("sub-bot/sub-bot.json"))
+}
+
+pub fn resolve_config(
+    named: Option<(ConfigFileSource, PathBuf)>,
+    no_config: bool,
+    default_path: impl FnOnce() -> Option<PathBuf>,
+    probe: impl FnOnce(&Path) -> anyhow::Result<bool>,
+) -> anyhow::Result<ConfigSelection> {
+    // The CLI rejects an explicit --config together with --no-config.
+    if no_config {
+        return Ok(ConfigSelection::BuiltIn("no-config"));
+    }
+    if let Some((source, path)) = named {
+        return Ok(ConfigSelection::File { source, path });
+    }
+    let Some(path) = default_path() else {
+        return Ok(ConfigSelection::BuiltIn("no-default-path"));
+    };
+    if probe(&path).map_err(|e| config_diagnostic(&path, None, &e))? {
+        Ok(ConfigSelection::File { source: ConfigFileSource::DefaultPath, path })
+    } else {
+        Ok(ConfigSelection::BuiltIn("not-found"))
+    }
+}
+
+/// Only an absent directory entry permits fallback. In particular, a dangling symlink is a broken config.
+pub fn probe_default_file(path: &Path) -> anyhow::Result<bool> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let meta = if meta.is_symlink() {
+        match std::fs::metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(ConfigRule("dangling symlink").into()),
+            target => target?,
+        }
+    } else {
+        meta
+    };
+    anyhow::ensure!(meta.is_file(), ConfigRule("not a regular file"));
+    Ok(true)
+}
+
+/// Read the selected file without hanging if a FIFO replaces it between discovery and open.
+fn read_config_text(path: &Path) -> anyhow::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+    anyhow::ensure!(file.metadata()?.is_file(), ConfigRule("not a regular file"));
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    Ok(text)
+}
+
+pub(crate) fn read_config_json<T: serde::de::DeserializeOwned>(path: &Path) -> anyhow::Result<T> {
+    let text = read_config_text(path)?;
+    let config = serde_json::from_str(&text)?;
+    // Derived structs can also deserialize sequences; a configuration must be an object.
+    anyhow::ensure!(text.trim_start().starts_with('{'), ConfigRule("expected a JSON object"));
+    Ok(config)
+}
+
+/// Only fixed, credential-free validation messages may be surfaced by CLI readers.
+#[derive(Debug)]
+pub(crate) struct ConfigRule(pub &'static str);
+
+impl ConfigRule {
+    /// Keep the location for internal diagnostics; config_diagnostic only reads the rule itself.
+    pub(crate) fn at(self, location: impl fmt::Display) -> anyhow::Error {
+        let message = format!("{location}: {self}");
+        anyhow::Error::new(self).context(message)
+    }
+}
+
+impl fmt::Display for ConfigRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ConfigRule {}
+
+pub(crate) fn config_diagnostic(path: &Path, reader: Option<&str>, err: &anyhow::Error) -> anyhow::Error {
+    if let Some(io) = err.downcast_ref::<io::Error>() {
+        return anyhow::anyhow!("cannot read configuration {path:?}: {:?}", io.kind());
+    }
+    let subject = match reader {
+        Some(reader) => format!("configuration for {reader} {path:?}"),
+        None => format!("configuration {path:?}"),
+    };
+    if let Some(json) = err.downcast_ref::<serde_json::Error>() {
+        return anyhow::anyhow!("invalid {subject} at line {} column {}", json.line(), json.column());
+    }
+    if let Some(rule) = err.downcast_ref::<ConfigRule>() {
+        return anyhow::anyhow!("invalid {subject}: {rule}");
+    }
+    anyhow::anyhow!("invalid {subject}: {err:#}")
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -119,10 +263,10 @@ impl Profile {
     }
 
     pub(crate) fn validate_workspace(&self, name: &str) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+        anyhow::ensure!(!self.workspace_roots.is_empty(), ConfigRule("workspaceRoots must not be empty").at(format_args!("profile '{name}'")));
         anyhow::ensure!(
             self.allows_any_workspace() || self.allowed_workspace_roots.iter().all(|r| r.is_absolute() && !r.as_os_str().as_encoded_bytes().contains(&b'*')),
-            "profile '{name}': allowedWorkspaceRoots must be [\"*\"] or a list of absolute directory paths"
+            ConfigRule("allowedWorkspaceRoots must be [\"*\"] or a list of absolute directory paths").at(format_args!("profile '{name}'"))
         );
         Ok(())
     }
@@ -222,8 +366,8 @@ impl AlertsConfig {
 }
 fn read_secret(path: &std::path::Path, dir: Option<&std::path::Path>) -> anyhow::Result<String> {
     let path = if path.is_relative() { dir.unwrap_or_else(|| std::path::Path::new(".")).join(path) } else { path.to_owned() };
-    let secret = std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read webhookSecretFile"))?;
-    anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
+    let secret = std::fs::read_to_string(path).map_err(|_| ConfigRule("cannot read webhookSecretFile"))?;
+    anyhow::ensure!(!secret.trim().is_empty(), ConfigRule("webhookSecretFile is empty"));
     Ok(secret.trim().to_owned())
 }
 fn validate_targets(targets: &Targets) -> anyhow::Result<()> {
@@ -654,7 +798,7 @@ impl Config {
     }
 
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        let mut cfg: Self = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+        let mut cfg: Self = read_config_json(path)?;
         if let (Some(f), Some(dir)) = (&cfg.api_key_file, path.parent()) {
             if f.is_relative() {
                 cfg.api_key_file = Some(dir.join(f));
@@ -673,9 +817,7 @@ impl Config {
                 if file.is_relative() {
                     *file = path.parent().unwrap_or_else(|| std::path::Path::new(".")).join(&*file);
                 }
-                let secret = std::fs::read_to_string(file).map_err(|_| anyhow::anyhow!("cannot read webhookSecretFile"))?;
-                anyhow::ensure!(!secret.trim().is_empty(), "webhookSecretFile is empty");
-                client.webhook_secret = Some(secret.trim().to_string());
+                client.webhook_secret = Some(read_secret(file, None)?);
             }
             client.resolved_webhooks = resolve_targets(&client.webhook_url, client.webhook_secret.as_deref(), path.parent())?;
             for target in &client.resolved_webhooks {
@@ -696,7 +838,7 @@ impl Config {
     /// 只做结构/注册表校验，不访问工作目录或网络。
     pub fn validate(&self) -> anyhow::Result<()> {
         self.socket_mode()?;
-        anyhow::ensure!(self.keychain_timeout_secs >= 1, "keychainTimeoutSecs must be >= 1");
+        anyhow::ensure!(self.keychain_timeout_secs >= 1, ConfigRule("keychainTimeoutSecs must be >= 1"));
         check_stream_idle_timeout("streamIdleTimeoutSecs", self.stream_idle_timeout_secs)?;
         for id in self.default_provider.iter().chain(self.providers.keys()).chain(self.profiles.values().filter_map(|p| p.provider.as_ref())) {
             validate_provider(id)?;
@@ -728,8 +870,8 @@ impl Config {
             anyhow::ensure!(self.clients.iter().any(|c| c.name == trust.client), "trustLoopback: unknown client '{}'", trust.client);
         }
         self.compaction.validate("compaction")?;
-        self.pricing.validate("pricing")?;
-        crate::usage::report::PricingConfig::validate_legacy(&self.usage_estimate, "usageEstimate.pricesUsdPerMillion")?;
+        self.pricing.validate()?;
+        crate::usage::report::PricingConfig::validate_legacy(&self.usage_estimate)?;
         let registry = agent_tools::ToolRegistry::with_builtins();
         if let Some(policy) = &self.tool_approval {
             policy.validate().map_err(anyhow::Error::msg)?;
@@ -1002,6 +1144,66 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_config_precedence_and_xdg_home() {
+        use ConfigFileSource::*;
+        use ConfigSelection::*;
+        let default_path = || panic!("forced choices must not resolve a default path");
+        let probe = |_: &Path| panic!("unexpected default probe");
+        for source in [Explicit, Env] {
+            let path = PathBuf::from("named.json");
+            assert_eq!(resolve_config(Some((source, path.clone())), false, default_path, probe).unwrap(), File { source, path });
+        }
+        assert_eq!(resolve_config(Some((Env, "bad.json".into())), true, default_path, probe).unwrap(), BuiltIn("no-config"));
+        assert_eq!(resolve_config(None, false, || None, probe).unwrap(), BuiltIn("no-default-path"));
+
+        for (xdg, expected) in [
+            (Some("/xdg"), "/xdg/sub-bot/sub-bot.json"),
+            (None, "/home/conf/.config/sub-bot/sub-bot.json"),
+            (Some(""), "/home/conf/.config/sub-bot/sub-bot.json"),
+            (Some("relative"), "/home/conf/.config/sub-bot/sub-bot.json"),
+        ] {
+            let path = default_config_path(xdg.map(Path::new), Some(Path::new("/home/conf")), || panic!("absolute HOME wins"));
+            assert_eq!(path.as_deref(), Some(Path::new(expected)));
+            let check_probe = |candidate: &Path| {
+                assert_eq!(candidate, Path::new(expected));
+                Ok(false)
+            };
+            assert_eq!(resolve_config(None, false, || path, check_probe).unwrap(), BuiltIn("not-found"));
+        }
+        for home in [None, Some(""), Some("relative")] {
+            assert_eq!(default_config_path(None, home.map(Path::new), || Some("/os/home".into())), Some("/os/home/.config/sub-bot/sub-bot.json".into()));
+        }
+        assert_eq!(default_config_path(None, None, || None), None);
+    }
+
+    #[test]
+    fn only_missing_default_allows_fallback() {
+        use std::os::unix::fs::symlink;
+        let dir = std::env::temp_dir().join(format!("sub-bot-config-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("sub-bot.json");
+        let default_path = || Some(path.clone());
+        let resolve = || resolve_config(None, false, default_path, probe_default_file);
+        assert_eq!(resolve().unwrap(), ConfigSelection::BuiltIn("not-found"));
+        let denied = resolve_config(None, false, default_path, |_| Err(io::Error::from(io::ErrorKind::PermissionDenied).into())).unwrap_err().to_string();
+        assert!(denied.contains("PermissionDenied") && denied.contains(path.to_str().unwrap()), "{denied}");
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(resolve().unwrap_err().to_string().contains("not a regular file"));
+        std::fs::remove_dir(&path).unwrap();
+        let target = dir.join("target.json");
+        symlink(&target, &path).unwrap();
+        assert!(resolve().unwrap_err().to_string().contains("dangling symlink"));
+        std::fs::write(&target, "{}").unwrap();
+        let selected = ConfigSelection::File { source: ConfigFileSource::DefaultPath, path: path.clone() };
+        assert_eq!(resolve().unwrap(), selected);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&target, &path).unwrap();
+        assert_eq!(resolve().unwrap(), selected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn default_data_dir_resolution_chain() {

@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.14.1] - 2026-11-17
+
+- Fixed `ask` to forward `--model` (or `SUB_BOT_MODEL`) to the daemon for new sessions in both streaming and async mode. The daemon checks the profile's `allowedModels`; a disallowed model returns HTTP 400 and the CLI prints the server error. Resuming keeps the session model; `--effort` can still update the session. **Upgrade note:** unset `SUB_BOT_MODEL` or scope it to `serve` if new asks should use the daemon's defaults.
+- Config-consuming commands now discover `~/.config/sub-bot/sub-bot.json` on macOS and Linux (or `$XDG_CONFIG_HOME/sub-bot/sub-bot.json` when absolute) after `--config` and `SUB_BOT_CONFIG`. They log the chosen source and report errors for broken files instead of falling back. Standalone `run` and `rpc` can use the same profiles, data and session directories as `serve`. **Upgrade note:** use `--no-config` to force the previous built-in profile. A file-backed `serve` uses the file's authentication policy; omitting `--config` no longer implies same-uid access.
+
 ## [0.14.0] - 2026-11-17
 
 - Select an existing working directory when creating a session with `run --cwd`, `rpc --cwd`, the first stdio RPC `prompt.cwd`, or HTTP `cwd` (`session.cwd` or top-level `cwd` in `/v1/chat`). Relative CLI/RPC paths use the invocation directory; relative HTTP paths use the profile default.

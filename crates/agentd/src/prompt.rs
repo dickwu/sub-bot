@@ -9,18 +9,16 @@ const CONTEXT_FILES: &[&str] = &["AGENTS.override.md", "AGENTS.md", "CLAUDE.md"]
 
 /// 从 cwd 向上直到 root 收集上下文文件（离 cwd 越近越靠后，优先级越高）。
 fn context_files(cwd: &Path, root: &Path) -> Vec<(String, String)> {
+    if !cwd.is_absolute() || !root.is_absolute() {
+        return vec![];
+    }
     let mut found = vec![];
-    let mut dir = Some(cwd);
-    while let Some(d) = dir {
+    for d in cwd.ancestors().take_while(|d| d.starts_with(root)) {
         if let Some(f) = CONTEXT_FILES.iter().map(|n| d.join(n)).find(|p| p.is_file()) {
             if let Ok(text) = std::fs::read_to_string(&f) {
                 found.push((f.to_string_lossy().into_owned(), text));
             }
         }
-        if d == root {
-            break;
-        }
-        dir = d.parent();
     }
     found.reverse();
     found
@@ -57,4 +55,35 @@ pub fn build(i: PromptInput) -> String {
     }
     sections.push(format!("Current working directory: {}", i.cwd.display()));
     sections.join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sessions_tests::TempDir;
+    use std::fs;
+
+    #[test]
+    fn context_files_stop_at_session_root() {
+        let dir = TempDir::new();
+        let root = dir.0.join("workspace");
+        let cwd = root.join("child");
+        fs::create_dir_all(&cwd).unwrap();
+        for (base, file, marker) in [
+            (&dir.0, "AGENTS.md", "parent ignored"),
+            (&root, "CLAUDE.md", "root fallback"),
+            (&cwd, "CLAUDE.md", "child fallback ignored"),
+            (&cwd, "AGENTS.md", "child primary ignored"),
+            (&cwd, "AGENTS.override.md", "child override"),
+        ] {
+            fs::write(base.join(file), marker).unwrap();
+        }
+        let root = fs::canonicalize(root).unwrap();
+        let cwd = fs::canonicalize(cwd).unwrap();
+        let texts: Vec<_> = context_files(&cwd, &root).into_iter().map(|(_, text)| text).collect();
+        assert_eq!(texts, ["root fallback", "child override"]);
+        assert!(context_files(&cwd, &root.join("unrelated")).is_empty());
+        assert!(context_files(&cwd, Path::new("")).is_empty());
+        assert_eq!(context_files(&cwd, &cwd)[0].1, "child override");
+    }
 }

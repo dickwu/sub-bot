@@ -1,5 +1,6 @@
 use crate::accounts::{AccountKey, AccountSlot, Cooldowns, FailoverProvider};
 use crate::routing::{Depth, Routing};
+use crate::workdir::{resolve_cwd, CwdError, ResolvedCwd};
 use crate::{
     config::{AccountConfig, Client, Config, Profile, ResolvedTarget},
     issues::{IssueEvent, IssueScope, Reporter, Severity},
@@ -19,7 +20,7 @@ use agent_tools::{preset, CallbackTool, CallerToolSpec, ToolContext, ToolRegistr
 use anyhow::{bail, Result};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -35,6 +36,7 @@ pub struct SessionHandle {
     /// 会话账号（请求或 profile 解析出的主账号；failover 实际使用的账号见消息的 `account`）
     pub account: String,
     pub cwd: PathBuf,
+    pub session_root: PathBuf,
     pub agent: Arc<Agent>,
     pub issues: Arc<Reporter>,
     issue_targets: Vec<ResolvedTarget>,
@@ -527,7 +529,7 @@ impl SessionHandle {
 pub struct SessionRequest {
     pub provider: Option<String>,
     pub profile: Option<String>,
-    /// 会话工作目录：绝对路径或相对 profile 第一个 workspaceRoot；必须落在某个 workspaceRoot 内
+    /// 会话工作目录：绝对路径或相对第一个可用的 workspaceRoots；受 profile.allowedWorkspaceRoots 约束。
     pub cwd: Option<PathBuf>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Option<String>,
@@ -557,6 +559,24 @@ pub struct SessionRequest {
     pub stream_idle_timeout_secs: Option<u64>,
     /// 覆盖 profile / 全局 llmMaxRetries（0..=20）；随会话持久化
     pub llm_max_retries: Option<u32>,
+}
+
+impl SessionRequest {
+    fn validate_limits(&self) -> Result<()> {
+        anyhow::ensure!(self.max_turns.is_none_or(|n| n >= 1), "maxTurns must be >= 1");
+        anyhow::ensure!(self.max_turns_ask_timeout_secs.is_none_or(|n| n >= 1), "maxTurnsAskTimeoutSecs must be >= 1");
+        if let Some(secs) = self.stream_idle_timeout_secs {
+            crate::config::check_stream_idle_timeout("streamIdleTimeoutSecs", secs)?;
+        }
+        anyhow::ensure!(self.llm_max_retries.is_none_or(|n| n <= agent_ai::MAX_LLM_MAX_RETRIES), "llmMaxRetries must be between 0 and {}", agent_ai::MAX_LLM_MAX_RETRIES);
+        Ok(())
+    }
+}
+
+struct SessionTarget {
+    model: String,
+    explicit: bool,
+    key: AccountKey,
 }
 
 /// 第一次 prompt 之后不能再修改 depth（路由不会重新进行）。
@@ -760,22 +780,6 @@ fn expand_tools(names: &[String]) -> Result<Vec<String>> {
     }
     out.dedup();
     Ok(out)
-}
-
-/// 解析并校验会话 cwd：canonicalize 后必须位于 profile 的某个 workspaceRoot 之内（防止越权访问其它目录）。
-fn resolve_cwd(p: &Profile, requested: Option<&std::path::Path>) -> Result<(PathBuf, PathBuf)> {
-    let roots: Vec<PathBuf> = p.workspace_roots.iter().filter_map(|r| std::fs::canonicalize(r).ok()).collect();
-    let first = roots.first().ok_or_else(|| anyhow::anyhow!("profile has no existing workspaceRoots"))?;
-    let cwd = match requested {
-        None => first.clone(),
-        Some(c) if c.is_absolute() => std::fs::canonicalize(c)?,
-        Some(c) => std::fs::canonicalize(first.join(c))?,
-    };
-    if !cwd.is_dir() {
-        bail!("cwd is not a directory");
-    }
-    let root = roots.iter().find(|r| cwd.starts_with(r)).ok_or_else(|| anyhow::anyhow!("cwd is outside the profile's workspaceRoots"))?;
-    Ok((cwd, root.clone()))
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -1144,8 +1148,68 @@ impl Hub {
         self.create_inner(client, req, ephemeral, None)
     }
 
+    fn request_profile(&self, client: &Client, req: &SessionRequest) -> Result<(String, &Profile)> {
+        let name = req.profile.clone().or_else(|| client.profiles.first().cloned()).ok_or_else(|| anyhow::anyhow!("client has no profiles"))?;
+        anyhow::ensure!(client.profiles.contains(&name), "profile '{name}' is not allowed for client '{}'", client.name);
+        let p = self.config.profiles.get(&name).ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))?;
+        Ok((name, p))
+    }
+
+    fn request_target(&self, p: &Profile, name: &str, req: &SessionRequest) -> Result<SessionTarget> {
+        let explicit = req.model.is_some();
+        let model = match &req.model {
+            Some(m) if !Config::model_allowed(p, m) => bail!("model '{m}' is not allowed in profile '{name}' (allowedModels)"),
+            Some(m) => m,
+            None => p.model.as_ref().unwrap_or(&self.config.default_model),
+        };
+        let provider = select_provider(req.provider.as_deref(), p.provider.as_deref(), model, &self.default_provider);
+        let model = if explicit || p.model.is_some() { model.clone() } else { self.default_model_for(provider) };
+        if !Config::model_allowed(p, &model) {
+            bail!("default model '{model}' is not in profile '{name}' allowedModels");
+        }
+        let account = match &req.account {
+            Some(a) if !self.account_allowed(p, provider, a) => bail!(AccountNotAllowed { account: a.clone(), profile: name.into() }),
+            Some(a) => a,
+            None => self.profile_account(p, provider),
+        };
+        Ok(SessionTarget { model, explicit, key: AccountKey::new(provider, account) })
+    }
+
+    /// Deferred RPC must still reject invalid startup options before reading stdin.
+    pub(crate) fn preflight_session(&self, client: &Client, req: &SessionRequest) -> Result<()> {
+        let (name, p) = self.request_profile(client, req)?;
+        req.validate_limits()?;
+        let target = self.request_target(p, &name, req)?;
+        self.provider(&target.key.provider, &target.key.account)?;
+        Ok(())
+    }
+
+    /// cwd 只能在创建时选择。已有会话上的 cwd 仅用于断言，不改变工具和上下文边界。
+    pub(crate) fn check_session_cwd(&self, h: &SessionHandle, requested: Option<&Path>) -> Result<()> {
+        let Some(requested) = requested else { return Ok(()) };
+        let p = &self.config.profiles[&h.profile];
+        resolve_cwd(&h.profile, p, Some(requested)).and_then(|pair| if pair.cwd == h.cwd { Ok(()) } else { Err(CwdError::Mismatch) }).inspect_err(|e| self.trace_cwd_rejection(&h.profile, p, e))?;
+        Ok(())
+    }
+
+    fn cwd_policy(p: &Profile) -> &'static str {
+        if p.allows_any_workspace() {
+            "any"
+        } else {
+            "list"
+        }
+    }
+
+    fn trace_cwd_rejection(&self, profile: &str, p: &Profile, error: &CwdError) {
+        tracing::info!(profile = %self.issues.redact(profile).escape_debug(), cwd_policy = Self::cwd_policy(p), cwd_decision = error.decision(), "session cwd rejected");
+    }
+
+    fn log_path(&self, path: &Path) -> String {
+        self.issues.redact(&path.to_string_lossy()).escape_debug().to_string()
+    }
+
     /// 新建会话，或（`restore`）用持久化的 JSONL 重建会话：沿用原 id、历史和已确定的路由，追加写入同一文件。
-    pub(crate) fn create_inner(&self, client: &Client, req: SessionRequest, ephemeral: bool, restore: Option<Restore>) -> Result<Arc<SessionHandle>> {
+    pub(crate) fn create_inner(&self, client: &Client, mut req: SessionRequest, ephemeral: bool, restore: Option<Restore>) -> Result<Arc<SessionHandle>> {
         // 上限检查与插入共用 map 锁，避免并发创建突破上限。
         let mut sessions = self.sessions.lock().unwrap();
         anyhow::ensure!(!self.shutting_down.load(Ordering::Relaxed), "server is shutting down");
@@ -1163,20 +1227,11 @@ impl Hub {
                 return Err(TooManySessions.into());
             }
         }
-        let profile_name = req.profile.clone().or_else(|| client.profiles.first().cloned()).ok_or_else(|| anyhow::anyhow!("client has no profiles"))?;
-        if !client.profiles.contains(&profile_name) {
-            bail!("profile '{profile_name}' is not allowed for client '{}'", client.name);
-        }
-        let p: &Profile = self.config.profiles.get(&profile_name).ok_or_else(|| anyhow::anyhow!("unknown profile '{profile_name}'"))?;
-        anyhow::ensure!(req.max_turns.is_none_or(|n| n >= 1), "maxTurns must be >= 1");
-        anyhow::ensure!(req.max_turns_ask_timeout_secs.is_none_or(|n| n >= 1), "maxTurnsAskTimeoutSecs must be >= 1");
-        if let Some(secs) = req.stream_idle_timeout_secs {
-            crate::config::check_stream_idle_timeout("streamIdleTimeoutSecs", secs)?;
-        }
-        anyhow::ensure!(req.llm_max_retries.is_none_or(|n| n <= agent_ai::MAX_LLM_MAX_RETRIES), "llmMaxRetries must be between 0 and {}", agent_ai::MAX_LLM_MAX_RETRIES);
+        let (profile_name, p) = self.request_profile(client, &req)?;
+        req.validate_limits()?;
 
         let allowed = expand_tools(&p.tools)?;
-        let selected = match req.tools {
+        let selected = match req.tools.take() {
             Some(t) => {
                 // `mcp__…` 名字（可带 `*`）选择 MCP 工具，由 McpManager::session_tools 校验
                 if let Some(bad) = t.iter().find(|n| !allowed.contains(n) && !crate::mcp::tool::is_mcp_name(n)) {
@@ -1195,7 +1250,18 @@ impl Hub {
 
         let id = restore.as_ref().map(|r| r.store.id.clone()).unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-        let (cwd, root) = resolve_cwd(p, req.cwd.as_deref())?;
+        let restored = restore.is_some();
+        let ResolvedCwd { cwd, session_root, decision } = resolve_cwd(&profile_name, p, req.cwd.as_deref())
+            .and_then(|mut pair| {
+                if let Some(r) = &restore {
+                    pair.restore_root(r.store.meta())?;
+                }
+                Ok(pair)
+            })
+            .inspect_err(|e| self.trace_cwd_rejection(&profile_name, p, e))?;
+        let SessionTarget { model, explicit, key } = self.request_target(p, &profile_name, &req)?;
+        let provider_id = key.provider.as_str();
+        let account = key.account;
         let ctx = ToolContext { cwd: cwd.clone(), http_allow_hosts: p.http_allow_hosts.clone(), shell_env: p.shell_env.clone() };
         let (requested_mcp, builtin): (Vec<String>, Vec<String>) = selected.iter().cloned().partition(|n| crate::mcp::tool::is_mcp_name(n));
         let mut tools: Vec<Arc<dyn AgentTool>> = self.registry.build(&builtin, &ctx)?;
@@ -1210,25 +1276,6 @@ impl Hub {
             tools.push(Arc::new(tool));
         }
 
-        let explicit = req.model.is_some();
-        let model = match req.model {
-            Some(m) if !Config::model_allowed(p, &m) => {
-                bail!("model '{m}' is not allowed in profile '{profile_name}' (allowedModels)")
-            }
-            Some(m) => m,
-            None => p.model.clone().unwrap_or_else(|| self.config.default_model.clone()),
-        };
-        let provider_id = select_provider(req.provider.as_deref(), p.provider.as_deref(), &model, &self.default_provider).to_string();
-        let model = if explicit || p.model.is_some() { model } else { self.default_model_for(&provider_id) };
-        if !Config::model_allowed(p, &model) {
-            bail!("default model '{model}' is not in profile '{profile_name}' allowedModels");
-        }
-        let provider_id = provider_id.as_str();
-        let account = match req.account {
-            Some(a) if !self.account_allowed(p, provider_id, &a) => bail!(AccountNotAllowed { account: a, profile: profile_name }),
-            Some(a) => a,
-            None => self.profile_account(p, provider_id).to_string(),
-        };
         let meta = Arc::new(crate::usage::UsageMeta { caller: client.name.clone(), profile: Some(profile_name.clone()), session_id: Some(id.clone()) });
         let provider = self.session_provider(p, provider_id, &account, meta)?;
         // MCP 工具（会话创建时的快照）；只有 Anthropic 的工具结果支持图片
@@ -1298,12 +1345,16 @@ impl Hub {
             append: &[p.append_system_prompt.as_deref().unwrap_or(""), req.append_system_prompt.as_deref().unwrap_or("")],
             tools: &tools,
             cwd: &cwd,
-            root: &root,
+            root: &session_root,
             load_context_files: p.load_context_files,
         });
         let prompt_sha256 = crate::config::sha256_hex(&system_prompt);
         let (store, history, created_at, compacted) = match restore {
-            Some(r) => {
+            Some(mut r) => {
+                if r.store.meta().session_root.is_none() {
+                    // Pin legacy sessions once, without rewriting the original header.
+                    r.store.update_meta(&SessionMeta { cwd: Some(cwd.clone()), session_root: Some(session_root.clone()), ..Default::default() })?;
+                }
                 if r.store.meta().system_prompt_sha256.as_ref().is_some_and(|h| *h != prompt_sha256) {
                     tracing::info!(session_id = %id, "system prompt changed since the session was created (profile or context files changed); using the current prompt");
                 }
@@ -1320,6 +1371,7 @@ impl Hub {
                             explicit_model: Some(explicit),
                             api: req.api.map(|a| a.as_str().to_string()),
                             cwd: Some(cwd.clone()),
+                            session_root: Some(session_root.clone()),
                             requested_reasoning_effort: requested_effort,
                             reasoning_effort: dynamic.reasoning.get(),
                             routing: serde_json::to_value(&*dynamic.routing.lock().unwrap()).ok(),
@@ -1344,7 +1396,7 @@ impl Hub {
                 (store, vec![], unix_ms(), false)
             }
         };
-        let persisted_path = store.as_ref().map(|s| s.path.clone());
+        let persisted = store.is_some();
         let hooks = Arc::new(crate::sessions::SessionHooks::new(crate::sessions::HooksInit {
             store,
             dynamic: dynamic.clone(),
@@ -1382,7 +1434,14 @@ impl Hub {
             approval,
             hooks: Some(hooks.clone()),
         };
-        tracing::info!(session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account, cwd = %cwd.display(), model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"), api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(), tool_approval = config.approval.is_some(), max_turns, on_max_turns = on_max_turns.as_str(), max_turns_ask_timeout_secs = ask_timeout_secs, stream_idle_timeout_secs = llm.stream_idle_timeout_secs, llm_max_retries = llm.llm_max_retries, persisted = ?persisted_path, restored = !history.is_empty(), "session created");
+        tracing::info!(
+            session_id = %id, bot = %client.name, profile = %profile_name, provider = provider_id, account = %account,
+            cwd = %self.log_path(&cwd), session_root = %self.log_path(&session_root), cwd_policy = Self::cwd_policy(p), cwd_decision = decision,
+            model = %config.model.get(), depth = depth.as_str(), reasoning_effort = config.reasoning.get().map(|l| l.as_str()).unwrap_or("-"),
+            api = %self.effective_api(&config), tools = ?config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
+            tool_approval = config.approval.is_some(), max_turns, on_max_turns = on_max_turns.as_str(), max_turns_ask_timeout_secs = ask_timeout_secs,
+            stream_idle_timeout_secs = llm.stream_idle_timeout_secs, llm_max_retries = llm.llm_max_retries, persisted, restored, "session created"
+        );
         self.warn_short_timeouts(&id, &profile_name, p, llm.stream_idle_timeout_secs);
         let h = Arc::new(SessionHandle {
             issues: self.issues.clone(),
@@ -1395,6 +1454,7 @@ impl Hub {
             profile: profile_name,
             account,
             cwd,
+            session_root,
             agent: Agent::new(config, history),
             dynamic,
             hooks,
@@ -1705,7 +1765,7 @@ impl Hub {
     /// 会话视图（POST/GET/PATCH /v1/sessions）。
     pub fn session_view(&self, h: &SessionHandle) -> serde_json::Value {
         let mut view = serde_json::json!({
-            "sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "provider": h.provider_id(), "account": h.account, "model": h.model(),
+            "sessionId": h.id, "profile": h.profile, "cwd": h.cwd, "sessionRoot": h.session_root, "provider": h.provider_id(), "account": h.account, "model": h.model(),
             "api": h.effective_api().map(|a| a.as_str()).unwrap_or_else(|| self.effective_api(&h.agent.config)),
             "isStreaming": h.agent.is_running(),
             "tools": h.agent.config.tools.iter().map(|t| t.name().to_string()).collect::<Vec<_>>(),
@@ -2932,9 +2992,101 @@ pub(crate) mod tests {
 
     fn capture_all() -> (AllFields, tracing::subscriber::DefaultGuard) {
         use tracing_subscriber::layer::SubscriberExt;
+        // Keep a second dispatcher alive while capturing. With only one registered dispatcher,
+        // a parallel test with no thread-local subscriber can cache `never` for a new callsite.
+        static KEEPALIVE: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+        KEEPALIVE.get_or_init(|| tracing::Dispatch::new(tracing_subscriber::registry()));
         let capture = AllFields::default();
         let guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(capture.clone()));
         (capture, guard)
+    }
+
+    #[tokio::test]
+    async fn cwd_external_context_and_tools_are_session_local() {
+        use crate::sessions_tests::{hub, prompt, TempDir};
+        use std::fs;
+        let dir = TempDir::new();
+        let workspace = dir.0.join("workspace");
+        let inside = workspace.join("sub");
+        let extra = dir.0.join("extra");
+        let outside = extra.join("job");
+        for (path, instructions, marker) in [
+            (&workspace, "workspace instruction", "wrong: using sessionRoot"),
+            (&inside, "inside instruction", "inside marker"),
+            (&extra, "extra-parent instruction", "wrong: using allow-list root"),
+            (&outside, "outside instruction", "outside marker"),
+        ] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("AGENTS.md"), instructions).unwrap();
+            fs::write(path.join("marker"), marker).unwrap();
+        }
+        let (hub, _) = hub(&dir, |cfg| {
+            let p = cfg.profiles.get_mut("default").unwrap();
+            p.workspace_roots = vec![workspace.clone()];
+            p.allowed_workspace_roots = vec![extra];
+            p.load_context_files = true;
+            let mut disabled = p.clone();
+            disabled.load_context_files = false;
+            cfg.profiles.insert("disabled".into(), disabled);
+            cfg.clients[0].profiles.push("disabled".into());
+        });
+        let client = &hub.config.clients[0];
+        let open = |path: &Path, profile| hub.create_session(client, SessionRequest { cwd: Some(path.into()), profile, ..Default::default() }).unwrap();
+        let a = open(&inside, None);
+        let b = open(&outside, None);
+        assert_eq!(a.session_root, fs::canonicalize(workspace).unwrap());
+        assert_eq!(b.session_root, fs::canonicalize(&outside).unwrap());
+        let system_a = a.agent.config.system_prompt.as_deref().unwrap();
+        let system_b = b.agent.config.system_prompt.as_deref().unwrap();
+        assert!(system_a.find("workspace instruction").unwrap() < system_a.find("inside instruction").unwrap());
+        assert!(!system_a.contains("outside instruction"));
+        assert!(system_b.contains("outside instruction"));
+        assert!(!system_b.contains("extra-parent instruction"));
+        assert!(!system_b.contains("inside instruction"));
+        let disabled = open(&outside, Some("disabled".into()));
+        assert!(!disabled.agent.config.system_prompt.as_deref().unwrap().contains("instruction"));
+        let read = r#"/tool read {"path":"marker"}"#;
+        tokio::join!(prompt(&a, read), prompt(&b, read));
+        for (h, marker) in [(a, "inside marker"), (b, "outside marker")] {
+            let messages = h.agent.messages().await;
+            let Some(Message::Assistant(m)) = messages.last() else { panic!("no assistant result") };
+            assert_eq!(m.text(), format!("tool read returned: {marker}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn cwd_decision_log_redacts_paths() {
+        use crate::sessions_tests::{hub, TempDir};
+        use std::fs;
+        let dir = TempDir::new();
+        let secret = "dummy-secret-in-directory";
+        let root = dir.0.join(format!("{secret}\nline"));
+        let cwd = root.join("sub");
+        fs::create_dir_all(&cwd).unwrap();
+        let denied = dir.0.join("unlogged-rejected-path");
+        fs::create_dir(&denied).unwrap();
+        let (hub, _) = hub(&dir, |cfg| {
+            let p = cfg.profiles.get_mut("default").unwrap();
+            p.workspace_roots = vec![root];
+            p.allowed_workspace_roots.clear();
+        });
+        hub.issues.add_secret(secret.into());
+        let (logs, _guard) = capture_all();
+        let client = &hub.config.clients[0];
+        let h = hub.create_session(client, SessionRequest { cwd: Some(cwd.clone()), system_prompt: Some("unlogged-custom-prompt".into()), ..Default::default() }).unwrap();
+        assert_eq!(h.cwd, fs::canonicalize(cwd).unwrap());
+        assert!(hub.remove(client, &h.id));
+        // Even a restored session without any messages must be logged as restored.
+        assert!(hub.load_persisted(client, &h.id).unwrap().is_some());
+        assert!(hub.create_session(client, SessionRequest { cwd: Some(denied), ..Default::default() }).err().unwrap().is::<CwdError>());
+        let logs = logs.0.lock().unwrap().join("\n");
+        assert!(logs.contains("cwd_policy=list cwd_decision=workspace_root"), "{logs}");
+        assert!(logs.contains("session_root=") && logs.contains(r"[redacted]\nline"), "{logs}");
+        assert!(logs.contains("restored=true") && logs.contains("restored=false"), "{logs}");
+        assert!(logs.contains("cwd_policy=list cwd_decision=denied"), "{logs}");
+        for omitted in [secret, "unlogged-rejected-path", "unlogged-custom-prompt"] {
+            assert!(!logs.contains(omitted), "{logs}");
+        }
     }
 
     fn account(fields: serde_json::Value) -> crate::config::AccountConfig {

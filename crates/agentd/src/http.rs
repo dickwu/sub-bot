@@ -5,6 +5,7 @@ use crate::{
     routing::Depth,
     sessions::{CompactError, ResumeFailed},
     webhook::WebhookTarget,
+    workdir::CwdError,
 };
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
@@ -19,7 +20,7 @@ use axum::{
 use futures::{FutureExt, Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::json;
-use std::{convert::Infallible, net::SocketAddr, sync::Arc};
+use std::{convert::Infallible, net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Clone)]
 struct AppState {
@@ -172,14 +173,19 @@ fn apply_overrides(h: &SessionHandle, effort: Option<ThinkingLevel>, depth: Opti
     Ok(())
 }
 
-fn create_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
-    if e.is::<TooManySessions>() {
-        (StatusCode::TOO_MANY_REQUESTS, Json(json!({"error": e.to_string()})))
+fn session_request_error(e: anyhow::Error) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if e.is::<TooManySessions>() {
+        StatusCode::TOO_MANY_REQUESTS
     } else if e.is::<AccountNotAllowed>() {
-        (StatusCode::FORBIDDEN, Json(json!({"error": e.to_string()})))
+        StatusCode::FORBIDDEN
     } else {
-        bad_request(e)
-    }
+        match e.downcast_ref::<CwdError>() {
+            Some(CwdError::Denied(_)) => StatusCode::FORBIDDEN,
+            Some(CwdError::Mismatch) => StatusCode::CONFLICT,
+            _ => StatusCode::BAD_REQUEST,
+        }
+    };
+    (status, Json(json!({"error": e.to_string()})))
 }
 
 /// 调用方自己的会话：内存里没有时从磁盘恢复（同一 client 的会话目录）。未知 / 非 owner / 非法 id ⇒ 404。
@@ -300,7 +306,7 @@ async fn profiles(State(st): State<AppState>, Extension(c): Caller) -> ApiResult
                     "defaultEffort": agent_ai::effort_caps(provider, &model).default,
                     "routing": {"deepModel": st.hub.deep_model_spec(p, provider), "autoRoute": p.auto_route, "routerModel": p.router_model.clone().unwrap_or_else(|| model.clone()),
                         "defaultDepth": if p.auto_route { Depth::Auto } else { Depth::Standard }},
-                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "maxTurns": p.max_turns, "onMaxTurns": p.on_max_turns, "maxTurnsAskTimeoutSecs": p.max_turns_ask_timeout_secs, "streamIdleTimeoutSecs": llm.stream_idle_timeout_secs, "llmMaxRetries": llm.llm_max_retries, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
+                    "api": p.api.unwrap_or(st.hub.config.default_api), "maxOutputTokens": p.max_output_tokens, "tokenBudget": p.token_budget, "maxTurns": p.max_turns, "onMaxTurns": p.on_max_turns, "maxTurnsAskTimeoutSecs": p.max_turns_ask_timeout_secs, "streamIdleTimeoutSecs": llm.stream_idle_timeout_secs, "llmMaxRetries": llm.llm_max_retries, "tools": p.tools.iter().cloned().chain(st.hub.mcp.profile_tool_names(n)).collect::<Vec<_>>(), "mcpServers": st.hub.mcp.profile_servers(n), "toolApproval": st.hub.config.tool_approval_of(p), "workspaceRoots": p.workspace_roots, "allowedWorkspaceRoots": p.allowed_workspace_roots, "allowCallerTools": p.allow_caller_tools, "allowSystemPromptOverride": p.allow_system_prompt_override})
             })
         })
         .collect();
@@ -351,7 +357,7 @@ async fn models(State(st): State<AppState>, Extension(c): Caller, Query(q): Quer
 async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: axum::body::Bytes) -> ApiResult {
     // 允许空请求体（全部默认值）
     let b: SessionRequest = if body.iter().all(u8::is_ascii_whitespace) { SessionRequest::default() } else { serde_json::from_slice(&body).map_err(bad_request)? };
-    let h = st.hub.create_session(&c, b).map_err(create_error)?;
+    let h = st.hub.create_session(&c, b).map_err(session_request_error)?;
     Ok((StatusCode::CREATED, Json(st.hub.session_view(&h))).into_response())
 }
 
@@ -359,6 +365,8 @@ async fn create_session(State(st): State<AppState>, Extension(c): Caller, body: 
 #[serde(rename_all = "camelCase")]
 struct PromptBody {
     message: String,
+    /// 若提供，必须与会话已绑定的 cwd 一致（相对路径使用该会话的 profile）。
+    cwd: Option<PathBuf>,
     /// "steer" | "follow_up"：运行中时如何排队
     mode: Option<String>,
     /// 粘性：从这条消息起修改会话推理强度
@@ -369,6 +377,7 @@ struct PromptBody {
 
 async fn prompt(State(st): State<AppState>, Extension(c): Caller, Path(id): Path<String>, request_id: Option<Extension<RequestId>>, ApiJson(b): ApiJson<PromptBody>) -> ApiResult {
     let h = session(&st, &c, &id).await?;
+    st.hub.check_session_cwd(&h, b.cwd.as_deref()).map_err(session_request_error)?;
     if let Some(Extension(id_value)) = request_id {
         h.set_request_id(id_value.0);
     }
@@ -515,6 +524,8 @@ struct ChatBody {
     /// `session.model` 的别名（两处都给且不同 ⇒ 400）
     #[serde(default)]
     model: Option<String>,
+    /// `session.cwd` 的别名；已有 sessionId 时仅用作断言。
+    cwd: Option<PathBuf>,
     /// 其余未知顶层字段：收集起来在 handler 里返回 400（而不是静默忽略）。
     /// 用 flatten 收集而不是 deny_unknown_fields，是为了给出可操作的提示（session.* 字段该放进 "session"）。
     #[serde(flatten)]
@@ -522,23 +533,10 @@ struct ChatBody {
 }
 
 /// `/v1/chat` 文档化的顶层字段（未知字段错误里列出）。
-const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model"];
-/// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"；profile/model/reasoningEffort/depth/account 顶层可用）。
-const SESSION_ONLY_FIELDS: &[&str] = &[
-    "provider",
-    "cwd",
-    "systemPrompt",
-    "appendSystemPrompt",
-    "api",
-    "tools",
-    "callerTools",
-    "toolApproval",
-    "maxTurns",
-    "onMaxTurns",
-    "maxTurnsAskTimeoutSecs",
-    "streamIdleTimeoutSecs",
-    "llmMaxRetries",
-];
+const CHAT_FIELDS: &[&str] = &["message", "sessionId", "session", "stream", "async", "callbackUrl", "webhookEvents", "timeoutSecs", "reasoningEffort", "depth", "account", "profile", "model", "cwd"];
+/// 只能放在 `session` 里的会话选项（顶层出现时提示放进 "session"）。
+const SESSION_ONLY_FIELDS: &[&str] =
+    &["provider", "systemPrompt", "appendSystemPrompt", "api", "tools", "callerTools", "toolApproval", "maxTurns", "onMaxTurns", "maxTurnsAskTimeoutSecs", "streamIdleTimeoutSecs", "llmMaxRetries"];
 
 /// 错误信息里展示的字段名：去掉控制字符并截断（只回显键名，不回显任何值）。
 fn field_label(key: &str) -> String {
@@ -554,7 +552,7 @@ fn unknown_chat_field(unknown: &serde_json::Map<String, serde_json::Value>) -> O
 }
 
 /// 顶层别名并入 `session`：只给一处 ⇒ 使用它；两处相同 ⇒ 接受；两处不同 ⇒ 400。
-fn merge_session_alias(name: &str, top: Option<String>, session: &mut Option<String>) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+fn merge_session_alias<T: PartialEq>(name: &str, top: Option<T>, session: &mut Option<T>) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match (top, session.as_ref()) {
         (Some(top), Some(inner)) if &top != inner => Err(bad_request(format!("{name} given both at top level and in session; put it in session.{name}"))),
         (Some(top), _) => {
@@ -566,13 +564,14 @@ fn merge_session_alias(name: &str, top: Option<String>, session: &mut Option<Str
 }
 
 impl ChatBody {
-    /// 拒绝未知字段并合并 profile/model 别名。
+    /// 拒绝未知字段并合并 profile/model/cwd 别名。
     fn normalize(&mut self) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
         if let Some(message) = unknown_chat_field(&self.unknown) {
             return Err(bad_request(message));
         }
         merge_session_alias("profile", self.profile.take(), &mut self.session.profile)?;
-        merge_session_alias("model", self.model.take(), &mut self.session.model)
+        merge_session_alias("model", self.model.take(), &mut self.session.model)?;
+        merge_session_alias("cwd", self.cwd.take(), &mut self.session.cwd)
     }
 }
 
@@ -647,6 +646,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
     let h = match b.session_id {
         Some(id) => {
             let h = session(&st, &c, &id).await?;
+            st.hub.check_session_cwd(&h, b.session.cwd.as_deref()).map_err(session_request_error)?;
             apply_overrides(&h, b.reasoning_effort, b.depth)?;
             h
         }
@@ -654,7 +654,7 @@ async fn chat(State(st): State<AppState>, Extension(c): Caller, request_id: Opti
             b.session.reasoning_effort = b.reasoning_effort.or(b.session.reasoning_effort);
             b.session.depth = b.depth.or(b.session.depth);
             b.session.account = b.account.or(b.session.account);
-            st.hub.create_chat_session(&c, b.session).map_err(create_error)?
+            st.hub.create_chat_session(&c, b.session).map_err(session_request_error)?
         }
     };
     if let Some(Extension(id)) = request_id {
@@ -1578,6 +1578,7 @@ mod tests {
                         account: None,
                         profile: None,
                         model: None,
+                        cwd: None,
                         unknown: Default::default(),
                     }),
                 ),
@@ -1673,9 +1674,156 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cwd_on_create_and_chat_aliases() {
+        use crate::sessions_tests::{hub, TempDir};
+        use std::fs;
+        let dir = TempDir::new();
+        let workspace = dir.0.join("workspace");
+        let sub = workspace.join("sub");
+        let outside = dir.0.join("outside");
+        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir(&outside).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let sub = fs::canonicalize(sub).unwrap();
+        let outside = fs::canonicalize(outside).unwrap();
+        let (hub, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().workspace_roots = vec![workspace.clone()]);
+        let app = test_router(hub);
+        let token = Some("test-token");
+        let assert_pair = |view: &Value, cwd: &std::path::Path, root: &std::path::Path| {
+            assert_eq!(view["cwd"], json!(cwd), "{view}");
+            assert_eq!(view["sessionRoot"], json!(root), "{view}");
+        };
+        for (input, cwd, root) in [(json!("sub"), &sub, &workspace), (json!(outside), &outside, &outside)] {
+            let (status, view) = request(&app, "POST", "/v1/sessions", token, json!({"cwd": input})).await;
+            assert_eq!(status, StatusCode::CREATED, "{view}");
+            assert_pair(&view, cwd, root);
+        }
+        let empty = Request::builder().method("POST").uri("/v1/sessions").header("authorization", "Bearer test-token").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(empty).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let view: Value = serde_json::from_slice(&to_bytes(resp.into_body(), 64 * 1024).await.unwrap()).unwrap();
+        assert_pair(&view, &workspace, &workspace);
+        for (body, cwd, root) in [
+            (json!({"message": "hi", "session": {"cwd": "sub"}}), &sub, &workspace),
+            (json!({"message": "hi", "cwd": outside}), &outside, &outside),
+            (json!({"message": "hi", "cwd": "sub", "session": {"cwd": "sub"}}), &sub, &workspace),
+        ] {
+            assert_pair(&chat_session_view(&app, body).await, cwd, root);
+        }
+        let conflict = json!({"message": "hi", "cwd": sub, "session": {"cwd": "sub"}});
+        assert_eq!(request(&app, "POST", "/v1/chat", token, conflict).await, (StatusCode::BAD_REQUEST, json!({"error": "cwd given both at top level and in session; put it in session.cwd"})));
+
+        let started = start_async(&app, json!({"message": "hi", "async": true, "cwd": outside})).await;
+        wait_task(&app, &started, false).await;
+        let (_, view) = request(&app, "GET", &format!("/v1/sessions/{}", started["sessionId"].as_str().unwrap()), token, json!({})).await;
+        assert_pair(&view, &outside, &outside);
+        let stream = Request::builder()
+            .method("POST")
+            .uri("/v1/chat")
+            .header("authorization", "Bearer test-token")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"message":"hi", "stream":true, "cwd":"sub"}).to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(stream).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let id = response.headers()["x-session-id"].to_str().unwrap().to_owned();
+        to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let (_, view) = request(&app, "GET", &format!("/v1/sessions/{id}"), token, json!({})).await;
+        assert_pair(&view, &sub, &workspace);
+    }
+
+    #[tokio::test]
+    async fn cwd_validation_and_bound_assertions() {
+        use crate::sessions_tests::{hub, TempDir};
+        use std::{fs, os::unix::fs::symlink};
+        let dir = TempDir::new();
+        let workspace = dir.0.join("workspace");
+        let external = dir.0.join("denied");
+        fs::create_dir_all(workspace.join("sub")).unwrap();
+        fs::create_dir_all(external.join("sub")).unwrap();
+        fs::write(workspace.join("file"), "").unwrap();
+        symlink("sub", workspace.join("alias")).unwrap();
+        let (hub, _) = hub(&dir, |cfg| {
+            let p = cfg.profiles.get_mut("default").unwrap();
+            p.workspace_roots = vec![workspace.clone()];
+            p.allowed_workspace_roots.clear();
+            let mut alternate = p.clone();
+            alternate.workspace_roots = vec![external.clone()];
+            cfg.profiles.insert("alternate".into(), alternate);
+            cfg.clients[0].profiles.push("alternate".into());
+        });
+        let app = test_router(hub.clone());
+        let token = Some("test-token");
+        for (cwd, status, error) in [
+            ("", StatusCode::BAD_REQUEST, "cwd must not be empty"),
+            ("missing", StatusCode::BAD_REQUEST, "cwd does not exist"),
+            ("file", StatusCode::BAD_REQUEST, "cwd is not a directory"),
+            ("../denied", StatusCode::FORBIDDEN, "cwd is not allowed in profile 'default' (allowedWorkspaceRoots plus workspaceRoots)"),
+        ] {
+            for path in ["/v1/sessions", "/v1/chat"] {
+                let input = if path.ends_with("chat") { json!({"cwd": cwd, "message": "hi"}) } else { json!({"cwd": cwd}) };
+                assert_eq!(request(&app, "POST", path, token, input).await, (status, json!({"error": error})));
+            }
+        }
+        let (status, view) = request(&app, "POST", "/v1/sessions", token, json!({"cwd":"sub", "reasoningEffort":"low"})).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let id = view["sessionId"].as_str().unwrap();
+        let session_path = format!("/v1/sessions/{id}");
+        let prompt_path = format!("{session_path}/prompt");
+        let mismatch = "cwd is fixed for this session; start a new session to use a different cwd";
+        for (path, body) in [
+            ("/v1/chat", json!({"sessionId":id, "message":"do not submit", "cwd":".", "reasoningEffort":"high", "depth":"deep", "async":true})),
+            (&prompt_path, json!({"message":"do not submit", "cwd":".", "reasoningEffort":"high", "depth":"deep"})),
+        ] {
+            assert_eq!(request(&app, "POST", path, token, body).await, (StatusCode::CONFLICT, json!({"error": mismatch})));
+        }
+        let h = hub.get(&hub.config.clients[0], id).unwrap();
+        assert_eq!(h.requested_effort(), Some(ThinkingLevel::Low));
+        assert_eq!(h.routing().depth, Depth::Standard);
+        assert!(h.agent.messages().await.is_empty());
+        assert_eq!(request(&app, "PATCH", &session_path, token, json!({"cwd":"sub"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "POST", "/v1/chat", Some("other-token"), json!({"sessionId":id, "message":"foreign", "cwd":"missing"})).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(request(&app, "POST", &prompt_path, Some("other-token"), json!({"message":"foreign", "cwd":"missing"})).await.0, StatusCode::NOT_FOUND);
+        // Invalid/denied assertions keep their status, and the actual session's profile supplies the base.
+        assert_eq!(request(&app, "POST", &prompt_path, token, json!({"message":"hi", "cwd":"missing"})).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(request(&app, "POST", &prompt_path, token, json!({"message":"hi", "cwd":external})).await.0, StatusCode::FORBIDDEN);
+        let (status, _) = request(&app, "POST", "/v1/chat", token, json!({"sessionId":id, "message":"continue", "profile":"alternate", "session":{"cwd":"alias"}})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(request(&app, "POST", &prompt_path, token, json!({"message":"again", "cwd":"sub"})).await.0, StatusCode::ACCEPTED);
+        let (status, patched) = request(&app, "PATCH", &session_path, token, json!({"reasoningEffort":"high"})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!((patched["cwd"].clone(), patched["sessionRoot"].clone()), (view["cwd"].clone(), view["sessionRoot"].clone()));
+        hub.abort_all().await;
+    }
+
+    #[tokio::test]
+    async fn profiles_exposes_workspace_policy_only_for_visible_profiles() {
+        let dir = crate::sessions_tests::TempDir::new();
+        let (hub, _) = crate::sessions_tests::hub(&dir, |cfg| {
+            let mut other = cfg.profiles["default"].clone();
+            other.workspace_roots = vec!["./other-default".into()];
+            other.allowed_workspace_roots = vec!["/unmounted/other-work".into()];
+            cfg.profiles.insert("other".into(), other);
+            cfg.clients[1].profiles = vec!["other".into()];
+        });
+        let app = test_router(hub);
+        for (token, name, roots, allowed) in
+            [("test-token", "default", json!([std::env::current_dir().unwrap()]), json!(["*"])), ("other-token", "other", json!(["./other-default"]), json!(["/unmounted/other-work"]))]
+        {
+            let (status, body) = request(&app, "GET", "/v1/profiles", Some(token), json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["profiles"].as_array().unwrap().len(), 1);
+            let p = &body["profiles"][0];
+            assert_eq!(p["name"], name);
+            assert_eq!(p["workspaceRoots"], roots);
+            assert_eq!(p["allowedWorkspaceRoots"], allowed);
+        }
+    }
+
+    #[tokio::test]
     async fn chat_and_session_reject_unknown_fields() {
         let app = reviewer_app();
-        for field in ["cwd", "systemPrompt", "provider", "tools", "callerTools", "api", "appendSystemPrompt"] {
+        for field in ["systemPrompt", "provider", "tools", "callerTools", "api", "appendSystemPrompt"] {
             let (status, body) = request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message": "hi", field: "x"})).await;
             assert_eq!((status, body), (StatusCode::BAD_REQUEST, json!({"error": format!(r#"unknown field '{field}'; session options go under "session": {{...}}"#)})));
         }
@@ -1691,6 +1839,12 @@ mod tests {
         let (status, body) = request(&app, "POST", "/v1/sessions", Some("test-token"), json!({"profile": "reviewer", "message": "sk-secret-value"})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].as_str().unwrap().contains("unknown field `message`") && !body.to_string().contains("sk-secret-value"), "{body}");
+        // The creation-only policy and the derived root are never accepted as inputs.
+        for field in ["allowedWorkspaceRoots", "sessionRoot", "workspaceRoot"] {
+            assert_eq!(request(&app, "POST", "/v1/sessions", Some("test-token"), json!({field: "."})).await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"hi", field:"."})).await.0, StatusCode::BAD_REQUEST);
+            assert_eq!(request(&app, "POST", "/v1/chat", Some("test-token"), json!({"message":"hi", "session":{field:"."}})).await.0, StatusCode::BAD_REQUEST);
+        }
         // 文档化的 session 字段与顶层字段仍然可用
         let (status, body) = request(
             &app,

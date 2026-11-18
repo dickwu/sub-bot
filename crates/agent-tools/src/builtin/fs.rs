@@ -1,5 +1,5 @@
 //! 核心编码工具（对应 pi `coding-agent/src/core/tools/{read,write,ls,bash}.ts`）。仅支持 macOS 和 Linux。
-//! 所有路径都限制在会话 cwd 之内。
+//! 文件工具按词法检查相对路径，OS 仍可跟随符号链接；bash 只设置启动 cwd，不限制文件访问。
 use agent_core::{AgentTool, ExecutionMode, ToolResult, UpdateSink};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -66,7 +66,7 @@ fn truncate(mut s: String) -> String {
     s
 }
 
-/// 把相对路径解析到 root 下，拒绝 `..` 越界与绝对路径。
+/// 把相对路径拼到 cwd 下；按词法拒绝绝对路径及 `..`，不解析符号链接。
 pub fn resolve_in_root(root: &Path, p: &str) -> Result<PathBuf> {
     let rel = Path::new(p);
     if rel.is_absolute() || rel.components().any(|c| matches!(c, Component::ParentDir | Component::Prefix(_))) {
@@ -100,7 +100,7 @@ impl AgentTool for ReadTool {
         "read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file relative to the workspace root."
+        "Read a UTF-8 text file relative to the session working directory."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"}},"required":["path"]})
@@ -128,7 +128,7 @@ impl AgentTool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write (overwrite) a text file relative to the workspace root."
+        "Write (overwrite) a text file relative to the session working directory."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]})
@@ -154,7 +154,7 @@ impl AgentTool for LsTool {
         "ls"
     }
     fn description(&self) -> &str {
-        "List a directory relative to the workspace root."
+        "List a directory relative to the session working directory."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"path":{"type":"string","default":"."}}})
@@ -187,7 +187,7 @@ impl AgentTool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command (sh -c) in the workspace root."
+        "Run a shell command (sh -c), starting in the session working directory."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{"command":{"type":"string"},"timeoutSecs":{"type":"integer"}},"required":["command"]})
@@ -261,7 +261,7 @@ impl AgentTool for EditTool {
         "edit"
     }
     fn description(&self) -> &str {
-        "Edit a file by exact text replacement. Each oldText must match exactly once in the current file."
+        "Edit a file relative to the session working directory by exact text replacement. Each oldText must match exactly once in the current file."
     }
     fn parameters(&self) -> Value {
         json!({"type":"object","properties":{

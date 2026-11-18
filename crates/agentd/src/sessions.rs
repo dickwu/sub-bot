@@ -589,7 +589,7 @@ impl Hub {
         for (updated_at, row) in rows {
             match row {
                 Ok(h) => out.push(json!({
-                    "sessionId": h.id, "profile": h.profile, "provider": h.provider_id(), "account": h.account, "model": h.model(), "cwd": h.cwd,
+                    "sessionId": h.id, "profile": h.profile, "provider": h.provider_id(), "account": h.account, "model": h.model(), "cwd": h.cwd, "sessionRoot": h.session_root,
                     "createdAt": h.hooks.created_at(), "updatedAt": updated_at, "messageCount": h.agent.messages().await.len(),
                     "inMemory": true, "running": h.agent.is_running(), "persisted": h.hooks.path().is_some(), "ephemeral": h.ephemeral, "title": h.hooks.title(),
                 })),
@@ -637,7 +637,7 @@ fn disk_view(f: &agent_session::SessionFile, updated_at: u64) -> Option<Value> {
     let model = messages.iter().rev().find_map(|m| if let Message::Assistant(a) = m { Some(a.model.clone()) } else { None }).or_else(|| meta.model.clone());
     let title = meta.title.clone().or_else(|| messages.iter().find_map(title_of));
     Some(json!({
-        "sessionId": s.id, "profile": s.profile(), "provider": meta.provider, "account": meta.account, "model": model, "cwd": meta.cwd,
+        "sessionId": s.id, "profile": s.profile(), "provider": meta.provider, "account": meta.account, "model": model, "cwd": meta.cwd, "sessionRoot": meta.session_root,
         "createdAt": agent_session::timestamp_ms(s.created_at()), "updatedAt": updated_at, "messageCount": messages.len(),
         "inMemory": false, "running": false, "persisted": true, "ephemeral": meta.ephemeral.unwrap_or(false), "title": title,
     }))

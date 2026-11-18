@@ -6,7 +6,7 @@
 //! `globset`（find 的文件名 glob）。不依赖外部 `rg` 可执行文件。许可证见 THIRD-PARTY-NOTICES.md。
 //!
 //! 结果先按文件收集再按路径排序，输出稳定；路径相对于会话 cwd（可直接传给 read / edit）。
-//! 搜索路径与其它 fs 工具一样经 [`resolve_in_root`] 限制在会话 cwd 内。
+//! 搜索路径与其它文件工具一样经 [`resolve_in_root`] 做词法检查；遍历不跟随符号链接，但不校验起始路径的物理边界。
 use super::fs::resolve_in_root;
 use agent_core::{AgentTool, ToolResult, UpdateSink};
 use anyhow::{anyhow, bail, Context, Result};
@@ -595,14 +595,14 @@ impl AgentTool for GrepTool {
     }
     fn description(&self) -> &str {
         "Search file contents with a regex (embedded ripgrep engine; Rust regex syntax). Respects .gitignore, skips hidden and binary files. \
-         Output: `path:line:text` (context lines `path-line-text`, groups separated by `--`), paths relative to the workspace root, sorted. \
+         Output: `path:line:text` (context lines `path-line-text`, groups separated by `--`), paths relative to the session working directory, sorted. \
          Prefer this over running rg/grep via bash (they may not be installed). Smart case by default."
     }
     fn parameters(&self) -> Value {
         let str_or_list = || json!([{"type": "string"}, {"type": "array", "items": {"type": "string"}}]);
         json!({"type": "object", "properties": {
             "pattern": {"type": "string", "description": "Regex (Rust regex syntax); literal if fixedStrings"},
-            "path": {"type": "string", "description": "File or directory relative to the workspace root (default .)"},
+            "path": {"type": "string", "description": "File or directory relative to the session working directory (default .)"},
             "glob": {"description": "Include glob(s) like rg -g, e.g. \"*.rs\" or [\"src/**\", \"!*.min.js\"]; prefix ! to exclude", "anyOf": str_or_list()},
             "type": {"description": "ripgrep file type(s), e.g. \"rust\", \"py\", \"ts\"", "anyOf": str_or_list()},
             "ignoreCase": {"type": "boolean", "description": "Force case-insensitive (true) or case-sensitive (false); overrides smartCase"},
@@ -770,12 +770,12 @@ impl AgentTool for FindTool {
     }
     fn description(&self) -> &str {
         "Find files or directories by glob (e.g. \"*.rs\", \"src/**/mod.rs\"), respecting .gitignore and skipping hidden entries like `rg --files`. \
-         Returns sorted paths relative to the workspace root, directories with a trailing /. Prefer this over find/fd/rg via bash (they may not be installed)."
+         Returns sorted paths relative to the session working directory, directories with a trailing /. Prefer this over find/fd/rg via bash (they may not be installed)."
     }
     fn parameters(&self) -> Value {
         json!({"type": "object", "properties": {
             "pattern": {"type": "string", "description": "Glob matched against the file name, or against the path relative to `path` if it contains /"},
-            "path": {"type": "string", "description": "Directory relative to the workspace root (default .)"},
+            "path": {"type": "string", "description": "Directory relative to the session working directory (default .)"},
             "type": {"type": "string", "enum": ["file", "dir", "any"], "description": "default file"},
             "hidden": {"type": "boolean", "description": "Include hidden files and directories (default false)"},
             "noIgnore": {"type": "boolean", "description": "Do not respect .gitignore/.ignore files (default false)"},

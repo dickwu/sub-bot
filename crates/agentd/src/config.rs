@@ -48,8 +48,11 @@ pub struct Profile {
     /// 工具白名单：工具名或 `preset:<name>`；默认是 pi 的编码工具集
     #[serde(default = "default_tools")]
     pub tools: Vec<String>,
-    /// 允许作为会话 cwd 的根目录；会话 cwd 必须位于其中之一（第一个是默认 cwd）
+    /// 有序的默认目录和项目指令边界；第一个可用目录是默认 cwd。
     pub workspace_roots: Vec<PathBuf>,
+    /// `["*"]` 不限制 cwd；其它列表是在 workspaceRoots 之外额外允许的绝对目录。
+    #[serde(default = "any_workspace_roots")]
+    pub allowed_workspace_roots: Vec<PathBuf>,
     /// 是否从 cwd 向上读取 AGENTS.md / CLAUDE.md 注入系统提示（对应 pi resource-loader.ts）
     #[serde(default = "yes")]
     pub load_context_files: bool,
@@ -104,6 +107,25 @@ pub struct Profile {
     /// 该 profile 可用的 MCP 服务器：全局 `mcpServers` 的名字、`{name, tools}`（引用并收窄工具）或内联定义；不填 = 没有 MCP 工具
     #[serde(default)]
     pub mcp_servers: Vec<crate::mcp::ProfileMcpServer>,
+}
+
+fn any_workspace_roots() -> Vec<PathBuf> {
+    vec![PathBuf::from("*")]
+}
+
+impl Profile {
+    pub(crate) fn allows_any_workspace(&self) -> bool {
+        matches!(self.allowed_workspace_roots.as_slice(), [root] if root.as_os_str() == "*")
+    }
+
+    pub(crate) fn validate_workspace(&self, name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+        anyhow::ensure!(
+            self.allows_any_workspace() || self.allowed_workspace_roots.iter().all(|r| r.is_absolute() && !r.as_os_str().as_encoded_bytes().contains(&b'*')),
+            "profile '{name}': allowedWorkspaceRoots must be [\"*\"] or a list of absolute directory paths"
+        );
+        Ok(())
+    }
 }
 
 fn default_tools() -> Vec<String> {
@@ -713,7 +735,7 @@ impl Config {
             policy.validate().map_err(anyhow::Error::msg)?;
         }
         for (name, profile) in &self.profiles {
-            anyhow::ensure!(!profile.workspace_roots.is_empty(), "profile '{name}': workspaceRoots must not be empty");
+            profile.validate_workspace(name)?;
             anyhow::ensure!(profile.max_turns >= 1, "profile '{name}': maxTurns must be >= 1");
             anyhow::ensure!(profile.max_turns_ask_timeout_secs >= 1, "profile '{name}': maxTurnsAskTimeoutSecs must be >= 1");
             if let Some(secs) = profile.stream_idle_timeout_secs {
@@ -895,6 +917,7 @@ impl Config {
                 run_timeout_secs: None,
                 tools: default_tools(),
                 workspace_roots: vec![workspace],
+                allowed_workspace_roots: any_workspace_roots(),
                 load_context_files: true,
                 http_allow_hosts: vec![],
                 shell_env: Default::default(),
@@ -1109,6 +1132,33 @@ mod tests {
     }
 
     #[test]
+    fn workspace_policy_defaults_and_validation() {
+        let parse = |profile| serde_json::from_value::<Config>(serde_json::json!({"profiles": {"p": profile}}));
+        let defaults = parse(serde_json::json!({"workspaceRoots": ["./not-mounted"]})).unwrap();
+        defaults.validate().unwrap();
+        assert!(defaults.profiles["p"].allows_any_workspace());
+        assert_eq!(defaults.profiles["p"].allowed_workspace_roots, [PathBuf::from("*")]);
+        assert!(Config::fallback_for(None, None, "", ".".into()).profiles["default"].allows_any_workspace());
+        for (extra, any) in [(serde_json::json!(["*"]), true), (serde_json::json!([]), false), (serde_json::json!(["/missing volume/a", "/other"]), false)] {
+            let cfg = parse(serde_json::json!({"workspaceRoots": ["."], "allowedWorkspaceRoots": extra})).unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.profiles["p"].allows_any_workspace(), any);
+            assert_eq!(serde_json::json!(cfg.profiles["p"].allowed_workspace_roots), extra);
+        }
+        for extra in [serde_json::json!(["*", "/abs"]), serde_json::json!(["/abs/*partial"]), serde_json::json!(["relative"]), serde_json::json!([""])] {
+            let cfg = parse(serde_json::json!({"workspaceRoots": ["."], "allowedWorkspaceRoots": extra})).unwrap();
+            assert!(cfg.validate().unwrap_err().to_string().starts_with("profile 'p': allowedWorkspaceRoots"));
+        }
+        for extra in [serde_json::Value::Null, serde_json::json!("*"), serde_json::json!([5])] {
+            assert!(parse(serde_json::json!({"workspaceRoots": ["."], "allowedWorkspaceRoots": extra})).is_err());
+        }
+        assert!(parse(serde_json::json!({})).is_err());
+        assert!(parse(serde_json::json!({"workspaceRoots": "."})).is_err());
+        let empty = parse(serde_json::json!({"workspaceRoots": []})).unwrap();
+        assert_eq!(empty.validate().unwrap_err().to_string(), "profile 'p': workspaceRoots must not be empty");
+    }
+
+    #[test]
     fn routing_fields_parse_validate_and_example_config_deserializes() {
         let cfg: Config = serde_json::from_str(r#"{"providers":{"anthropic":{"defaultModel":"claude-sonnet-5-5"}},"profiles":{"p":{"workspaceRoots":["."],"deepModel":"latest:claude-fable","autoRoute":true,"routerModel":"claude-haiku-5-5"}}}"#).unwrap();
         let p = &cfg.profiles["p"];
@@ -1129,6 +1179,9 @@ mod tests {
         assert_eq!(example.profiles["coder"].allowed_models, Some(DEFAULT_OPENAI_ALLOWED_MODELS.iter().map(|m| m.to_string()).collect()));
         assert_eq!(example.pricing, crate::usage::prices::PricingConfig::default());
         assert_eq!(example.profiles["reviewer"].model.as_deref(), Some("gpt-6-astra"));
+        assert!(example.profiles["coder"].allows_any_workspace());
+        assert!(example.profiles["reviewer"].allowed_workspace_roots.is_empty());
+        assert_eq!(example.profiles["docs-writer"].allowed_workspace_roots, [PathBuf::from("/Volumes/Docs")]);
         assert!(Config::model_allowed(&example.profiles["coder"], "gpt-6-astra") && !Config::model_allowed(&example.profiles["coder"], "gpt-4.1-mini"));
     }
 

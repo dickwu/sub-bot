@@ -42,10 +42,11 @@ mod turns;
 mod turns_tests;
 mod usage;
 pub mod webhook;
+mod workdir;
 
 use agent_ai::{Message, ThinkingLevel};
 use agent_core::AgentEvent;
-use clap::{Parser, Subcommand};
+use clap::{builder::TypedValueParser, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -77,7 +78,7 @@ struct Cli {
     /// 文件日志格式：json | text
     #[arg(long, global = true, default_value = "json", env = "SUB_BOT_LOG_FORMAT")]
     log_format: String,
-    /// 无配置文件时 default profile 的 workspaceRoot
+    /// 无配置文件时 default profile 的 workspaceRoots（默认工作目录）；与 run/rpc 的 --cwd 不同
     #[arg(long, global = true, default_value = ".")]
     workspace: PathBuf,
     /// 数据目录；默认系统数据目录/sub-bot
@@ -127,6 +128,9 @@ enum Cmd {
     Rpc {
         #[arg(long)]
         profile: Option<String>,
+        /// 会话工作目录（相对路径以启动目录为基准）；不填用 profile 默认值，--resume 时必须与原 cwd 一致
+        #[arg(long, value_name = "DIR", value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
+        cwd: Option<PathBuf>,
         /// 模型路由：standard | deep | auto（显式 --model 时忽略）
         #[arg(long)]
         depth: Option<routing::Depth>,
@@ -144,10 +148,13 @@ enum Cmd {
     Run {
         #[arg(long)]
         profile: Option<String>,
+        /// 会话工作目录（相对路径以启动目录为基准）；不填用 profile 默认值，--resume 时必须与原 cwd 一致
+        #[arg(long, value_name = "DIR", value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
+        cwd: Option<PathBuf>,
         /// 模型路由：standard | deep | auto（显式 --model 时忽略）
         #[arg(long)]
         depth: Option<routing::Depth>,
-        /// 输出 JSON（text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、effortAdjusted、allowedEfforts、routing、usage（最后一次调用）、totalUsage（整次运行，含路由分类调用）、turns、toolCalls、stopReason、error）
+        /// 输出 JSON（cwd、sessionRoot、text、model、api、reasoningEffort（实际生效值）、requestedReasoningEffort、effortAdjusted、allowedEfforts、routing、usage（最后一次调用）、totalUsage（整次运行，含路由分类调用）、turns、toolCalls、stopReason、error）
         #[arg(long)]
         json: bool,
         #[command(flatten)]
@@ -172,6 +179,11 @@ enum Cmd {
     Usage(usage::cli::Usage),
     /// 查看估测使用的标准 token 单价（公开价格目录；不加载密钥）
     Pricing(usage::cli::Pricing),
+    /// 离线列出本地 profile 的默认工作目录和允许策略（不连接服务、不加载密钥）
+    Profiles {
+        #[arg(long)]
+        json: bool,
+    },
     /// 实时列出 provider 支持的模型（默认只列可对话的模型，不含日期快照）
     Models {
         /// 列出全部（含 embedding、语音、图片、快照等）
@@ -366,6 +378,36 @@ fn local_client(cfg: &config::Config) -> config::Client {
     config::Client { name: "local".into(), token_sha256: String::new(), profiles: cfg.profiles.keys().cloned().collect(), ..Default::default() }
 }
 
+fn print_profiles(cli: &Cli, json: bool) -> anyhow::Result<()> {
+    #[derive(serde::Deserialize)]
+    struct ProfileListing {
+        profiles: std::collections::BTreeMap<String, config::Profile>,
+    }
+    let profiles = match &cli.config {
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|_| anyhow::anyhow!("cannot read configuration"))?;
+            serde_json::from_str::<ProfileListing>(&text).map_err(|_| anyhow::anyhow!("invalid configuration for profiles"))?.profiles
+        }
+        None => config::Config::fallback_for(None, None, "", cli.workspace.clone()).profiles,
+    };
+    let mut rows = Vec::with_capacity(profiles.len());
+    for (name, profile) in profiles {
+        profile.validate_workspace(&name)?;
+        // to_value propagates a serialization error if the fallback --workspace is non-UTF-8.
+        rows.push(serde_json::json!({
+            "name": name, "workspaceRoots": serde_json::to_value(profile.workspace_roots)?, "allowedWorkspaceRoots": profile.allowed_workspace_roots,
+        }));
+    }
+    if json {
+        println!("{}", serde_json::json!({"profiles": rows}));
+    } else {
+        for row in rows {
+            println!("{}: workspaceRoots={} allowedWorkspaceRoots={}", row["name"].as_str().unwrap_or_default().escape_debug(), row["workspaceRoots"], row["allowedWorkspaceRoots"]);
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -379,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
         return keys::run(&cli, command);
     }
     match &cli.cmd {
+        Cmd::Profiles { json } => return print_profiles(&cli, *json),
         Cmd::Usage(args) => {
             // 本地报表不构造 Hub、不加载密钥；公开目录的诊断仅写 stderr。
             logging::init(&cli.log_level, Some(std::path::Path::new("-")), &cli.log_format)?;
@@ -523,9 +566,10 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     };
-    let session_req = |profile: Option<String>, depth: Option<routing::Depth>, account: &AccountArg, turns: &TurnArgs, llm: &LlmArgs| hub::SessionRequest {
+    let session_req = |profile: Option<String>, cwd, depth: Option<routing::Depth>, account: &AccountArg, turns: &TurnArgs, llm: &LlmArgs| hub::SessionRequest {
         provider: cli.provider.clone(),
         profile,
+        cwd,
         model: cli.model.clone(),
         reasoning_effort: cli.reasoning_effort,
         depth,
@@ -559,7 +603,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
-        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::Pricing(_) | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
+        Cmd::HashToken { .. } | Cmd::Ask(_) | Cmd::Turns(_) | Cmd::Usage(_) | Cmd::Pricing(_) | Cmd::Profiles { .. } | Cmd::ProbeEfforts(_) | Cmd::Keys { .. } | Cmd::Mcp { .. } => unreachable!(),
         Cmd::Serve { bind, .. } => {
             let bind = if bind == "none" { None } else { Some(bind.parse().map_err(|_| anyhow::anyhow!("--bind must be a socket address or 'none'"))?) };
             if cli.config.is_none() {
@@ -568,30 +612,32 @@ async fn main() -> anyhow::Result<()> {
             let hub = prepared_hub.clone().expect("prepared hub");
             http::serve(hub, bind).await?;
         }
-        Cmd::Rpc { ref profile, depth, ref account, ref resume, ref turns, ref llm } => {
+        Cmd::Rpc { ref profile, ref cwd, depth, ref account, ref resume, ref turns, ref llm } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             if resume.is_some() {
                 anyhow::ensure!(turns.on_max_turns.is_none(), "--on-max-turns only applies to new sessions (onMaxTurns is fixed when the session is created)");
                 anyhow::ensure!(!llm.is_set(), LLM_ARGS_RESUME_ERROR);
             }
-            let result = rpc::run(hub.clone(), session_req(profile.clone(), depth, account, turns, llm), resume.clone()).await;
+            let result = rpc::run(hub.clone(), session_req(profile.clone(), cwd.clone(), depth, account, turns, llm), resume.clone()).await;
             hub.mcp.shutdown().await;
             result?;
         }
-        Cmd::Run { ref profile, depth, json, ref account, auto_approve, ref resume, ref turns, ref llm, ref prompt } => {
+        Cmd::Run { ref profile, ref cwd, depth, json, ref account, auto_approve, ref resume, ref turns, ref llm, ref prompt } => {
             let hub = prepared_hub.clone().expect("prepared hub");
             let client = local_client(&hub.config);
+            let cwd = cwd.as_deref().map(workdir::cli_cwd).transpose()?;
             let session = match resume {
                 Some(id) => {
                     anyhow::ensure!(!llm.is_set(), LLM_ARGS_RESUME_ERROR);
                     let session = resume_session(&hub, &client, id)?;
+                    hub.check_session_cwd(&session, cwd.as_deref())?;
                     if let Some(level) = cli.reasoning_effort {
                         session.set_reasoning_effort(Some(level));
                     }
                     turns.apply_to_resumed(&session)?;
                     session
                 }
-                None => hub.create_session(&client, session_req(profile.clone(), depth, account, turns, llm))?,
+                None => hub.create_session(&client, session_req(profile.clone(), cwd, depth, account, turns, llm))?,
             };
             let persisted = session.hooks.path().is_some();
             if !json {
@@ -669,7 +715,7 @@ async fn main() -> anyhow::Result<()> {
                 add_usage(&mut total, &session.hooks.compaction_usage());
                 // account：最后一次调用实际使用的账号（failover 后可能不同于会话账号）
                 let account = last.account.clone().unwrap_or_else(|| session.account.clone());
-                let mut out = serde_json::json!({"sessionId": session.id, "persisted": persisted, "resumed": resume.is_some(), "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turn_count, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
+                let mut out = serde_json::json!({"sessionId": session.id, "cwd": session.cwd, "sessionRoot": session.session_root, "persisted": persisted, "resumed": resume.is_some(), "model": session.model(), "account": account, "api": api, "text": last.text(), "stopReason": last.stop_reason, "turns": turn_count, "toolCalls": tool_calls, "usage": last.usage, "totalUsage": total, "error": last.error_message});
                 out.as_object_mut().unwrap().extend(session.effort_fields());
                 out.as_object_mut().unwrap().extend(session.turn_result_fields(limit, last.error_message.as_deref()));
                 out["reasoningEffort"] = serde_json::json!(effort);
@@ -790,6 +836,21 @@ fn format_efforts(model: &agent_ai::ModelInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cwd_flags_parse_only_on_run_and_rpc() {
+        let cli = Cli::try_parse_from(["sub-bot", "--workspace", "base", "run", "--cwd", "relative path", "hi"]).unwrap();
+        assert_eq!(cli.workspace, PathBuf::from("base"));
+        let Cmd::Run { cwd, .. } = cli.cmd else { panic!("run") };
+        assert_eq!(cwd, Some(PathBuf::from("relative path")));
+        let Cmd::Rpc { cwd, .. } = Cli::try_parse_from(["sub-bot", "rpc", "--cwd", "../checkout"]).unwrap().cmd else { panic!("rpc") };
+        assert_eq!(cwd, Some(PathBuf::from("../checkout")));
+        assert!(matches!(Cli::try_parse_from(["sub-bot", "run", "hi"]).unwrap().cmd, Cmd::Run { cwd: None, .. }));
+        assert!(matches!(Cli::try_parse_from(["sub-bot", "rpc"]).unwrap().cmd, Cmd::Rpc { cwd: None, .. }));
+        assert!(Cli::try_parse_from(["sub-bot", "serve", "--cwd", "dir"]).is_err());
+        assert!(Cli::try_parse_from(["sub-bot", "run", "--workspace-root", "dir", "hi"]).is_err());
+        assert!(matches!(Cli::try_parse_from(["sub-bot", "profiles", "--json"]).unwrap().cmd, Cmd::Profiles { json: true }));
+    }
 
     #[test]
     fn pricing_and_usage_refresh_cli_flags() {

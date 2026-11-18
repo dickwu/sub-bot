@@ -39,6 +39,10 @@ pub struct Ask {
     /// Continue a server session (also after a server restart: the server reloads it from its session directory).
     #[arg(long, visible_alias = "resume")]
     pub session: Option<String>,
+    /// Working directory for a new session (session.cwd; relative paths resolve against this process's cwd).
+    /// The server checks it against the profile's allowedWorkspaceRoots. With --session it must match the session's cwd.
+    #[arg(long)]
+    pub cwd: Option<PathBuf>,
     /// Submit an asynchronous task and poll until its final result.
     #[arg(long = "async")]
     pub asynchronous: bool,
@@ -106,6 +110,8 @@ pub struct Client {
     depth: Option<crate::routing::Depth>,
     /// 新会话的账号（session.account）
     account: Option<String>,
+    /// session.cwd（新会话选择目录；已有会话时作为断言）
+    cwd: Option<PathBuf>,
     approval: ApprovalMode,
     /// 新会话的 session.maxTurns / session.onMaxTurns
     max_turns: Option<u64>,
@@ -171,6 +177,7 @@ impl Client {
             effort: None,
             depth: None,
             account: None,
+            cwd: None,
             approval: ApprovalMode::Ignore,
             max_turns: None,
             on_max_turns: None,
@@ -229,6 +236,9 @@ impl Client {
         let mut body = json!({"message": message, "session": {"profile": profile, "provider": self.provider}, "sessionId": session});
         if let Some(account) = &self.account {
             body["session"]["account"] = json!(account);
+        }
+        if let Some(cwd) = &self.cwd {
+            body["session"]["cwd"] = json!(cwd);
         }
         if let Some(effort) = self.effort {
             body["reasoningEffort"] = json!(effort);
@@ -632,6 +642,11 @@ pub async fn run(args: &Ask, data_dir: PathBuf, provider: Option<&str>, effort: 
     client.effort = effort;
     client.depth = if args.deep { Some(crate::routing::Depth::Deep) } else { args.depth };
     client.account = args.account.account.clone();
+    if let Some(cwd) = &args.cwd {
+        let cwd = crate::workdir::cli_cwd(cwd)?;
+        tracing::info!(cwd = %cwd.display(), "ask: requesting session cwd");
+        client.cwd = Some(cwd);
+    }
     client.approval = if args.auto_approve {
         ApprovalMode::Auto(true)
     } else if args.auto_deny {
@@ -743,7 +758,10 @@ mod tests {
         let mut client = Client::new(None, Some("http://127.0.0.1:1".into()), None).unwrap();
         let body = client.chat_body("hi", None, Some("s"), json!({"stream": true}));
         assert!(body.get("reasoningEffort").is_none() && body.get("depth").is_none());
-        assert!(body["session"].get("account").is_none());
+        assert!(body["session"].get("account").is_none() && body["session"].get("cwd").is_none());
+        client.cwd = Some(PathBuf::from("/srv/repo"));
+        assert_eq!(client.chat_body("hi", None, None, json!({}))["session"]["cwd"], "/srv/repo");
+        client.cwd = None;
         client.effort = Some(agent_ai::ThinkingLevel::Max);
         client.depth = Some(crate::routing::Depth::Deep);
         client.account = Some("work".into());

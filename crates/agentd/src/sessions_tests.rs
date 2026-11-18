@@ -4,7 +4,7 @@ use crate::hub::{Hub, SessionHandle, SessionRequest};
 use crate::issues::Reporter;
 use agent_ai::{AssistantEvent, AssistantMessage, Content, Message, Provider, Request, StopReason, ThinkingLevel, Usage};
 use agent_core::AgentEvent;
-use agent_session::{compaction as cp, Entry, Session};
+use agent_session::{compaction as cp, Entry, Session, SessionMeta};
 use axum::{
     body::{to_bytes, Body},
     http::{Request as HttpRequest, StatusCode},
@@ -123,6 +123,7 @@ impl Drop for TempDir {
 pub(crate) fn config(dir: &Path) -> Config {
     let mut cfg = Config::fallback("faux".into(), "test-token", std::env::current_dir().unwrap());
     cfg.data_dir = Some(dir.join("data"));
+    cfg.pricing.source = crate::usage::prices::PricingSource::Builtin;
     cfg.profiles.get_mut("default").unwrap().load_context_files = false;
     cfg.clients.push(Client { name: "other".into(), token_sha256: sha256_hex("other-token"), profiles: vec!["default".into()], ..Default::default() });
     cfg
@@ -216,6 +217,9 @@ async fn resume_after_restart_restores_context_signatures_and_settings() {
         (Some("default"), Some("faux"), Some(ThinkingLevel::High), Some("hello there"))
     );
     assert_eq!(meta.cwd.as_deref(), Some(h.cwd.as_path()));
+    assert_eq!(meta.session_root.as_deref(), Some(h.session_root.as_path()));
+    let Entry::Session { meta: Some(header), .. } = &stored.entries()[0] else { panic!("session header") };
+    assert_eq!((&header.cwd, &header.session_root), (&meta.cwd, &meta.session_root));
     assert_eq!(meta.routing.as_ref().unwrap()["decided"], true);
     assert!(meta.system_prompt_sha256.is_some());
     drop((h, hub1));
@@ -228,6 +232,7 @@ async fn resume_after_restart_restores_context_signatures_and_settings() {
     assert!(hub2.get(&me, &id).is_none());
     let h = hub2.get_or_load(&me, &id).await.unwrap().expect("rehydrated");
     assert_eq!(h.id, id);
+    assert_eq!((Some(&h.cwd), Some(&h.session_root)), (meta.cwd.as_ref(), meta.session_root.as_ref()));
     assert_eq!(h.agent.messages().await, before);
     assert_eq!(h.requested_effort(), Some(ThinkingLevel::High));
     assert!(h.routing().decided);
@@ -242,6 +247,147 @@ async fn resume_after_restart_restores_context_signatures_and_settings() {
     assert_eq!(Session::open(&path).unwrap().active_messages(), h.agent.messages().await);
     assert_eq!(h.agent.messages().await.len(), 4);
     assert_eq!(agent_session::list_files(&dir.sessions().join("default")).len(), 1);
+}
+
+#[tokio::test]
+async fn cwd_resume_preserves_pair_and_rechecks_policy() {
+    use std::fs;
+    let dir = TempDir::new();
+    let workspace = dir.0.join("workspace");
+    let extra = dir.0.join("extra");
+    let job = extra.join("job");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir_all(&job).unwrap();
+    fs::write(extra.join("AGENTS.md"), "newly reachable parent instruction").unwrap();
+    fs::write(job.join("CLAUDE.md"), "job instruction").unwrap();
+    fs::write(job.join("marker"), "job marker").unwrap();
+    let job = fs::canonicalize(job).unwrap();
+    let (hub1, _) = hub(&dir, |cfg| {
+        let p = cfg.profiles.get_mut("default").unwrap();
+        p.workspace_roots = vec![workspace.clone()];
+        p.load_context_files = true;
+    });
+    let h = hub1.create_session(&client(&hub1, "default"), SessionRequest { cwd: Some(job.clone()), ..Default::default() }).unwrap();
+    prompt(&h, "original history").await;
+    let (id, path, history) = (h.id.clone(), h.hooks.path().unwrap(), h.agent.messages().await);
+    drop((h, hub1));
+
+    let (hub2, _) = hub(&dir, |cfg| {
+        let p = cfg.profiles.get_mut("default").unwrap();
+        p.workspace_roots = vec![extra];
+        p.allowed_workspace_roots.clear();
+        p.load_context_files = true;
+    });
+    let app = crate::http::test_router(hub2.clone());
+    let uri = format!("/v1/sessions/{id}");
+    let (status, rows) = request(&app, "GET", "/v1/sessions", "test-token", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows["sessions"][0]["inMemory"], false);
+    assert_eq!(rows["sessions"][0]["sessionRoot"], json!(job));
+    let (status, result) = request(&app, "POST", "/v1/chat", "test-token", Some(json!({"sessionId": id, "message": r#"/tool read {"path":"marker"}"#}))).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(result["text"], "tool read returned: job marker");
+    let (status, view) = request(&app, "GET", &uri, "test-token", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!((view["cwd"].clone(), view["sessionRoot"].clone()), (json!(job), json!(job)));
+    let h = hub2.get(&client(&hub2, "default"), &id).unwrap();
+    let system = h.agent.config.system_prompt.as_deref().unwrap();
+    assert!(system.contains("job instruction") && !system.contains("newly reachable parent instruction"));
+    let messages = h.agent.messages().await;
+    assert_eq!(&messages[..history.len()], history.as_slice());
+    assert_eq!(Session::read(&path).unwrap().active_messages(), messages);
+    assert_eq!(agent_session::list_files(&dir.sessions().join("default")).len(), 1);
+    drop((h, app, hub2));
+
+    let (hub3, _) = hub(&dir, |cfg| {
+        let p = cfg.profiles.get_mut("default").unwrap();
+        p.workspace_roots = vec![workspace];
+        p.allowed_workspace_roots.clear();
+    });
+    let app = crate::http::test_router(hub3);
+    let (status, body) = request(&app, "GET", &uri, "test-token", None).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "session cannot be resumed: cwd is not allowed in profile 'default' (allowedWorkspaceRoots plus workspaceRoots)");
+}
+
+#[tokio::test]
+async fn cwd_resume_rejects_missing_redirected_or_invalid_saved_paths() {
+    use std::{fs, os::unix::fs::symlink};
+    let dir = TempDir::new();
+    let root = dir.0.join("workspace");
+    let cwd = root.join("sub");
+    let target = dir.0.join("replacement");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir(&target).unwrap();
+    let root = fs::canonicalize(root).unwrap();
+    let cwd = fs::canonicalize(cwd).unwrap();
+    let make = |saved_cwd: Option<PathBuf>, saved_root: PathBuf| {
+        Session::create_with_meta(&dir.sessions().join("default"), "default", SessionMeta { cwd: saved_cwd, session_root: Some(saved_root), ..Default::default() }).unwrap().id
+    };
+    let good = make(Some(cwd.clone()), root.clone());
+    let unrelated = make(Some(cwd.clone()), target.clone());
+    let missing_root = make(Some(cwd.clone()), dir.0.join("missing"));
+    let no_cwd = make(None, root.clone());
+    let too_broad = make(Some(cwd.clone()), root.clone());
+    let (hub, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().workspace_roots = vec![cwd.clone()]);
+    let app = crate::http::test_router(hub);
+    let check = |id: String, cause: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, body) = request(&app, "GET", &format!("/v1/sessions/{id}"), "test-token", None).await;
+            assert_eq!(status, StatusCode::CONFLICT);
+            assert_eq!(body["error"], format!("session cannot be resumed: {cause}"));
+        }
+    };
+    for id in [unrelated, missing_root, no_cwd] {
+        check(id, "invalid stored sessionRoot: expected a canonical directory containing cwd").await;
+    }
+    check(too_broad, "stored sessionRoot exceeds the current context boundary").await;
+    fs::remove_dir(&cwd).unwrap();
+    check(good.clone(), "cwd does not exist").await;
+    symlink(target, &cwd).unwrap();
+    check(good, "stored cwd is no longer canonical").await;
+}
+
+#[tokio::test]
+async fn cwd_legacy_sessions_derive_and_pin_root() {
+    use std::fs;
+    let dir = TempDir::new();
+    let sub = dir.0.join("workspace/sub");
+    fs::create_dir_all(&sub).unwrap();
+    let sub = fs::canonicalize(sub).unwrap();
+    let workspace = sub.parent().unwrap().to_owned();
+    let dir_on_disk = dir.sessions().join("default");
+    let only_cwd = Session::create_with_meta(&dir_on_disk, "default", SessionMeta { cwd: Some(sub.clone()), ..Default::default() }).unwrap();
+    let v1 = Session::create(&dir_on_disk, "default").unwrap();
+    let mut header = serde_json::to_value(&v1.entries()[0]).unwrap();
+    header["version"] = json!(1);
+    header.as_object_mut().unwrap().remove("meta");
+    fs::write(&v1.path, format!("{header}\n")).unwrap();
+    let (hub, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().workspace_roots = vec![workspace.clone()]);
+    let me = client(&hub, "default");
+    let rows = hub.list_sessions(&me, 10).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["sessionRoot"].is_null()));
+    for (original, expected_cwd) in [(only_cwd, sub), (v1, workspace.clone())] {
+        assert_eq!(file_entries(&original.path).len(), 1, "listing is read-only");
+        for _ in 0..2 {
+            let h = hub.load_persisted(&me, &original.id).unwrap().unwrap();
+            assert_eq!((&h.cwd, &h.session_root), (&expected_cwd, &workspace));
+            let log = Session::read(&original.path).unwrap();
+            assert_eq!(log.entries().len(), 2);
+            assert_eq!(log.meta().cwd.as_ref(), Some(&expected_cwd));
+            assert_eq!(log.meta().session_root.as_ref(), Some(&workspace));
+            for in_memory in [true, false] {
+                if !in_memory {
+                    hub.remove(&me, &h.id);
+                }
+                let rows = hub.list_sessions(&me, 10).await;
+                let row = rows.iter().find(|r| r["sessionId"] == h.id).unwrap();
+                assert_eq!((row["inMemory"].clone(), row["sessionRoot"].clone()), (json!(in_memory), json!(workspace)));
+            }
+        }
+    }
 }
 
 #[tokio::test]
@@ -549,12 +695,20 @@ async fn interrupted_tool_call_is_repaired_on_resume() {
 #[tokio::test]
 async fn resume_failures_and_persistence_disabled() {
     let dir = TempDir::new();
-    let (hub1, _) = hub(&dir, |_| {});
+    let old = dir.0.join("old");
+    let other = dir.0.join("other");
+    std::fs::create_dir(&old).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let (hub1, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().workspace_roots = vec![old]);
     let h = hub1.create_session(&client(&hub1, "default"), SessionRequest::default()).unwrap();
     let (id, path) = (h.id.clone(), h.hooks.path().unwrap());
     drop((h, hub1));
     // profile 不再允许原 cwd ⇒ 409（ResumeFailed）
-    let (hub2, _) = hub(&dir, |cfg| cfg.profiles.get_mut("default").unwrap().workspace_roots = vec![std::env::temp_dir()]);
+    let (hub2, _) = hub(&dir, |cfg| {
+        let p = cfg.profiles.get_mut("default").unwrap();
+        p.workspace_roots = vec![other];
+        p.allowed_workspace_roots.clear();
+    });
     let app = crate::http::test_router(hub2.clone());
     let (status, body) = request(&app, "GET", &format!("/v1/sessions/{id}"), "test-token", None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");

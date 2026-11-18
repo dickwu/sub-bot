@@ -18,7 +18,7 @@ pub enum Risk {
     Network,
 }
 
-/// 构造工具时所需的会话级上下文。`cwd` 是该会话的工作目录（所有文件路径都限制在其中）。
+/// 构造工具时所需的会话级上下文。`cwd` 是文件工具的相对路径基准，也是 bash 的启动目录，不是沙箱。
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
     pub cwd: PathBuf,

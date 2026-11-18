@@ -37,6 +37,9 @@ pub struct SessionMeta {
     pub api: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
+    /// 上下文文件向上查找的边界；与 cwd 一起固定到会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_reasoning_effort: Option<ThinkingLevel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,6 +100,7 @@ impl SessionMeta {
             explicit_model,
             api,
             cwd,
+            session_root,
             requested_reasoning_effort,
             reasoning_effort,
             routing,
@@ -599,10 +603,13 @@ mod tests {
         let meta = SessionMeta { model: Some("m1".into()), cwd: Some("/w".into()), ..Default::default() };
         let mut s = Session::create_with_meta(&dir, "p", meta).unwrap();
         assert!(!s.update_meta(&SessionMeta { model: Some("m1".into()), ..Default::default() }).unwrap());
+        assert!(s.update_meta(&SessionMeta { session_root: Some("/w".into()), ..Default::default() }).unwrap());
+        assert!(!s.update_meta(&SessionMeta { session_root: Some("/w".into()), ..Default::default() }).unwrap());
         assert!(s.update_meta(&SessionMeta { model: Some("m2".into()), title: Some("t".into()), ..Default::default() }).unwrap());
         let re = Session::open(&s.path).unwrap();
         assert_eq!(re.meta().model.as_deref(), Some("m2"));
         assert_eq!(re.meta().cwd.as_deref(), Some(Path::new("/w")));
+        assert_eq!(re.meta().session_root.as_deref(), Some(Path::new("/w")));
         assert_eq!(re.meta().title.as_deref(), Some("t"));
         // session_info 不进入树
         assert!(re.active_messages().is_empty());

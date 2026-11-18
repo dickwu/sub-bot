@@ -9,7 +9,7 @@
 - 可选的工具调用审批（`toolApproval`）：执行前按策略 allow / ask / deny，ask 时暂停等待调用方通过 HTTP / RPC / CLI 批准，见「工具调用审批」
 - 设计细节见 [DESIGN.md](DESIGN.md)；许可证 `MIT OR Apache-2.0`，第三方声明见 [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md)
 
-> 状态：**v0.13.0**。用量报表默认用 models.dev 的公开标准单价做费用估测，离线时沿用最近一次有效快照或内置表；新增 `sub-bot pricing` 和 `usage --refresh-prices`。内置 OpenAI 允许列表新增 GPT-6.2 Astra / Sol，默认仍是 GPT-6.1 Sol。见「用量统计」与 [CHANGELOG.md](CHANGELOG.md)。
+> 状态：**v0.14.0**。创建会话时可选择工作目录（CLI、HTTP、stdio RPC），恢复时沿用已保存的目录和上下文边界。默认允许选择任意现有目录；如果原先依赖 `workspaceRoots` 限制选择范围，请在升级前加上 `"allowedWorkspaceRoots": []`。见「按请求选择工作目录」与 [CHANGELOG.md](CHANGELOG.md)。
 
 ## Claude (Anthropic)
 
@@ -86,16 +86,17 @@ SIGINT/SIGTERM 阻止新任务、取消运行中的 agent，并在 `shutdownGrac
 - 每条消息在加入上下文时立即追加写入（用户消息、助手消息、工具结果），不再等运行结束；进程崩溃最多丢失正在写的那一行。
 
 文件格式沿用 pi 的会话树（`id` / `parentId`），向后兼容：
-- header `{"type":"session","version":2,"id","profile","timestamp","meta":{...}}`；`meta` 记录重建会话所需的信息：`client`、`provider`、`account`、`model`、`explicitModel`、`api`、`cwd`、`requestedReasoningEffort`、`reasoningEffort`、`routing`、`tools`、`systemPrompt` / `appendSystemPrompt`（仅调用方覆盖时）、`systemPromptSha256`、`callerTools`（只有名字）、`ephemeral`、`toolApproval`（仅请求里给了会话级审批策略时）、`title`（第一条用户消息预览）。
+- header `{"type":"session","version":2,"id","profile","timestamp","meta":{...}}`；`meta` 记录重建会话所需的信息：`client`、`provider`、`account`、`model`、`explicitModel`、`api`、`cwd`、`sessionRoot`、`requestedReasoningEffort`、`reasoningEffort`、`routing`、`tools`、`systemPrompt` / `appendSystemPrompt`（仅调用方覆盖时）、`systemPromptSha256`、`callerTools`（只有名字）、`ephemeral`、`toolApproval`（仅请求里给了会话级审批策略时）、`title`（第一条用户消息预览）。
 - `{"type":"session_info","id","timestamp","meta":{...}}`：元数据更新（模型路由确定、推理强度修改、标题），不进入树，后写覆盖先写。
 - `{"type":"compaction",...,"summary","firstKeptEntryId","tokensBefore","tokensAfter"}`：见「上下文压缩」。
-- v1 文件（没有 `meta` / `session_info` / token 字段）照常加载：profile 取 header，cwd 取 profile 的第一个 workspaceRoot，模型取最后一条助手消息。
+- v1 文件（没有 `meta` / `session_info` / token 字段）照常加载：profile 取 header，模型可从最后一条助手消息恢复。没有 `cwd` 时使用当前 profile 的默认目录；旧文件没有 `sessionRoot` 时按照当前规则推导。成功恢复后通过一条 `session_info` 固定这两个路径，不覆盖旧 header。
 
 ### 重启后恢复（rehydrate）
 
 HTTP 上任何会话路由（`GET/PATCH/DELETE /v1/sessions/{id}`、`/messages`、`/prompt`、`/events`、`/abort`、`/compact`，以及带 `sessionId` 的 `/v1/chat`）遇到不在内存里的 ID 时，会从**同一 client** 的会话目录加载它，然后照常处理；其它 client 的会话一律 404。ID 必须是规范的小写 UUID，否则直接 404、不访问磁盘（防止路径穿越）。成功时记 info 日志 `session rehydrated from disk`（`session_id`、`messages`、`compacted`、`repaired_tool_calls`、`elapsed_ms`）。
 
-- 恢复的内容：上下文（压缩后的摘要 + 保留消息；tool_use / tool_result 配对原样保留，Anthropic 签名 thinking 块原样回放，压缩保留的消息除外，见「上下文压缩」）、profile、cwd（仍须位于 workspaceRoots 内）、provider / account、已确定的模型路由（不会重新路由，depth 不能再改）、请求的推理强度（按模型重新解析）、工具列表、调用方的系统提示覆盖、chat 会话的短 TTL。系统提示按当前 profile 与 AGENTS.md 重新构建（与创建时不同会记 info 日志）。之后的消息追加到同一个文件。
+- 恢复的内容：上下文（压缩后的摘要 + 保留消息；tool_use / tool_result 配对原样保留，Anthropic 签名 thinking 块原样回放，压缩保留的消息除外，见「上下文压缩」）、profile、已保存的 `cwd` / `sessionRoot`、provider / account、已确定的模型路由（不会重新路由，depth 不能再改）、请求的推理强度（按模型重新解析）、工具列表、调用方的系统提示覆盖、chat 会话的短 TTL。系统提示按当前 profile 和保存的上下文边界重新构建（与创建时不同会记 info 日志）。之后的消息追加到同一个文件。
+- 恢复时按**当前** `allowedWorkspaceRoots` 策略重新校验 cwd。目录消失、被重定向、已不允许，或保存的 `sessionRoot` 无效 / 超出当前边界，都会拒绝恢复；允许范围放宽时也不会加载保存边界之外的指令。
 - 不恢复：调用方回调工具（`callbackUrl` / token 不落盘，记 WARN）、中断的运行（不会自动重新执行）、等待中的工具调用审批（见下条）。
 - **工具调用审批**：恢复的会话按**当前** profile（或全局）`toolApproval` 重新建立审批闸门，创建时请求里的会话级 `toolApproval` 随会话持久化并继续叠加（重启不会放宽策略）。等待中的审批只在内存里：重启时正在等待审批的工具调用没有结果，按下面的崩溃修复补上 `interrupted` 错误结果（工具没有执行），之前的 `callId` 决定会返回 404。
 - 恢复的会话计入 `maxSessionsPerClient`（满了返回 429）。不能恢复（文件损坏、profile / cwd / 模型 / 账号不再被允许、provider 未加载）返回 **409** `session cannot be resumed: ...`。
@@ -105,27 +106,27 @@ HTTP 上任何会话路由（`GET/PATCH/DELETE /v1/sessions/{id}`、`/messages`�
 ### CLI 与 RPC
 
 ```bash
-sub-bot run --json "分析 src/ 的结构"          # {"sessionId":"…","persisted":true,"resumed":false,…}
+sub-bot run --json "分析 src/ 的结构"          # {"sessionId":"…","cwd":"/work/app","sessionRoot":"/work","persisted":true,"resumed":false,…}
 sub-bot run "分析 src/ 的结构"                  # stdout 只有回复；stderr 打印 [session] <id>
 sub-bot run --resume <id> "继续，补上测试"       # 读取 <sessionDir>/local/<…>_<id>.jsonl，追加写入
-sub-bot rpc --resume <id>                       # <sessionDir>/stdio/；get_state 返回 sessionId / persisted
+sub-bot rpc --resume <id>                       # <sessionDir>/stdio/；get_state 返回 sessionId / cwd / sessionRoot / persisted
 sub-bot ask --resume <id> "继续"                # --resume 是 --session 的别名；服务重启后由服务端按需恢复
 ```
 
-`run --resume` / `rpc --resume` 时 profile、模型、provider、账号、depth 都来自记录（命令行同名参数被忽略），`--reasoning-effort` 作为粘性修改生效，审批照常按 profile 策略进行（`run --resume --auto-approve`、`ask --resume --auto-approve|--auto-deny` 可同时使用）；`--no-persist-sessions` 或 `persistSessions: false` 时 `--resume` 直接报错。
+`run --resume` / `rpc --resume` 时 profile、模型、provider、账号、depth 都来自记录（命令行同名参数被忽略），`--cwd` 若提供则必须匹配已保存的目录，`--reasoning-effort` 作为粘性修改生效，审批照常按 profile 策略进行（`run --resume --auto-approve`、`ask --resume --auto-approve|--auto-deny` 可同时使用）；`--no-persist-sessions` 或 `persistSessions: false` 时 `--resume` 直接报错。
 
 ### 列表与删除
 
 ```bash
 curl -s 'localhost:7878/v1/sessions?limit=20' -H "Authorization: Bearer $T"
-# {"sessions":[{"sessionId":"…","profile":"coder","provider":"anthropic","account":"default","model":"claude-opus-5-5","cwd":"/work/app",
+# {"sessions":[{"sessionId":"…","profile":"coder","provider":"anthropic","account":"default","model":"claude-opus-5-5","cwd":"/work/app","sessionRoot":"/work",
 #   "createdAt":1767225600000,"updatedAt":1767229200000,"messageCount":12,"inMemory":false,"running":false,"persisted":true,"ephemeral":false,
 #   "title":"给 src/lib.rs 加单元测试…"}]}
 curl -X DELETE "localhost:7878/v1/sessions/$SID" -H "Authorization: Bearer $T"              # {"deleted":true,"inMemory":true,"purged":false}
 curl -X DELETE "localhost:7878/v1/sessions/$SID?purge=true" -H "Authorization: Bearer $T"   # 同时删除 JSONL：{"deleted":true,"inMemory":false,"purged":true}
 ```
 
-- 列表合并内存会话与磁盘会话（按 ID 去重，内存优先），按 `updatedAt` 倒序，`limit` 默认 50（1–1000）；时间为 Unix 毫秒，磁盘会话的 `updatedAt` 是文件修改时间，`messageCount` 是当前上下文（压缩后）的消息数。列表只读文件，不会加载会话。
+- 列表合并内存会话与磁盘会话（按 ID 去重，内存优先），按 `updatedAt` 倒序，`limit` 默认 50（1–1000）；时间为 Unix 毫秒，磁盘会话的 `updatedAt` 是文件修改时间，`messageCount` 是当前上下文（压缩后）的消息数。列表只读文件，不会加载会话；旧文件的 `sessionRoot` 在首次恢复前可能为 `null`。
 - `DELETE` 默认只删内存会话（运行中会被中止），JSONL 保留，之后按 ID 仍可恢复；只在磁盘上的会话也返回 200（`inMemory:false`）。`?purge=true` 同时删除 JSONL（之后 404）。
 
 ## 上下文压缩
@@ -390,6 +391,56 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
 
 `serve` 收到 Ctrl-C 或 SIGTERM 时停止接受新会话/提交，取消正在运行的会话，等运行收尾并写入 JSONL 后退出。
 
+## 按请求选择工作目录
+
+工作目录 `cwd` 在**创建会话时**选定：文件工具以它为相对路径基准，`bash` 从那里启动。另有一个 `sessionRoot`，只用于限制向上读取项目指令。两者都是解析符号链接后的绝对路径，由会话固定，不能用 PATCH 更改。
+
+`workspaceRoots` 仍是必填的非空列表。第一个存在且可用的目录是默认 cwd；相对 `workspaceRoots` 以 sub-bot **进程启动目录**为基准，不是配置文件目录。无配置时，`--workspace`（默认 `.`）填入 `default` profile 的 `workspaceRoots`，与每个会话的 `--cwd` 不同。
+
+| profile 的 `allowedWorkspaceRoots` | 可选的 cwd（先解析符号链接，再按路径组件判断） |
+|---|---|
+| 省略或 `["*"]` | 任意现有目录（默认） |
+| `[]` | 仅 `workspaceRoots` 本身及其子目录，恢复 v0.13 的选择限制 |
+| `["/Volumes/Builds"]` | `workspaceRoots` 和列出的额外目录本身及其子目录 |
+
+旧配置不用改也能读取，**但外部 cwd 不再默认拒绝**。额外目录必须是绝对路径，不能混用 `"*"`，也不接受裸字符串、`null` 或部分通配。尚未挂载或不是目录的根不授予权限，也不会导致服务无法启动。默认或 HTTP 相对请求需要一个可用的默认目录；绝对请求可以在默认目录不可用时直接通过策略检查。不会创建目录，也不会展开路径里的 `~` 或 `$HOME`（shell 可在传参前展开）。
+
+- **本地**：`run --cwd`、`rpc --cwd` 以及 JSONL `prompt.cwd` 都以启动 sub-bot 的进程目录为相对路径基准。没有 `--workspace-root` 或 `workspaceRoot` 别名。
+- **HTTP**：`POST /v1/sessions` 接受 `cwd`；`POST /v1/chat` 接受 `cwd` 或 `session.cwd`。相对路径以该会话 profile 的默认目录为基准，不是调用方的路径。两处都填时，若解析出的输入路径不同，直接返回 400，不到磁盘上比较指向。
+- **续聊**：`run` / `rpc --resume` 或 HTTP `sessionId` 沿用记录的 `cwd` / `sessionRoot`。可用 `--cwd`、chat 的 `cwd` 或 `/v1/sessions/{id}/prompt` 的 `cwd` 断言目录；解析后必须与原目录相同，否则返回冲突（HTTP 409）。HTTP 断言使用会话自己的 profile；不能靠传另一个 profile 改变基准。`ask --cwd <dir>` 会把目录作为 `session.cwd` 发给服务端（相对路径先按 ask 进程目录转成绝对路径）；配合 `--session` 时同样只作断言。
+
+```bash
+sub-bot run --cwd "$HOME/src/app" "检查项目结构"
+sub-bot ask --socket "$SOCK" --profile coder --cwd /Volumes/GWD/inter "列出顶层文件"
+sub-bot rpc --cwd "$HOME/src/app"              # 启动时绑定；或不加参数，在首条 prompt 中给 cwd
+sub-bot --config sub-bot.json profiles --json   # 只读本地配置，不连服务、不读密钥、不探测挂载
+```
+
+无 `--cwd` 且不恢复的 RPC，可用这条 JSONL 作为第一条会话命令：
+
+```json
+{"id":"1","type":"prompt","message":"检查项目结构","cwd":"../app"}
+```
+
+HTTP 示例（`$BOT_TOKEN`、`$SID` 分别代表调用 token 和已有会话 ID）：
+
+```bash
+curl -s localhost:7878/v1/sessions -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"profile":"coder","cwd":"app"}'
+curl -s localhost:7878/v1/chat -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"message":"检查项目结构","session":{"profile":"coder","cwd":"app"}}'
+curl -s localhost:7878/v1/chat -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"message":"检查构建目录","profile":"coder","cwd":"/Volumes/Builds/job","model":"gpt-6.2-sol"}'
+curl -s "localhost:7878/v1/sessions/$SID/prompt" -H "Authorization: Bearer $BOT_TOKEN" -H 'content-type: application/json' \
+  -d '{"message":"继续","cwd":"app"}'
+```
+
+当 `cwd` 在 `workspaceRoots` 内时，`sessionRoot` 取配置顺序中第一个匹配的根；其它目录（含额外允许树中的子目录）以 `cwd` 自身为 `sessionRoot`，不找 Git 根，不读取上级项目指令。每层只选第一个存在的文件：`AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md`；注入可读文本时从 `sessionRoot` 到 `cwd` 排列，越近的越靠后。`loadContextFiles: false` 完全禁用。
+
+`GET /v1/profiles` 只列该 client 可用的 profile；例如其中一项（省略其它字段）：`{"name":"coder","workspaceRoots":["./work"],"allowedWorkspaceRoots":["*"]}`。本地 `profiles --json` 使用相同字段，但列出本地配置中的全部 profile。两者都不探测路径。
+
+**这不是文件访问控制。** 策略只约束可选的会话目录和项目指令的向上查找；文件工具的相对路径检查不阻止 OS 跟随符号链接，而 `bash` 能访问服务用户有权限的路径。只把有这些工具的 profile 授权给可信调用方。
+
 ## 配置（`sub-bot.json`）
 
 ```jsonc
@@ -417,7 +468,8 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
   },
   "profiles": {
     "coder": {
-      "workspaceRoots": ["/home/me/code"],     // 会话的 cwd 必须位于这些目录之内
+      "workspaceRoots": ["/home/me/code"],     // 第一个可用目录是默认 cwd；匹配的 workspace 决定项目上下文边界
+      "allowedWorkspaceRoots": ["*"],          // 可选，默认 ["*"]；[] 仅 workspaceRoots，或填额外允许的绝对目录
       "tools": ["read", "ls", "grep", "find", "edit", "write", "bash"],  // 白名单，默认就是这些；也可写 "preset:readonly" / "preset:no-shell"（见「内置工具与预设」）
       "model": "gpt-6.1-sol",                  // profile 默认模型
       "allowedModels": ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.2-astra", "gpt-6.2-sol"],  // 可选：支持 * 通配，不填则不限制
@@ -430,7 +482,7 @@ sub-bot --config sub-bot.json serve --bind 127.0.0.1:7878
       "llmMaxRetries": 3,                      // 可选：瞬时 LLM 错误重试次数（覆盖全局，0 禁用）
       "systemPrompt": null,                    // 替换默认编码前言
       "appendSystemPrompt": "...",             // 追加内容
-      "loadContextFiles": true,                // 注入 cwd 往上的 AGENTS.md / CLAUDE.md
+      "loadContextFiles": true,                // 从 sessionRoot 到 cwd 注入项目指令（含两端）
       "allowSystemPromptOverride": false,      // 是否允许 bot 在请求里覆盖或追加系统提示
       "allowCallerTools": false,               // 是否允许 bot 注册回调工具
       "toolApproval": "never",                 // 可选：never（默认）| always | {default, tools, bash, timeoutSecs, onTimeout}，见「工具调用审批」
@@ -594,6 +646,7 @@ sub-bot ask --effort high "解释这个仓库"
   - Linux：`~/.local/share/sub-bot/logs`
   - macOS：`~/Library/Application Support/sub-bot/logs`
 - 每行日志都带 span：`request_id`（沿用请求的 `X-Request-Id`，也会回写到响应头）/ `bot` / `session_id` / `profile` / `model` / `reasoning_effort` / `tool`
+  - `session created`（INFO）：记录规范化的 `cwd` / `session_root`、`cwd_policy`（`any` / `list`）、`cwd_decision`（`workspace_root` / `allowed_workspace_root` / `any`）以及 `restored`。路径在日志中脱敏、转义控制字符；拒绝时 DEBUG 只记录 profile、策略和决定，不记录被拒绝的路径。
   - `session_run` span：`requested_reasoning_effort` 是请求值，`reasoning_effort` 是按（路由后）实际模型解析的值；`model` / `reasoning_effort` 每个 span 只记录一次（text 格式不再出现重复字段）
   - `grep` / `find` 工具在 debug 级各有一个 span（正则只记长度，不记原文；记录 root、glob、type 与各选项），结束时 debug 记录搜索文件数、匹配数、耗时和是否截断；无法读取的路径汇总为一条 warn（`search skipped unreadable paths`，不作为 issue 上报）
 - 不会记录 API key、bot token 或回调 token；提示词、输出和文件内容只记录长度
@@ -607,15 +660,15 @@ sub-bot ask --effort high "解释这个仓库"
 | 方法和路径 | 说明 |
 |---|---|
 | `GET /v1/health` | 健康检查（无需鉴权） |
-| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`；`tools` 含当前可用的 MCP 工具名，另有 `mcpServers`） |
+| `GET /v1/profiles` | 当前 bot 可用的 profile（含 `model`、`allowedModels`、`reasoningEffort`、`allowedEfforts`、`defaultEffort`、`routing`；`tools` 含当前可用的 MCP 工具名，另有 `mcpServers`；包含 `workspaceRoots` 与 `allowedWorkspaceRoots`（只显示已配置的值，默认策略显示 `["*"]`）） |
 | `GET /v1/mcp` | 当前 bot 的 profile 引用的 MCP 服务器：`{servers: [{name, transport, status, required, serverName, serverVersion, connectMs, connectedAt, restarts, lastError, toolCount, tools: [{name, mcpName, description}]}], profiles: {<profile>: [server…]}}`，见「MCP 服务器」 |
 | `GET /v1/models?profile=&all=&provider=` | 实时模型列表（按 provider 缓存 10 分钟），每项带 `provider` / `reasoning` / `reasoningEfforts` / `allowedEfforts` / `defaultEffort`；`profile` 只返回该 profile 允许的 |
-| `GET /v1/sessions?limit=` | 列出自己的会话（内存 + 已持久化，按 ID 去重，按 `updatedAt` 倒序，`limit` 默认 50、最大 1000）：`{sessions: [{sessionId, profile, provider, account, model, cwd, createdAt, updatedAt, messageCount, inMemory, running, persisted, ephemeral, title}]}`，时间为 Unix 毫秒 |
-| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?, toolApproval?}`（未知字段返回 400；`toolApproval` 只能收紧 profile 策略，会随会话持久化，恢复后仍生效），返回 201 + 会话视图 `{sessionId, profile, cwd, provider, model, api, isStreaming, tools, pendingApprovals, persisted, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
+| `GET /v1/sessions?limit=` | 列出自己的会话（内存 + 已持久化，按 ID 去重，按 `updatedAt` 倒序，`limit` 默认 50、最大 1000）：`{sessions: [{sessionId, profile, provider, account, model, cwd, sessionRoot, createdAt, updatedAt, messageCount, inMemory, running, persisted, ephemeral, title}]}`，时间为 Unix 毫秒 |
+| `POST /v1/sessions` | 新建会话 `{profile, cwd?, model?, provider?, api?, account?, reasoningEffort?, depth?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?, toolApproval?}`（未知字段返回 400；`toolApproval` 只能收紧 profile 策略，会随会话持久化，恢复后仍生效），返回 201 + 会话视图 `{sessionId, profile, cwd, sessionRoot, provider, model, api, isStreaming, tools, pendingApprovals, persisted, reasoningEffort, requestedReasoningEffort, effortAdjusted, allowedEfforts, routing}` |
 | `GET /v1/sessions/{id}` | 会话视图（同上）及运行状态；非 owner 或未知会话返回 404。所有 `/v1/sessions/{id}/*` 路由和带 `sessionId` 的 `/v1/chat` 在会话不在内存时会从磁盘恢复，见「会话持久化与恢复」 |
-| `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?, maxTurns?}`：maxTurns 立即调整回合上限（见「回合预算（maxTurns）」）；修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）。返回 200 + 会话视图 |
+| `PATCH /v1/sessions/{id}` | `{reasoningEffort?, depth?, maxTurns?}`：maxTurns 立即调整回合上限（见「回合预算（maxTurns）」）；修改推理强度（下一次模型调用生效，运行中也可）；depth 仅在第一次 prompt 之前（否则 409）；不接受 `cwd`。返回 200 + 会话视图 |
 | `DELETE /v1/sessions/{id}?purge=` | 删除自己的内存会话并中止运行，返回 `{"deleted":true, "inMemory":bool, "purged":bool}`；默认保留磁盘 JSONL（之后仍可按 ID 恢复），`?purge=true` 同时删除 JSONL；未知/非 owner 返回 404 |
-| `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", reasoningEffort?, depth?}`，返回 202；`reasoningEffort` 粘性，`depth` 仅首个 prompt |
+| `POST /v1/sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", cwd?, reasoningEffort?, depth?}`，返回 202；`cwd` 仅断言原目录，`reasoningEffort` 粘性，`depth` 仅首个 prompt |
 | `GET /v1/sessions/{id}/events` | SSE 事件流 |
 | `POST /v1/sessions/{id}/abort` | 中止当前运行 |
 | `GET /v1/sessions/{id}/messages` | 消息历史（当前上下文；压缩后第一条是摘要消息） |
@@ -623,13 +676,13 @@ sub-bot ask --effort high "解释这个仓库"
 | `POST /v1/sessions/{id}/approvals/{callId}` | `{decision: "approve"\|"deny", reason?}` 决定一次审批：200 / 未知 404 / 已决定 409 |
 | `POST /v1/sessions/{id}/turns` | 调整回合预算 `{maxTurns}` \| `{addTurns}` \| `{stop:true}`，见「回合预算（maxTurns）」 |
 | `POST /v1/sessions/{id}/compact` | 立即压缩上下文，可选 `{instructions}`；返回 `{compacted, tokensBefore, tokensAfter, summaryChars, firstKeptEntryId, durationMs, usage}`；运行中 409，摘要调用失败 502 |
-| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` 是 `session.profile` / `session.model` 的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
+| `POST /v1/chat` | 一次性调用：`{message, sessionId?, session?, stream?, timeoutSecs?, async?, callbackUrl?, webhookEvents?, reasoningEffort?, depth?, account?, profile?, model?, cwd?}`；顶层 `reasoningEffort` / `depth` 作用于新会话或 `sessionId` 指定的会话（depth 仅首个 prompt 之前）；顶层 `profile` / `model` / `cwd` 是 `session` 内相应字段的别名（见下文）；响应带 `model`、推理强度字段和 `routing` |
 | `GET /v1/tasks/{id}` | 异步任务状态/结果/投递状态；未知、已过期或非 owner 返回 404 |
 
-`/v1/chat` 请求体校验（v0.9.2）：
-- 顶层 `profile` / `model` 等价于 `session.profile` / `session.model`（新会话使用；带 `sessionId` 时与 `session` 一样被忽略）。两处都给且值不同 ⇒ 400 `profile given both at top level and in session; put it in session.profile`（`model` 同理）；相同则接受。以前顶层 `profile` 会被静默忽略并落到默认 profile。
-- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`cwd`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`、`toolApproval`、`maxTurns`、`onMaxTurns`、`maxTurnsAskTimeoutSecs`、`streamIdleTimeoutSecs`、`llmMaxRetries`）报 `unknown field 'cwd'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。错误只包含字段名，不回显字段值。
-- `session` 对象（以及 `POST /v1/sessions` 请求体）里的未知字段同样返回 400（serde 报 ``unknown field `profiel`, expected one of ...``），拼写错误不再被静默忽略。
+`/v1/chat` 请求体校验：
+- 顶层 `profile` / `model` / `cwd` 等价于 `session` 里的同名字段。两处都给且值不同 ⇒ 400，例如 `cwd given both at top level and in session; put it in session.cwd`；相同则接受。带 `sessionId` 时 `profile` / `model` 不生效，`cwd` 仍会校验是否匹配原目录（同步、SSE、异步均如此）。
+- 其它未知顶层字段 ⇒ 400。只能放在 `session` 里的会话选项（`provider`、`systemPrompt`、`appendSystemPrompt`、`api`、`tools`、`callerTools`、`toolApproval`、`maxTurns`、`onMaxTurns`、`maxTurnsAskTimeoutSecs`、`streamIdleTimeoutSecs`、`llmMaxRetries`）报 `unknown field 'systemPrompt'; session options go under "session": {...}`；其它字段报 `unknown field '<name>'; expected one of: message, sessionId, session, ...`。未知字段错误只包含字段名，不回显字段值。
+- `session` 对象（以及 `POST /v1/sessions` 请求体）里的未知字段同样返回 400（serde 报 ``unknown field `profiel`, expected one of ...``）；不能传 `sessionRoot`、`workspaceRoot` 或 `allowedWorkspaceRoots`。
 - 顶层 `reasoningEffort` / `depth` / `account` 的语义不变（`account` 顶层优先于 `session.account`）。
 
 超时行为：
@@ -639,7 +692,7 @@ sub-bot ask --effort high "解释这个仓库"
 
 会话在创建、提交消息、运行结束时刷新空闲计时；读取信息/历史或订阅 SSE 不刷新计时。`serve` 每隔最多 60 秒（更短的非零 TTL 优先）清理超过各自 TTL 且未运行的会话，并记录日志；运行中的会话不会被空闲清理。删除/过期仅释放内存中的会话，JSONL 文件保留在磁盘，之后按旧 ID 访问会自动恢复（`DELETE ?purge=true` 才删除文件）。
 
-每个 client 最多保留 `maxSessionsPerClient` 个会话（包括 chat 自动创建的会话）。达到上限时先清理该 client 已过期的空闲会话；仍满则创建返回 HTTP **429** `{"error":"too many sessions..."}`，可主动 DELETE 腾出名额。其它创建参数错误仍返回 400。
+每个 client 最多保留 `maxSessionsPerClient` 个会话（包括 chat 自动创建的会话）。达到上限时先清理该 client 已过期的空闲会话；仍满则创建返回 HTTP **429** `{"error":"too many sessions..."}`，可主动 DELETE 腾出名额。`cwd` 为空、不存在、不是目录、无法解析或没有可用的默认目录时返回 **400**；超出 profile 允许的范围返回 **403**（错误中注明 `allowedWorkspaceRoots` 与 `workspaceRoots`）；已绑定会话上断言另一个有效目录返回 **409**，不提交消息也不更改会话设置。无法恢复已保存的目录或边界同样返回 **409** `session cannot be resumed: ...`。
 
 `/v1/chat` 不带 `sessionId` 时自动创建临时会话，使用独立的 `chatSessionTtlSecs`（默认 10 分钟），而非普通会话的 `sessionIdleTtlSecs`（默认 1 小时）。可用返回的 `sessionId` 继续对话；`stream:true` 时 ID 在响应头 `X-Session-Id` 中。继续对话会刷新计时，但不改变会话 TTL。三个配置字段都是顶层字段；两个 TTL 的 `0` 各自表示禁用过期，上限的 `0` 表示不限数量。
 
@@ -721,15 +774,19 @@ sub-bot --config sub-bot.json rpc --profile coder
 stdin 每行一个命令，stdout 每行一个响应或事件（格式与 pi 的 `--mode rpc` 一致）：
 
 ```
-→ {"id":"1","type":"prompt","message":"列出当前目录的文件"}
+→ {"id":"1","type":"prompt","message":"列出当前目录的文件","cwd":"../app"}
 ← {"id":"1","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}
 ← {"type":"tool_execution_start","toolName":"ls",...}
 ← {"type":"agent_settled","aborted":false}
 ```
 
-模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。`rpc --resume <sessionId>` 恢复 `<sessionDir>/stdio/` 下的会话（ID 可从 `get_state` 取得）；ID 不存在时第一行输出 `{"type":"response","command":"start","success":false,...}` 并退出。
+模型和推理强度用全局参数指定：`sub-bot --model gpt-6.1-sol --reasoning-effort high rpc --profile coder`；模型路由用 `rpc --depth standard|deep|auto`。`rpc --resume <sessionId>` 恢复 `<sessionDir>/stdio/` 下的会话（ID 可从 `get_state` 取得）。
 
-支持的命令：`prompt`（可选 `reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`compact`（`{"instructions"?: string}` → 与 HTTP compact 相同的结果；运行中 `success:false`）、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`approve`（`{"callId":"...","decision":"approve"|"deny","reason"?}`，见「工具调用审批」）、`get_messages`、`get_state`（含 `sessionId`、`persisted`、`model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`、`pendingApprovals`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
+- `--cwd` 或 `--resume` 在启动时绑定目录；启动会话失败（例如恢复 ID 不存在或 `--cwd` 无效）会先输出 `{"type":"response","command":"start","success":false,...}`，再以非零状态退出。
+- 两个参数都不传时，到第一条有效的会话命令才创建会话。首条 `prompt` 的 `cwd` 可以选目录；其它会话命令（例如 `get_state`）会绑定 profile 默认目录。`get_available_models`、空行和解析失败不会创建会话。默认目录不可用或会话上限等创建错误在首条会话命令时报告：返回带该命令 `id` 的失败响应，然后退出，不回退到其它目录。
+- 绑定后 `prompt.cwd` 只是断言，失败只影响该命令；其它命令不接受 `cwd`。每个进程只有一个会话，换目录请启动另一个 `rpc`。未绑定就遇到 EOF 不产生空会话文件。
+
+支持的命令：`prompt`（可选 `cwd`、`reasoningEffort`（粘性）、`depth`（仅首个 prompt））、`compact`（`{"instructions"?: string}` → 与 HTTP compact 相同的结果；运行中 `success:false`）、`set_reasoning_effort`（`{"level":"high"}` → `{requested, effective, adjusted, allowedEfforts}`）、`steer`、`follow_up`、`abort`、`approve`（`{"callId":"...","decision":"approve"|"deny","reason"?}`，见「工具调用审批」）、`get_messages`、`get_state`（含 `sessionId`、`cwd`、`sessionRoot`、`persisted`、`model`、`reasoningEffort`、`requestedReasoningEffort`、`effortAdjusted`、`allowedEfforts`、`routing`、`pendingApprovals`）、`get_available_models`。**关闭 stdin 等于关机**：请等收到 `agent_settled` 后再关闭。
 
 ## API key
 
@@ -751,7 +808,7 @@ key 文件只放 key 本身，首尾空白和换行会被去掉；文件读不�
 - 如果 key 来自文件，子进程可以直接读这个文件（只要知道路径）；
 - 内容中含有 key 的其它环境变量（不是上面这些变量名）不会被识别，需要自己加进 `deny` 或用 `allowlist`。
 
-因此**推荐用 key 文件**（不出现在任何进程的环境里），文件放在 `workspaceRoots` 之外。要真正隔离，请让 sub-bot 以单独的系统用户运行，或者把 bash 放进容器/沙箱。
+因此**推荐用 key 文件**，避免把 key 放进进程环境。把文件放在 `workspaceRoots` 外并不是权限隔离：默认策略允许选择外部目录，`bash` 也不受目录策略限制。请用操作系统权限隔离密钥和 agent（如单独的用户或容器/沙箱），不要只依赖路径约定。
 
 ## 密钥存储：macOS Keychain 与 `sub-bot keys`（v0.9.0；v0.10.3 起经 `/usr/bin/security` 读写）
 
@@ -1160,17 +1217,17 @@ CLI 的 `--account` 是 `run` / `rpc` / `ask` / `models` / `probe-efforts` 各�
 | `find` | read_fs | 按 glob 查找文件/目录（内嵌 ripgrep 的 `ignore` 遍历器） | ✓ | ✓ | ✓ |
 | `edit` | write_fs | 精确文本替换 | ✓ | ✓ | |
 | `write` | write_fs | 覆盖写文件 | ✓ | ✓ | |
-| `bash` | exec | `sh -c` 执行命令 | ✓ | | |
+| `bash` | exec | 从会话 cwd 启动 `sh -c`，不限制文件访问 | ✓ | | |
 | `clock` | safe | 当前 UTC 时间（需显式列出） | | | |
 | `http_fetch` | network | 受 host 白名单限制的 GET（需显式列出） | | | |
 
-profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相对会话 cwd，拒绝绝对路径和 `..`。
+profile 的 `tools` 不填时等于 `preset:default`。`read` / `write` / `edit` / `ls` / `grep` / `find` 的路径以会话 `cwd` 为基准，按词法拒绝绝对路径和 `..`，不保证符号链接解析后仍在 cwd 中。
 
 ### `grep` / `find`：内嵌 ripgrep 引擎
 
 `grep` 和 `find` **在进程内嵌入 ripgrep 的搜索引擎**——直接链接 ripgrep 项目（[BurntSushi/ripgrep](https://github.com/BurntSushi/ripgrep)）的库 crate：`grep-searcher`、`grep-regex`（及 `grep-matcher`）、`ignore`（并行、遵守 `.gitignore` 的遍历器）和 `globset`。**不需要安装 `rg`**，也不会启动任何子进程；宿主机上没有 `rg` / `grep` / `find` 时模型也能搜索。语义尽量与 `rg` 一致：
 
-- 遵守 `.gitignore`（git 仓库内）、`.ignore`、`.rgignore`、全局 gitignore、`.git/info/exclude` 及父目录中的这些文件；默认跳过隐藏文件；不跟随符号链接；`.git` 目录始终跳过（即使 `hidden=true`）。
+- 遵守 `.gitignore`（git 仓库内）、`.ignore`、`.rgignore`、全局 gitignore、`.git/info/exclude` 及父目录中的这些文件；默认跳过隐藏文件；遍历中不跟随符号链接，但不校验起始路径的物理边界；`.git` 目录始终跳过（即使 `hidden=true`）。
 - 二进制文件（含 NUL 字节）整体跳过；每行输出最多 500 字符（超出标注 `… [line truncated: N chars]`），整体输出最多 50,000 字节。
 - 并行遍历后按路径排序，输出稳定；路径相对会话 cwd，可直接交给 `read` / `edit`。
 - 截断时附带提示，例如 `[truncated (limit 100): showing 100 of 2345 matching lines in 87 file(s); refine pattern/path/glob/type, use outputMode=files_with_matches/count or raise limit (max 1000)]`。
@@ -1181,7 +1238,7 @@ profile 的 `tools` 不填时等于 `preset:default`。所有文件路径都相�
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `pattern` | 必填 | 正则（Rust regex 语法）；非法时报错 `invalid regex: ...` |
-| `path` | `.` | 文件或目录（相对 cwd，限制在 cwd 内；不存在报 `path not found`） |
+| `path` | `.` | 文件或目录（相对 cwd，拒绝绝对路径和 `..`；不存在报 `path not found`） |
 | `glob` | – | 字符串或数组，同 `rg -g`：`"*.rs"`、`["src/**", "!*.min.js"]`；`!` 前缀表示排除；不含 `/` 的 glob 匹配任意层级文件名 |
 | `type` | – | ripgrep 文件类型（字符串或数组），如 `rust`、`py`、`ts`；未知类型报 `unknown file type '...'` |
 | `ignoreCase` | – | `true` 强制不区分大小写，`false` 强制区分；设置后覆盖 `smartCase` |
@@ -1246,7 +1303,7 @@ RPC：`{"id":"9","type":"set_max_turns","maxTurns":300}`（或 `"addTurns":50` /
 - 异步任务 `webhookEvents` 新增 `turn_budget`（`all` 也包含），投递 `task.turn_budget_low` 与 `task.turn_budget_exhausted`，`data` 为事件字段加 `{taskId, sessionId, turnsUrl}`；回调目标对象的 `events` 也可写这两个名字。
 - 日志：INFO `turn budget changed`（session_id、max_turns、previous、turns_used、by）、`turn budget low`、`turn budget exhausted`、`turn budget wait resolved`；ask 超时为 WARN `turn budget wait timed out; stopping the run`。
 
-## 用量统计（v0.13.0）
+## 用量统计
 
 sub-bot 把每次 LLM 调用里 **provider 已经返回的 token 数** 记在本机，不需要 Anthropic / OpenAI 的 Admin key，也不是账单。能记的才会记：input、output、缓存读写、推理 token，以及时间、`provider/account`、模型、profile、会话 id、调用方 client 名（只有名字，没有 token）、重试次数。被丢弃的重试尝试和失败调用只要当时返回了用量，也会记下来并打上标记。压缩摘要和路由分类调用同样计入。provider 没有返回用量的调用会被跳过，不会写成全 0。
 
@@ -1564,8 +1621,8 @@ sub-bot --config sub-bot.json mcp list --profile coder --json   # 只连 coder �
 
 - 默认只监听 `127.0.0.1`。如果要跨机器访问，请放在带 TLS 的反向代理后面。
 - 受管 key 目录（Linux `~/.config/sub-bot/keys`）必须是当前用户所有、权限 0700 的真实目录，key 文件为 0600；`sub-bot keys set` 遇到不满足的已有目录会拒绝写入而不是修改权限。
-- MCP stdio 服务器以 sub-bot 的用户权限运行，不受 `workspaceRoots` 限制；只配置可信的服务器，用 `tools` allow-list 与 `toolApproval`（如 `"mcp__*": "ask"`）把关。
-- `bash` 工具能执行任意命令，请只把它开放给可信的 bot，并用 `workspaceRoots` 限定目录。只读场景使用 `preset:readonly`。需要人工把关时用 `toolApproval`（如 `"tools": {"bash": "ask"}` 加 `bash.allow` 白名单）；它是防误操作的护栏，不是沙箱。
+- MCP stdio 服务器以 sub-bot 的用户权限运行，其启动目录不随会话 `cwd` 变化；只配置可信的服务器，用 `tools` allow-list 与 `toolApproval`（如 `"mcp__*": "ask"`）把关。
+- `bash` 可以切换目录并访问服务用户有权限的文件；只对可信 bot 开放。只读场景使用 `preset:readonly`。需要人工把关时用 `toolApproval`（如 `"tools": {"bash": "ask"}` 加 `bash.allow` 白名单）；目录选择策略与审批都不是沙箱。
 
 ## 许可证 / License
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.0] - 2026-11-17
+
+- Select an existing working directory when creating a session with `run --cwd`, `rpc --cwd`, the first stdio RPC `prompt.cwd`, or HTTP `cwd` (`session.cwd` or top-level `cwd` in `/v1/chat`). Relative CLI/RPC paths use the invocation directory; relative HTTP paths use the profile default.
+- **Upgrade note:** existing configs retain their `workspaceRoots` defaults but now allow outside working directories unless restricted. Set `allowedWorkspaceRoots: []` to keep the previous roots-only policy, or list extra absolute roots. The policy controls directory selection, not filesystem access.
+- Tools start from the selected `cwd`; project instructions load only up to the selected `sessionRoot`. Session history pins both paths and checks current policy and the saved boundary on restore. Legacy sessions save the derived pair on first successful restore. An explicit cwd on a bound session must match; HTTP returns 409 for a mismatch or a session that cannot be restored.
+- `ask --cwd <dir>` sends `session.cwd` (relative paths resolved against the ask process directory).
+- View the directory policy in `GET /v1/profiles` or offline via `sub-bot profiles [--json]`. Session views and lists, `run --json`, and RPC `get_state` report the bound pair. Logs report the policy decision and redact directory fields.
+
 ## [0.13.0] - 2026-11-17
 
 - Usage estimates now use report-time OpenAI and Anthropic standard token rates from models.dev, with config overrides first and builtin prices as the offline baseline. The public feed request sends no provider credentials, model query, or usage records; estimates are not bills.

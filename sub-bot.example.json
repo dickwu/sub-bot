@@ -93,6 +93,7 @@
       "workspaceRoots": [
         "./work"
       ],
+      "allowedWorkspaceRoots": ["*"],
       "appendSystemPrompt": "Run the project's tests after making changes when possible.",
       "allowSystemPromptOverride": true,
       "allowCallerTools": true,
@@ -129,6 +130,7 @@
       "workspaceRoots": [
         "./work"
       ],
+      "allowedWorkspaceRoots": [],
       "appendSystemPrompt": "You only review code. Never modify files.",
       "maxTurns": 25,
       "maxOutputTokens": 8000,
@@ -152,7 +154,8 @@
       ],
       "workspaceRoots": [
         "./work/docs"
-      ]
+      ],
+      "allowedWorkspaceRoots": ["/Volumes/Docs"]
     }
   },
   "clients": [

@@ -11,6 +11,14 @@
 
 ---
 
+## 按请求选择工作目录（v0.14.0）
+
+- **策略与默认值**：`Profile::validate_workspace` 只做结构校验，不探测挂载。`workspaceRoots` 必填且非空，保持配置顺序；相对根以 sub-bot 进程 cwd 为基准。无配置时 `--workspace`（默认 `.`）填入唯一的默认根。`allowedWorkspaceRoots` 省略或精确为 `["*"]` 时允许任意已有目录；否则允许 `workspaceRoots` 与额外绝对根的并集（含后代，`[]` 恢复 v0.13 的选择限制）。不可用的根不授权，不会回退成任意目录。
+- **解析**：`workdir::resolve_cwd` 在创建、从磁盘恢复或断言时使用同一套规则。默认 / HTTP 相对请求以第一个可用的 `workspaceRoots` 目录为基准；绝对请求不依赖默认目录。`run` / `rpc` 参数和 JSONL `cwd` 先用 `cli_cwd` 相对启动进程的 cwd 转成绝对路径。不改进程 cwd，不建目录、不做 shell 展开。校验目录类型，解析符号链接，按 `Path::starts_with` 比较路径组件；不接受不能写入 JSON / JSONL 的 cwd。
+- **绑定**：在 `Hub::create_inner`，先确认 client/profile，再解析目录。用于工具的始终是规范化 `cwd`；`sessionRoot` 只限制祖先指令文件查找。取配置顺序中首个匹配的 workspace 根（非最长匹配），没有匹配时取 `cwd` 自身，即使它是额外允许根的子目录。每层选择 `AGENTS.override.md` > `AGENTS.md` > `CLAUDE.md` 的第一个文件，只注入可读文本，从外到内排列；不找 Git 根。MCP 的启动目录不变。
+- **持久化与恢复**：把 `cwd` / `sessionRoot` 写入 JSONL v2 header。恢复时校验当前 profile 策略，保存的绝对 cwd 不得消失或被重定向。保存的 `sessionRoot` 必须仍是规范目录，包含 cwd，且在当前计算出的边界内；即使新增了更宽的 workspace 根，仍使用原边界。旧文件只有 cwd 时推导 root，两者都没有时取 profile 默认值；成功恢复后追加一次 `session_info`，不改 header、不在列表时回填。恢复失败是 HTTP 409（容量限制仍为 429）。
+- **断言与发现**：已有会话上的 `cwd` 通过 `Hub::check_session_cwd` 校验，必须与保存的 cwd 一致；不重新绑定、也不更改设置或提交消息。HTTP 创建/断言的非法目录为 400，目录策略拒绝为 403，已绑定且不匹配为 409。`GET /v1/profiles` 只展示调用方获准使用的 profile；`profiles [--json]` 只读本地配置，不初始化 Hub、provider 或读取密钥。两者都展示 `workspaceRoots` 与 `allowedWorkspaceRoots`，不探测挂载。
+
 ## 长流稳健性（v0.10.6）
 
 - **流空闲超时**：`agent_ai::{DEFAULT_STREAM_IDLE_TIMEOUT_SECS = 1800, MAX_STREAM_IDLE_TIMEOUT_SECS = 7200}` 与 `validate_stream_idle_timeout_secs` 是唯一的取值来源（配置 `config::check_stream_idle_timeout` 把键路径带进错误、HTTP 400、clap `main::parse_stream_idle_timeout` 共用同一文案）。provider 实例默认值在 `hub::build_provider` 里按 账号 > provider > 全局（`Config::account_stream_idle_timeout_secs`）构造；profile / 请求级覆盖放进 `Request.stream_idle_timeout`，provider 取 `req.stream_idle_timeout.unwrap_or(实例默认)`（请求优先）——这样 failover 账号在没有覆盖时仍用各自的实例默认。`LoopConfig.stream_idle_timeout`、压缩摘要（`SummaryCall`）、路由分类（`routing::classify`）都传同一个会话值。
@@ -184,11 +192,11 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | `agent/src/agent.ts` | `agent-core/src/agent.rs`：`Agent`（broadcast 订阅，`prompt`、`steer`、`follow_up`、`abort`） | ✅ |
 | `AgentTool` / `AgentEvent` | `agent-core/src/{tool,event}.rs`，事件名与 `docs/json.md` 一致 | ✅ |
 | 钩子 `beforeToolCall`/`afterToolCall`/`transformContext` | 在 `LoopConfig` 上加 `Arc<dyn Hooks>` | M3 |
-| `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：**核心工具** `read`、`write`、`edit`、`ls`、`bash`（PowerShell），全部限定在会话 cwd 内 | ✅（edit 已有单测） |
+| `coding-agent/core/tools/*` | `agent-tools/src/builtin/fs.rs`：`read`、`write`、`edit`、`ls` 对相对 cwd 的路径做词法检查；`bash` 从 cwd 启动 `sh -c`，不限制文件访问 | ✅（edit 已有单测） |
 | `tools/grep.ts`、`find.ts` | `agent-tools/src/builtin/search.rs`：进程内嵌 ripgrep 引擎（`grep-searcher` / `grep-regex` / `ignore` / `globset`，不依赖外部 `rg`），结果按路径排序、输出有界 | ✅ |
 | `file-mutation-queue.ts`、`truncate.ts` | `mutation_queue.rs` | M1 |
 | `tools/index.ts` 的 `createCodingTools(cwd)` | `agent-tools/src/registry.rs`：`ToolRegistry::with_builtins()` 加上 `build(names, ToolContext{cwd})`；`DEFAULT_TOOLS = read, ls, grep, find, edit, write, bash`；预设有 `default`、`readonly`（read/ls/grep/find）、`no-shell`（再加 edit/write） | ✅ |
-| `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 cwd 向上查找到 workspaceRoot 为止）、cwd | ✅ |
+| `core/system-prompt.ts` + `resource-loader.ts` 的 AGENTS.md 部分 | `agentd/src/prompt.rs`：preamble 或自定义内容、工具列表、规则、append、AGENTS.md/CLAUDE.md（从 `cwd` 向上查到固定的 `sessionRoot`，含两端）、cwd | ✅ |
 | `core/session-manager.ts` | `agent-session/src/lib.rs`：JSONL 树（`id`/`parentId`、叶子指针、`active_context` 含压缩）、header `meta` 与 `session_info` 元数据、按 id 查找、崩溃修复；`agentd/src/sessions.rs`：`ContextHooks` 逐条写入、按需恢复、列表/purge | ✅ 读写与恢复；fork/分支切换在 M2 |
 | `core/compaction/*` | `agent-session/src/compaction.rs`（估计、切点、序列化与提示词，纯函数）+ `agentd/src/compaction.rs`（配置、摘要调用）；模型调用前经 `ContextHooks::before_call` 自动压缩，`POST /v1/sessions/{id}/compact` / RPC `compact` 手动压缩 | ✅ |
 | `core/skills.ts`、`extensions/`、`prompt-templates.ts` | `agent-resources` crate（只做 skills 和 prompt templates；扩展改成 MCP 或回调） | M4 |
@@ -211,8 +219,8 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 - 请求头为 `Authorization: Bearer <token>`。
 - 每个 client 有一个 profile 白名单（`clients[].profiles`）。
 - 会话按 owner 隔离：别的 bot 访问时一律返回 404。会话文件存放在 `<sessionDir>/<client>/` 下。
-- 每个 profile 有 `workspaceRoots`。会话可以指定 `cwd`（相对路径相对第一个 root，也可以写绝对路径），服务端 canonicalize 之后必须落在某个 root 之内，否则返回 400（已测试 `/tmp` 和 `..` 都会被拒）。
-- 工具内部还会做一次 `resolve_in_root` 校验（拒绝绝对路径和 `..`）。
+- `allowedWorkspaceRoots` 只约束会话 cwd 选择；默认允许任何已有目录，不改变鉴权、owner 隔离、工具白名单或审批。此策略不是文件系统沙箱。
+- 文件工具的 `resolve_in_root` 仅按词法拒绝绝对路径和 `..`，不会阻止 OS 跟随符号链接。`grep` / `find` 遍历时不跟随链接，但不校验起始路径的物理边界。`bash` 只设置启动 cwd；它能切换目录并访问服务用户能访问的文件。限制工具和授权对象，不能以 `workspaceRoots` 保护密钥。
 - 请求里的 `tools` 只能在 profile 白名单范围内**收窄**，不能扩大。
 - `systemPrompt`/`appendSystemPrompt` 覆盖需要 profile 设置 `allowSystemPromptOverride`；调用方回调工具需要 `allowCallerTools`。
 - **OpenAI Key（v0.3.1）**：`agent_ai::secrets` 负责加载，顺序为 `--openai-key-file` > `OPENAI_API_KEY_FILE` > 配置 `apiKeyFile` / `apiKeyKeychain`（v0.9.0，macOS Keychain，二选一）> `OPENAI_API_KEY` > 受管存储（v0.9.0，`sub-bot keys set` 写入的 Keychain 条目或 0600 key 文件；只在前几级都未命中时探测）。Anthropic 同理（`ANTHROPIC_*`）。macOS Keychain 条目（v0.10.3 起）经 Apple 的 `/usr/bin/security` 读/写/删（`agent_ai::keychain::security_tool`：绝对路径、不经 shell；写入走 `security -i` 的 stdin + `-X <hex>`，secret 不进 argv；先删后建再读回校验），条目 ACL 因此归属 `security` 工具而不是 sub-bot 二进制的 cdhash，`brew upgrade` 后不再弹授权对话框；`sub-bot keys reauth` 一次性迁移旧版本创建的条目；`keys list` 的属性搜索仍用 `security-framework`。读文件时去掉首尾空白；出错时只报路径和原因，不带内容。key 在内存里用 `Secret` 包装：`Debug`/`Display` 输出 `[redacted]`，drop 时清零，只在设置 `Authorization` 头时 `expose()`。任何响应、事件和日志里都不会出现 key，日志只记录来源。
@@ -226,17 +234,18 @@ pi 分为三层，依赖方向是单向的：`ai` ← `agent` ← `coding-agent`
 | 方法和路径 | 说明 |
 |---|---|
 | `GET /health` | 无需鉴权 |
-| `GET /profiles` | 当前 bot 可用的 profile，包括 model、allowedModels、reasoningEffort、tools 和 workspaceRoots |
+| `GET /profiles` | 当前 bot 可用的 profile，包括 model、allowedModels、reasoningEffort、tools、`workspaceRoots` 与 `allowedWorkspaceRoots` |
 | `GET /usage` | 本地用量汇总（与 `sub-bot usage --json` 相同）；query：`today` / `month` / `days` / `since` / `until` / `by` / 过滤字段；需 Bearer token |
 | `GET /models?profile=&all=` | 调用 provider 的 `/v1/models` 实时取模型列表（Hub 缓存 10 分钟），默认过滤掉非对话模型（embedding/tts/image/realtime/codex/-pro 等）和日期快照；每项带 `reasoning`、`reasoningEfforts` |
-| `POST /sessions` | 请求体为 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`，返回 `{sessionId, profile, cwd, model, reasoningEffort, tools}`；model 不在 profile 的 `allowedModels` 内返回 400 |
-| `GET /sessions/{id}` | 会话信息及运行状态；非 owner 或未知会话返回 404 |
+| `GET /sessions` | 合并列出 owner 的内存 / 磁盘会话，含 `cwd` 与 `sessionRoot`（旧文件恢复前可能为 null） |
+| `POST /sessions` | 请求体为 `{profile, cwd?, model?, reasoningEffort?, tools?, systemPrompt?, appendSystemPrompt?, callerTools?}`（可空）；返回会话视图，含 `cwd` 与 `sessionRoot` |
+| `GET/PATCH /sessions/{id}` | 返回会话视图；PATCH 不接受 `cwd`。非 owner 或未知会话 404，无法恢复 409 |
 | `DELETE /sessions/{id}` | owner 删除内存会话并 abort 当前运行，返回 `{"deleted":true}`；未知/非 owner 返回 404，持久化 JSONL 保留并记日志 |
-| `POST /sessions/{id}/prompt` | 请求体为 `{message, mode?: "steer"|"follow_up"}`，返回 202 和 `started`/`queuedSteer`/`queuedFollowUp`（语义同 pi：运行中只能 steer 或 follow_up） |
+| `POST /sessions/{id}/prompt` | `{message, mode?: "steer"\|"follow_up", cwd?, reasoningEffort?, depth?}`；`cwd` 必须匹配原目录，随后才修改设置或提交；成功返回 202 |
 | `GET /sessions/{id}/events` | SSE，`event:` 名称与 pi 的 `AgentEvent.type` 一致，额外有 `agent_settled{aborted}` |
 | `POST /sessions/{id}/abort` | 中止当前运行 |
 | `GET /sessions/{id}/messages` | 返回当前分支的消息 |
-| `POST /chat` | 一次性调用：`{message, sessionId?, session?: {...}, stream?}`。不流式时返回 `{sessionId, text, stopReason, error, aborted, messages}`；`stream:true` 时返回 SSE，直到 `agent_settled` |
+| `POST /chat` | `{message, sessionId?, session?, cwd?, stream?, async?, ...}`。顶层 `cwd` 与 `session.cwd` 等价（两处冲突为 400）；有 `sessionId` 时用实际会话的 profile 断言。同步结果、SSE 和异步任务各自的响应格式不变；按 ID GET 会话可查两个路径 |
 
 示例：
 ```bash
@@ -247,22 +256,22 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 ### 会话生命周期（v0.3.2）
 - 顶层配置 `sessionIdleTtlSecs` 默认 3600；无 `sessionId` 的 `/chat` 自动创建临时会话，使用独立的 `chatSessionTtlSecs`（默认 600）。两个字段各自的 0 表示禁用该类过期。
 - 创建、submit、运行完成后更新单调时钟时间；GET/SSE 不刷新。`serve` 启动 sweeper，周期为最短非零 TTL 与 60 秒的较小值，仅清理未运行且超过其 TTL 的会话。`Hub::evict_idle(now)` 可注入时间测试，每次清理记 info 日志。
-- `maxSessionsPerClient` 默认 64，0 不限制，包括普通和临时会话。创建时在同一 map 锁内检查/插入；满额先回收该 client 已过期的空闲会话，仍满返回专用错误（HTTP 429），其它参数错误返回 400。
+- `maxSessionsPerClient` 默认 64，0 不限制，包括普通和临时会话。创建时在同一 map 锁内检查/插入；满额先回收该 client 已过期的空闲会话，仍满返回专用错误（HTTP 429）。
 - HTTP 提交、删除、清理使用同一个 map 锁，避免删除后旧 handle 再启动运行。DELETE 会取消正在运行的 Agent；清理与删除都保留已有 JSONL（`?purge=true` 才删除），之后按旧 ID 访问时从同一 client 的会话目录恢复（README「会话持久化与恢复」）。
 - 临时会话可通过返回的 ID 继续（流式响应使用 `X-Session-Id` 头），续聊刷新计时但不改变 TTL。
 - RPC 只有一个进程生命周期内的会话，无需 delete 命令或 sweeper；关闭 stdin 会 abort 并退出。
 
-### stdio JSONL RPC（`sub-bot rpc --profile coder`）
+### stdio JSONL RPC（`sub-bot rpc --profile coder [--cwd DIR]`）
 - 父进程直接拉起 agent，命令和响应格式与 pi 的 `modes/rpc/rpc-types.ts` 一致：
   ```
-  → {"id":"1","type":"prompt","message":"..."}
+  → {"id":"1","type":"prompt","message":"...","cwd":"../checkout"}
   ← {"id":"1","type":"response","command":"prompt","success":true}
   ← {"type":"message_update","assistantMessageEvent":{...}} ... {"type":"agent_settled","aborted":false}
   ```
-- 目前支持的命令：`prompt`、`steer`、`follow_up`、`abort`、`get_messages`、`get_state`。
-- M2 加入 `set_model`、`compact`、`fork`、`new_session`、`switch_session`。
-- 关闭 stdin 等于关机（与 pi 相同）。
-- 本地 stdio 被视为可信，可以使用全部 profile。
+- 每个进程只有一个绑定的会话。`--cwd` / `--resume` 立即打开；否则先无副作用地校验 CLI 选项，再等第一条有效会话命令。首条 `prompt.cwd` 可选工作目录，其它会话命令（包括 `get_state`）使用默认 cwd；`get_available_models` 和无效输入不绑定。绑定时先订阅再提交，避免首个 prompt 丢事件；未绑定就 EOF 不落盘。
+- 启动错误响应的 `command` 为 `start`；延迟创建失败则先发送与命令 `id` 对应的 `success:false` 响应，再非零退出。绑定后的 `prompt.cwd` 是断言，失败可继续处理后续命令；其它命令不接受 `cwd`。
+- 命令：`prompt`、`steer`、`follow_up`、`abort`、`approve`、`set_max_turns`、`set_reasoning_effort`、`get_messages`、`get_state`（报告 `cwd` / `sessionRoot`）、`get_available_models`、`compact`。
+- 关闭 stdin 会取消当前运行并退出。父进程被视为可信，可以使用全部本地 profile。
 
 ### 调用方工具（附加能力）
 - `callerTools: [{name, description, parameters, callbackUrl, callbackToken}]`。
@@ -320,7 +329,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
   - 再往下是 `llm{provider, model, api, reasoning_effort}`（实际发送的值）和 `tool{tool, tool_call_id}`。
 - **关键事件**：
   - 请求结束（status、latency_ms，4xx 记为 warn，5xx 记为 error）；
-  - `session created`（cwd、model、tools）；
+  - `session created`（INFO）：`cwd`、`session_root`、`cwd_policy=any|list`、`cwd_decision=workspace_root|allowed_workspace_root|any`、`restored`（是否从盘恢复，即使历史为空），以及 model、tools 等。目录先脱敏再转义控制字符；拒绝时 DEBUG 只给 profile、策略和决定，不给输入路径或允许列表；
   - `run started/finished`（耗时、消息数、工具调用数、输入和输出 token、stop_reason）；
   - `llm call finished/failed`（耗时、token、cached_tokens）；
   - `tool finished/failed`（耗时）；
@@ -330,7 +339,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
   - API key、Bearer token、回调 token 都不进入任何字段，鉴权失败也只记录“token 缺失或未知”；
   - 上游错误信息会先打码，形如 `sk-…` 的内容替换为 `[redacted]`；
   - 提示词、模型输出、工具参数和文件内容只记录长度或计数。
-  - 例外：没有配置文件时，`serve` 会把随机生成的 token 用 eprintln 打到 stderr 一次，方便本机使用；这条不经过 tracing，也不进日志文件。
+  - 无配置时自动生成的随机 token 也不打印。
 - 已实测：日志文件和会话 JSONL 里都搜不到 key、`sk-` 或 bot token。
 
 ---
@@ -369,7 +378,7 @@ curl -X POST localhost:7878/v1/chat -H 'Authorization: Bearer <你的 bot token>
 
 | 里程碑 | 内容 | 验收 |
 |---|---|---|
-| **M0（已完成，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；会话 cwd 与 workspaceRoots 校验；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件，越权 cwd 和工具被拒，401/404 隔离） |
+| **M0（历史，已用 OpenAI 实测）** | 5 个 crate；双层 agent loop；OpenAI Chat Completions 流式调用；核心工具 read/write/edit/ls/bash；当时 cwd 仅限 `workspaceRoots`；AGENTS.md 注入；JSONL 会话；HTTP、SSE、stdio RPC；每个 bot 一个 token 和 profile | `cargo check` 无警告；3 个单测通过；faux 冒烟测试通过（edit 改文件、目录与工具策略、401/404 隔离） |
 | **M1：编码能力补齐** | ✅ OpenAI Responses API（v0.3）；✅ `grep`、`find`（内嵌 ripgrep，遵守 .gitignore）；file mutation queue；pi 的 `truncate` 输出截断策略；`read` 支持 offset/limit；edit 返回 diff | 用真实 key 跑一个“修 bug 并跑测试”的端到端任务 |
 | **M1.5：Claude** | `agent-ai/src/anthropic.rs` 接入 Anthropic Messages API；profile 增加 `provider` 字段；Hub 持有多个 provider，按 profile 分派 | 先用离线单测覆盖 SSE 解析和请求体，有 key 后再做端到端测试 |
 | **M2：会话** | ✅ 恢复会话（`sessionId` 重开后加载 JSONL，`run`/`rpc --resume`）；✅ `compaction`（自动压缩和 `compact` 命令）；fork 和分支切换；`set_model`；RPC 命令补齐 | 长会话超过上下文后能自动压缩并继续 |
